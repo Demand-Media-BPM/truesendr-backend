@@ -2227,7 +2227,7 @@ module.exports = function bulkValidatorRouter(deps) {
     buf,
     filename,
     mime,
-    metadata = {}
+    metadata = {},
   ) {
     return new Promise((resolve, reject) => {
       const upload = bucket(username).openUploadStream(filename, {
@@ -2243,7 +2243,7 @@ module.exports = function bulkValidatorRouter(deps) {
             length: upload.length,
             filename: upload.filename,
             contentType: upload.options.contentType,
-          })
+          }),
         );
     });
   }
@@ -2405,7 +2405,7 @@ module.exports = function bulkValidatorRouter(deps) {
     // ---------------------------
     const cleanedWb = xlsx.utils.book_new();
     const cleanedWs = xlsx.utils.json_to_sheet(
-      cleanedRows.length ? cleanedRows : [{ [emailCol]: "" }]
+      cleanedRows.length ? cleanedRows : [{ [emailCol]: "" }],
     );
     xlsx.utils.book_append_sheet(cleanedWb, cleanedWs, "Cleaned");
     const cleanedBuf = xlsx.write(cleanedWb, {
@@ -2419,7 +2419,7 @@ module.exports = function bulkValidatorRouter(deps) {
     // ---------------------------
     const fixWb = xlsxStyle.utils.book_new();
     const fixWs = xlsxStyle.utils.json_to_sheet(
-      fixRows.length ? fixRows : [{ [emailCol]: "" }]
+      fixRows.length ? fixRows : [{ [emailCol]: "" }],
     );
 
     // highlight style
@@ -2512,7 +2512,7 @@ module.exports = function bulkValidatorRouter(deps) {
       originalName || "bulk.xlsx",
       mime ||
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-      { username, kind: "original", bulkId }
+      { username, kind: "original", bulkId },
     );
 
     const { BulkStat: UserBulkStat } = deps.getUserDb(
@@ -2521,7 +2521,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     const state = stats.errorsFound > 0 ? "needs_cleanup" : "ready";
@@ -2557,7 +2557,7 @@ module.exports = function bulkValidatorRouter(deps) {
           updatedAt: new Date(),
         },
       },
-      { upsert: true }
+      { upsert: true },
     );
 
     if (sessionId) {
@@ -2624,7 +2624,7 @@ module.exports = function bulkValidatorRouter(deps) {
           .status(err.status || 500)
           .send(err.message || "Preflight failed");
       }
-    }
+    },
   );
 
   // ───────────────────────────────────────────────────────────
@@ -2704,7 +2704,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     const meta = await UserBulkStat.findOne({ bulkId });
@@ -2723,13 +2723,13 @@ module.exports = function bulkValidatorRouter(deps) {
             cleanedAt: null,
           },
           $currentDate: { updatedAt: true },
-        }
+        },
       );
 
       // read original
       const origBuffer = await readGridFSToBuffer(
         username,
-        meta.originalFileId
+        meta.originalFileId,
       );
       const { rows } = readWorkbookFromBuffer(origBuffer);
       if (!rows.length) return res.status(400).send("Empty sheet");
@@ -2745,7 +2745,7 @@ module.exports = function bulkValidatorRouter(deps) {
         built.cleanedBuf,
         `cleaned_${bulkId}.xlsx`,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        { username, kind: "cleaned", bulkId }
+        { username, kind: "cleaned", bulkId },
       );
 
       const fixSaved = await saveBufferToGridFS(
@@ -2753,7 +2753,7 @@ module.exports = function bulkValidatorRouter(deps) {
         built.fixBuf,
         `fix_invalid_${bulkId}.xlsx`,
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        { username, kind: "fix_invalid", bulkId }
+        { username, kind: "fix_invalid", bulkId },
       );
 
       // re-analyze using same logic (optional but consistent)
@@ -2795,7 +2795,7 @@ module.exports = function bulkValidatorRouter(deps) {
             cleanedAt: new Date(),
             sessionId,
           },
-        }
+        },
       );
 
       if (sessionId) {
@@ -2829,7 +2829,7 @@ module.exports = function bulkValidatorRouter(deps) {
         {
           $set: { state: "failed", phase: "failed", error: err.message },
           $currentDate: { updatedAt: true },
-        }
+        },
       );
 
       return res.status(500).send("Cleanup failed");
@@ -2851,7 +2851,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
     const doc = await UserBulkStat.findOne({ bulkId });
     if (!doc || !doc.fixFileId)
@@ -2862,7 +2862,7 @@ module.exports = function bulkValidatorRouter(deps) {
       "Content-Disposition",
       `attachment; filename="fix_invalid_format_${
         doc.originalName || bulkId
-      }.xlsx"`
+      }.xlsx"`,
     );
 
     const dl = bucket(username).openDownloadStream(doc.fixFileId);
@@ -2878,7 +2878,7 @@ module.exports = function bulkValidatorRouter(deps) {
     bulkId,
     username,
     sessionId,
-    cat
+    cat,
   ) {
     const inc = {};
     if (cat === "valid") inc.valid = 1;
@@ -2889,7 +2889,7 @@ module.exports = function bulkValidatorRouter(deps) {
     const doc = await UserBulkStat.findOneAndUpdate(
       { bulkId },
       { $inc: inc },
-      { new: true }
+      { new: true },
     );
 
     if (doc && sessionId) {
@@ -2931,7 +2931,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     const meta = await UserBulkStat.findOne({ bulkId });
@@ -2943,7 +2943,7 @@ module.exports = function bulkValidatorRouter(deps) {
       return res
         .status(400)
         .send(
-          "Invalid format emails exist. Download & fix or Skip & Continue."
+          "Invalid format emails exist. Download & fix or Skip & Continue.",
         );
     }
 
@@ -2993,7 +2993,7 @@ module.exports = function bulkValidatorRouter(deps) {
           unknown: 0,
         },
         $currentDate: { updatedAt: true },
-      }
+      },
     );
 
     const runJob = async ({ streamToRes = false }) => {
@@ -3013,7 +3013,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 error: "No email column found",
               },
               $currentDate: { updatedAt: true },
-            }
+            },
           );
 
           if (streamToRes) res.status(400).send("No email column found");
@@ -3029,7 +3029,7 @@ module.exports = function bulkValidatorRouter(deps) {
               error: "Unable to read input file",
             },
             $currentDate: { updatedAt: true },
-          }
+          },
         );
 
         if (streamToRes) res.status(500).send("Unable to read input file");
@@ -3064,7 +3064,7 @@ module.exports = function bulkValidatorRouter(deps) {
       try {
         await UserBulkStat.updateOne(
           { bulkId },
-          { $set: { progressCurrent: 0, progressTotal: total } }
+          { $set: { progressCurrent: 0, progressTotal: total } },
         );
       } catch {}
 
@@ -3083,7 +3083,7 @@ module.exports = function bulkValidatorRouter(deps) {
         try {
           await UserBulkStat.updateOne(
             { bulkId },
-            { $set: { progressCurrent: current, progressTotal: total0 } }
+            { $set: { progressCurrent: current, progressTotal: total0 } },
           );
         } catch {}
       };
@@ -3123,8 +3123,8 @@ module.exports = function bulkValidatorRouter(deps) {
         await Promise.all(
           Array.from(
             { length: Math.min(limit, Math.max(1, items.length)) },
-            runner
-          )
+            runner,
+          ),
         );
 
         return results;
@@ -3137,7 +3137,7 @@ module.exports = function bulkValidatorRouter(deps) {
 
         const logger = (step, message, level = "info") => {
           console.log(
-            `[BULK][${username}][${bulkId}][${E}] ${step} (${level}): ${message}`
+            `[BULK][${username}][${bulkId}][${E}] ${step} (${level}): ${message}`,
           );
         };
 
@@ -3155,7 +3155,7 @@ module.exports = function bulkValidatorRouter(deps) {
         const fresh = cached
           ? Date.now() -
               new Date(
-                cached.updatedAt || cached.createdAt || cached.timestamp || 0
+                cached.updatedAt || cached.createdAt || cached.timestamp || 0,
               ).getTime() <=
             FRESH_DB_MS
           : false;
@@ -3169,7 +3169,7 @@ module.exports = function bulkValidatorRouter(deps) {
               isDisposable: !!cached.isDisposable,
               isRoleBased: !!cached.isRoleBased,
               isFree: !!cached.isFree,
-            }
+            },
           );
           await bumpUpdatedAt(EmailLog, E, "bulk");
 
@@ -3198,7 +3198,7 @@ module.exports = function bulkValidatorRouter(deps) {
               },
               $currentDate: { updatedAt: true },
             },
-            { upsert: true, new: true }
+            { upsert: true, new: true },
           );
 
           final = {
@@ -3243,7 +3243,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 isDisposable: !!prelim.isDisposable,
                 isRoleBased: !!prelim.isRoleBased,
                 isFree: !!prelim.isFree,
-              }
+              },
             );
 
             final = {
@@ -3265,7 +3265,7 @@ module.exports = function bulkValidatorRouter(deps) {
               score:
                 typeof prelim.score === "number"
                   ? prelim.score
-                  : prelimRaw.score ?? 0,
+                  : (prelimRaw.score ?? 0),
               section: "bulk",
             };
 
@@ -3297,7 +3297,7 @@ module.exports = function bulkValidatorRouter(deps) {
                   isDisposable: !!stable.isDisposable,
                   isRoleBased: !!stable.isRoleBased,
                   isFree: !!stable.isFree,
-                }
+                },
               );
 
               final = {
@@ -3319,7 +3319,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 score:
                   typeof stable.score === "number"
                     ? stable.score
-                    : prelim.score ?? 0,
+                    : (prelim.score ?? 0),
                 section: "bulk",
               };
 
@@ -3329,7 +3329,7 @@ module.exports = function bulkValidatorRouter(deps) {
               const builtUnknown = buildReasonAndMessage(
                 "❔ Unknown",
                 null,
-                {}
+                {},
               );
               final = {
                 status: "❔ Unknown",
@@ -3387,7 +3387,7 @@ module.exports = function bulkValidatorRouter(deps) {
             },
             sessionId,
             true,
-            username
+            username,
           );
         } catch {}
 
@@ -3426,14 +3426,14 @@ module.exports = function bulkValidatorRouter(deps) {
           Number(process.env.BULK_CONCURRENCY || 8),
           worker,
           (done, total0) =>
-            sendProgressToFrontend(done, total0, sessionId, username, bulkId)
+            sendProgressToFrontend(done, total0, sessionId, username, bulkId),
         );
 
         // Bill only for checked categories
         if (billableCount > 0) {
           await User.updateOne(
             { username },
-            { $inc: { credits: -billableCount } }
+            { $inc: { credits: -billableCount } },
           );
         }
 
@@ -3459,7 +3459,7 @@ module.exports = function bulkValidatorRouter(deps) {
           outBuffer,
           `result_${bulkId}.xlsx`,
           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-          { username, kind: "result", bulkId }
+          { username, kind: "result", bulkId },
         );
 
         await UserBulkStat.updateOne(
@@ -3485,7 +3485,7 @@ module.exports = function bulkValidatorRouter(deps) {
               progressTotal: total,
             },
             $currentDate: { updatedAt: true },
-          }
+          },
         );
 
         if (sessionId) {
@@ -3510,7 +3510,7 @@ module.exports = function bulkValidatorRouter(deps) {
             RegionStat,
             DomainReputation,
             username,
-            { mode: "bulk", counts: { ...catCounts, requests: 1 } }
+            { mode: "bulk", counts: { ...catCounts, requests: 1 } },
           );
         } catch (e) {
           console.warn("dashstat (bulk) inc failed:", e.message);
@@ -3520,14 +3520,14 @@ module.exports = function bulkValidatorRouter(deps) {
           setTimeout(
             () =>
               deps.progressStore.delete(`${username}:${sessionId}:${bulkId}`),
-            60_000
+            60_000,
           );
 
         if (streamToRes) {
           res.setHeader("Content-Type", saved.contentType);
           res.setHeader(
             "Content-Disposition",
-            `attachment; filename="validated_emails.xlsx"`
+            `attachment; filename="validated_emails.xlsx"`,
           );
           bucket(username).openDownloadStream(saved.id).pipe(res);
         }
@@ -3544,7 +3544,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 finishedAt: new Date(),
               },
               $currentDate: { updatedAt: true },
-            }
+            },
           );
 
           if (streamToRes)
@@ -3557,7 +3557,7 @@ module.exports = function bulkValidatorRouter(deps) {
           {
             $set: { state: "failed", phase: "failed", error: err.message },
             $currentDate: { updatedAt: true },
-          }
+          },
         );
 
         if (streamToRes) res.status(500).send("Bulk validation failed");
@@ -3575,7 +3575,7 @@ module.exports = function bulkValidatorRouter(deps) {
               {
                 $set: { state: "failed", phase: "failed", error: err.message },
                 $currentDate: { updatedAt: true },
-              }
+              },
             );
           } catch {}
         });
@@ -3601,13 +3601,13 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     const doc = await UserBulkStat.findOneAndUpdate(
       { bulkId },
       { $set: { sessionId }, $currentDate: { updatedAt: true } },
-      { new: true }
+      { new: true },
     );
 
     if (!doc) return res.status(404).send("Bulk not found");
@@ -3636,7 +3636,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     // ✅ no sessionId filter (undo)
@@ -3675,7 +3675,7 @@ module.exports = function bulkValidatorRouter(deps) {
           "resultFileId",
           "cleanedAt",
           "creditsUsed",
-        ].join(" ")
+        ].join(" "),
       );
 
     const items = docs.map((d) => {
@@ -3762,7 +3762,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     await UserBulkStat.updateOne(
@@ -3770,7 +3770,7 @@ module.exports = function bulkValidatorRouter(deps) {
       {
         $set: { state: "canceled", phase: "canceled", finishedAt: new Date() },
         $currentDate: { updatedAt: true },
-      }
+      },
     );
 
     res.json({ ok: true });
@@ -3796,7 +3796,7 @@ module.exports = function bulkValidatorRouter(deps) {
         RegionStat,
         DomainReputation,
         username,
-        BulkStat
+        BulkStat,
       );
 
       const doc = await UserBulkStat.findOne({ bulkId });
@@ -3877,7 +3877,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     const doc = await UserBulkStat.findOne({ bulkId });
@@ -3886,11 +3886,11 @@ module.exports = function bulkValidatorRouter(deps) {
 
     res.setHeader(
       "Content-Type",
-      doc.originalMime || "application/octet-stream"
+      doc.originalMime || "application/octet-stream",
     );
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${doc.originalName || "uploaded.xlsx"}"`
+      `attachment; filename="${doc.originalName || "uploaded.xlsx"}"`,
     );
 
     const dl = bucket(username).openDownloadStream(doc.originalFileId);
@@ -3913,7 +3913,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     const doc = await UserBulkStat.findOne({ bulkId });
@@ -3927,7 +3927,7 @@ module.exports = function bulkValidatorRouter(deps) {
         doc.originalName
           ? `validated_${doc.originalName}`
           : "validated_emails.xlsx"
-      }"`
+      }"`,
     );
 
     const dl = bucket(username).openDownloadStream(doc.resultFileId);
@@ -3945,11 +3945,11 @@ module.exports = function bulkValidatorRouter(deps) {
     const buffer = xlsx.write(workbook, { type: "buffer", bookType: "xlsx" });
     res.setHeader(
       "Content-Disposition",
-      "attachment; filename=email_template.xlsx"
+      "attachment; filename=email_template.xlsx",
     );
     res.setHeader(
       "Content-Type",
-      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     );
     res.send(buffer);
   });
@@ -3977,14 +3977,14 @@ module.exports = function bulkValidatorRouter(deps) {
         RegionStat,
         DomainReputation,
         username,
-        BulkStat
+        BulkStat,
       );
 
       const docs = await UserBulkStat.find({ state: { $in: states } })
         .sort({ createdAt: -1 })
         .limit(limit)
         .select(
-          "bulkId originalName uniqueValid creditsRequired state createdAt startedAt finishedAt resultFileId valid invalid risky unknown"
+          "bulkId originalName uniqueValid creditsRequired state createdAt startedAt finishedAt resultFileId valid invalid risky unknown",
         )
 
         .lean();
@@ -4012,6 +4012,59 @@ module.exports = function bulkValidatorRouter(deps) {
   });
 
   // ───────────────────────────────────────────────────────────
+  // meta (single job state) - lightweight status fetch
+  // ───────────────────────────────────────────────────────────
+  router.get("/meta", async (req, res) => {
+    const username = req.headers["x-user"] || req.query.username;
+    const bulkId = req.query.bulkId;
+
+    if (!username || !bulkId)
+      return res.status(400).json({ error: "username and bulkId required" });
+
+    const { BulkStat: UserBulkStat } = deps.getUserDb(
+      mongoose,
+      EmailLog,
+      RegionStat,
+      DomainReputation,
+      username,
+      BulkStat,
+    );
+
+    try {
+      const d = await UserBulkStat.findOne({ bulkId })
+        .select(
+          "bulkId state phase progressCurrent progressTotal valid invalid risky unknown creditsUsed creditsRequired finishedAt resultFileId updatedAt",
+        )
+        .lean();
+
+      if (!d) return res.status(404).json({ error: "Bulk not found" });
+
+      return res.json({
+        bulkId: d.bulkId,
+        state: d.state,
+        phase: d.phase,
+        progress: {
+          current: d.progressCurrent || 0,
+          total: d.progressTotal || 0,
+        },
+        counts: {
+          valid: d.valid || 0,
+          invalid: d.invalid || 0,
+          risky: d.risky || 0,
+          unknown: d.unknown || 0,
+        },
+        creditsUsed: d.creditsUsed || 0,
+        creditsRequired: d.creditsRequired || 0,
+        finishedAt: d.finishedAt || null,
+        canDownload: !!d.resultFileId,
+        updatedAt: d.updatedAt || null,
+      });
+    } catch (e) {
+      return res.status(500).json({ error: "Meta fetch failed" });
+    }
+  });
+
+  // ───────────────────────────────────────────────────────────
   // progress
   // ───────────────────────────────────────────────────────────
   router.get("/progress", async (req, res) => {
@@ -4029,7 +4082,7 @@ module.exports = function bulkValidatorRouter(deps) {
       RegionStat,
       DomainReputation,
       username,
-      BulkStat
+      BulkStat,
     );
 
     // If bulkId is provided, return single job progress
