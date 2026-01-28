@@ -746,13 +746,6 @@ module.exports = function EmailFinderRouter() {
               }
             );
 
-            // charge credit
-            await User.findOneAndUpdate(
-              { _id: userId, credits: { $gt: 0 } },
-              { $inc: { credits: -1 } },
-              { new: true }
-            ).lean();
-
             return;
           }
 
