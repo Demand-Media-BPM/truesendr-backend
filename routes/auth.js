@@ -109,7 +109,7 @@ async function verifyRecaptcha(token, ip) {
 
     const { data } = await axios.post(
       "https://www.google.com/recaptcha/api/siteverify",
-      params
+      params,
     );
     return !!data?.success;
   } catch (e) {
@@ -209,7 +209,7 @@ router.post("/auth/request-code", async (req, res) => {
             expiresAt,
           },
           $inc: { resendCount: 1 },
-        }
+        },
       );
     }
 
@@ -274,7 +274,7 @@ router.post("/auth/resend-code", async (req, res) => {
     if (elapsed < RESEND_MIN_INTERVAL_MS) {
       const retryAfterSec = secondsLeftFrom(
         token.lastSentAt,
-        RESEND_MIN_INTERVAL_MS
+        RESEND_MIN_INTERVAL_MS,
       );
       return res.status(429).json({
         ok: false,
@@ -292,7 +292,7 @@ router.post("/auth/resend-code", async (req, res) => {
       {
         $set: { codeHash, expiresAt, lastSentAt: new Date() },
         $inc: { resendCount: 1 },
-      }
+      },
     );
 
     try {
@@ -353,7 +353,7 @@ router.post("/auth/verify-code", async (req, res) => {
     if (!ok) {
       await SignupToken.updateOne(
         { _id: token._id },
-        { $inc: { attempts: 1 } }
+        { $inc: { attempts: 1 } },
       );
       return res.status(400).json({ ok: false, message: "Invalid code." });
     }
@@ -380,7 +380,7 @@ router.post("/auth/verify-code", async (req, res) => {
       credits: 100,
     });
     console.log(
-      `[users] saved _id=${newUser._id} into db=${mongoose.connection.name}.collection=users`
+      `[users] saved _id=${newUser._id} into db=${mongoose.connection.name}.collection=users`,
     );
 
     await createPerUserDb(token.username);
@@ -429,8 +429,10 @@ router.post("/auth/login", async (req, res) => {
       message: "Login successful",
       user: {
         id: user._id,
-        username: user.username, // keep returning username for per-user DB usage
-        email: user.email,
+        username: user.username, // internal use
+        email: user.email, // tray email
+        firstName: user.firstName, // 👈 add
+        lastName: user.lastName, // 👈 add
         permissions: user.permissions || [],
         credits: user.credits ?? 0,
       },
@@ -478,9 +480,9 @@ router.post("/auth/forgot-password", async (req, res) => {
     const base = process.env.FRONTEND_URL || "https://localhost:3000";
     const resetLink = `${base.replace(
       /\/+$/,
-      ""
+      "",
     )}/reset-password?email=${encodeURIComponent(
-      user.email
+      user.email,
     )}&token=${rawToken}`;
 
     try {
