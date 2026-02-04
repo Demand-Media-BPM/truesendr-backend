@@ -2075,112 +2075,112 @@ const tls = require("tls");
  * Exchange/Office365 IMAP XOAUTH2 (two-step, no SASL-IR inline initial response)
  * Returns { ok: true } or throws an Error with details.
  */
-async function msImapXoauth2TwoStep({
-  host,
-  port = 993,
-  user,
-  accessToken,
-  timeoutMs = 120_000,
-}) {
-  const xoauth2 = Buffer.from(
-    `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
-    "utf8",
-  ).toString("base64");
+// async function msImapXoauth2TwoStep({
+//   host,
+//   port = 993,
+//   user,
+//   accessToken,
+//   timeoutMs = 120_000,
+// }) {
+//   const xoauth2 = Buffer.from(
+//     `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
+//     "utf8",
+//   ).toString("base64");
 
-  return await new Promise((resolve, reject) => {
-    const socket = tls.connect(
-      {
-        host,
-        port,
-        servername: host, // SNI
-        minVersion: "TLSv1.2",
-      },
-      () => {},
-    );
+//   return await new Promise((resolve, reject) => {
+//     const socket = tls.connect(
+//       {
+//         host,
+//         port,
+//         servername: host, // SNI
+//         minVersion: "TLSv1.2",
+//       },
+//       () => {},
+//     );
 
-    const cleanup = () => {
-      try {
-        socket.end();
-      } catch {}
-      try {
-        socket.destroy();
-      } catch {}
-    };
+//     const cleanup = () => {
+//       try {
+//         socket.end();
+//       } catch {}
+//       try {
+//         socket.destroy();
+//       } catch {}
+//     };
 
-    socket.setTimeout(timeoutMs, () => {
-      cleanup();
-      reject(new Error("IMAP timeout"));
-    });
+//     socket.setTimeout(timeoutMs, () => {
+//       cleanup();
+//       reject(new Error("IMAP timeout"));
+//     });
 
-    socket.on("error", (e) => {
-      cleanup();
-      reject(e);
-    });
+//     socket.on("error", (e) => {
+//       cleanup();
+//       reject(e);
+//     });
 
-    let buf = "";
-    let stage = 0;
+//     let buf = "";
+//     let stage = 0;
 
-    // simple line reader
-    socket.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
+//     // simple line reader
+//     socket.on("data", (chunk) => {
+//       buf += chunk.toString("utf8");
 
-      // process by lines
-      while (true) {
-        const idx = buf.indexOf("\n");
-        if (idx === -1) break;
+//       // process by lines
+//       while (true) {
+//         const idx = buf.indexOf("\n");
+//         if (idx === -1) break;
 
-        const line = buf.slice(0, idx).replace(/\r$/, "");
-        buf = buf.slice(idx + 1);
+//         const line = buf.slice(0, idx).replace(/\r$/, "");
+//         buf = buf.slice(idx + 1);
 
-        // console.log("[MS IMAP]", line);
+//         // console.log("[MS IMAP]", line);
 
-        // Stage 0: wait greeting "* OK ..."
-        if (stage === 0) {
-          if (/^\*\s+OK\b/i.test(line)) {
-            stage = 1;
-            socket.write("a1 CAPABILITY\r\n");
-          }
-          continue;
-        }
+//         // Stage 0: wait greeting "* OK ..."
+//         if (stage === 0) {
+//           if (/^\*\s+OK\b/i.test(line)) {
+//             stage = 1;
+//             socket.write("a1 CAPABILITY\r\n");
+//           }
+//           continue;
+//         }
 
-        // Stage 1: wait for "a1 OK"
-        if (stage === 1) {
-          if (/^a1\s+OK\b/i.test(line)) {
-            stage = 2;
-            socket.write("a2 AUTHENTICATE XOAUTH2\r\n");
-          }
-          continue;
-        }
+//         // Stage 1: wait for "a1 OK"
+//         if (stage === 1) {
+//           if (/^a1\s+OK\b/i.test(line)) {
+//             stage = 2;
+//             socket.write("a2 AUTHENTICATE XOAUTH2\r\n");
+//           }
+//           continue;
+//         }
 
-        // Stage 2: wait for continuation "+"
-        if (stage === 2) {
-          if (/^\+\s*/.test(line)) {
-            stage = 3;
-            socket.write(xoauth2 + "\r\n");
-          } else if (/^a2\s+BAD\b/i.test(line) || /^a2\s+NO\b/i.test(line)) {
-            cleanup();
-            reject(new Error(`AUTHENTICATE rejected: ${line}`));
-          }
-          continue;
-        }
+//         // Stage 2: wait for continuation "+"
+//         if (stage === 2) {
+//           if (/^\+\s*/.test(line)) {
+//             stage = 3;
+//             socket.write(xoauth2 + "\r\n");
+//           } else if (/^a2\s+BAD\b/i.test(line) || /^a2\s+NO\b/i.test(line)) {
+//             cleanup();
+//             reject(new Error(`AUTHENTICATE rejected: ${line}`));
+//           }
+//           continue;
+//         }
 
-        // Stage 3: wait auth result "a2 OK" or "a2 NO/BAD"
-        if (stage === 3) {
-          if (/^a2\s+OK\b/i.test(line)) {
-            stage = 4;
-            socket.write("a3 LOGOUT\r\n");
-            cleanup();
-            resolve({ ok: true });
-          } else if (/^a2\s+(NO|BAD)\b/i.test(line)) {
-            cleanup();
-            reject(new Error(`AUTHENTICATE failed: ${line}`));
-          }
-          continue;
-        }
-      }
-    });
-  });
-}
+//         // Stage 3: wait auth result "a2 OK" or "a2 NO/BAD"
+//         if (stage === 3) {
+//           if (/^a2\s+OK\b/i.test(line)) {
+//             stage = 4;
+//             socket.write("a3 LOGOUT\r\n");
+//             cleanup();
+//             resolve({ ok: true });
+//           } else if (/^a2\s+(NO|BAD)\b/i.test(line)) {
+//             cleanup();
+//             reject(new Error(`AUTHENTICATE failed: ${line}`));
+//           }
+//           continue;
+//         }
+//       }
+//     });
+//   });
+// }
 
 /**
  * Cleanup ALL configured providers (those present in PROVIDERS and having env creds).
@@ -2450,7 +2450,7 @@ async function buildImapAuth(providerKey, cfg) {
     // ✅ ImapFlow expects accessToken for XOAUTH2 (it builds the SASL payload itself)
     return {
       user: cfg.email,
-      accessToken: token
+      accessToken: token,
     };
   }
 
@@ -3631,14 +3631,371 @@ module.exports = function deliverabilityRouter(deps = {}) {
   });
 
   // Debug route (optional)
+  // router.post("/test-connection", async (req, res) => {
+  //   const { provider, mode = "imap", to } = req.body;
+
+  //   try {
+  //     if (!provider)
+  //       return res
+  //         .status(400)
+  //         .json({ ok: false, message: "Provider is required." });
+
+  //     const cfg = getProviderConfig(provider);
+  //     if (!cfg) {
+  //       return res.status(400).json({
+  //         ok: false,
+  //         message:
+  //           "Provider not configured. Please check .env email & app password.",
+  //       });
+  //     }
+
+  //     if (provider === "microsoft_business" && mode === "smtp") {
+  //       return res.status(400).json({
+  //         ok: false,
+  //         message: "SMTP debug not supported for Microsoft OAuth mailbox.",
+  //       });
+  //     }
+
+  //     if (mode === "smtp") {
+  //       const transporter = nodemailer.createTransport({
+  //         host: cfg.smtp.host,
+  //         port: cfg.smtp.port,
+  //         secure: cfg.smtp.secure,
+  //         auth: { user: cfg.email, pass: cfg.pass },
+  //       });
+
+  //       const recipient = to || cfg.email;
+  //       const info = await transporter.sendMail({
+  //         from: `"Deliverability Debug" <${cfg.email}>`,
+  //         to: recipient,
+  //         subject: `Deliverability debug ${new Date().toISOString()}`,
+  //         text: "This is a test email from /test-connection SMTP.",
+  //       });
+
+  //       return res.json({
+  //         ok: true,
+  //         mode: "smtp",
+  //         provider,
+  //         from: cfg.email,
+  //         to: recipient,
+  //         messageId: info.messageId,
+  //       });
+  //     }
+
+  //     const auth = await buildImapAuth(provider, cfg);
+  //     const isMs = provider === "microsoft_business";
+
+  //     if (isMs) {
+  //       // buildImapAuth must return something that contains accessToken for MS
+  //       // If your buildImapAuth currently returns { user, pass }, change it to return { user, accessToken } for microsoft_business.
+  //       const accessToken = auth?.accessToken;
+
+  //       if (!accessToken) {
+  //         return res.status(500).json({
+  //           ok: false,
+  //           message: "IMAP connection failed.",
+  //           error: "Missing accessToken for Microsoft OAuth flow",
+  //         });
+  //       }
+
+  //       try {
+  //         await msImapXoauth2TwoStep({
+  //           host: cfg.imap.host,
+  //           port: cfg.imap.port,
+  //           user: cfg.email,
+  //           accessToken,
+  //           timeoutMs: 120_000,
+  //         });
+
+  //         return res.json({
+  //           ok: true,
+  //           mode: "imap",
+  //           provider,
+  //           email: cfg.email,
+  //           note: "IMAP login successful (Microsoft two-step XOAUTH2).",
+  //         });
+  //       } catch (e) {
+  //         return res.status(500).json({
+  //           ok: false,
+  //           message: "IMAP connection failed.",
+  //           error: e?.message || String(e),
+  //         });
+  //       }
+  //     }
+
+  //     // Non-Microsoft providers: keep ImapFlow
+  //     const client = new ImapFlow({
+  //       host: cfg.imap.host,
+  //       port: cfg.imap.port,
+  //       secure: cfg.imap.secure,
+  //       auth,
+  //       logger: false,
+  //       socketTimeout: 60_000,
+  //       greetingTimeout: 30_000,
+  //       tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
+  //     });
+
+  //     try {
+  //       await client.connect();
+  //       const lock = await client.getMailboxLock(cfg.inboxFolder || "INBOX");
+  //       lock.release();
+  //       await client.logout();
+  //       return res.json({
+  //         ok: true,
+  //         mode: "imap",
+  //         provider,
+  //         email: cfg.email,
+  //         note: "IMAP login successful.",
+  //       });
+  //     } catch (imapErr) {
+  //       // IMPORTANT: don't call logout() if not connected
+  //       try {
+  //         client.close();
+  //       } catch {}
+  //       return res.status(500).json({
+  //         ok: false,
+  //         message: "IMAP connection failed.",
+  //         error: imapErr?.message || String(imapErr),
+  //         code: imapErr?.code,
+  //         responseStatus: imapErr?.responseStatus,
+  //         responseText: imapErr?.responseText,
+  //         serverResponse: imapErr?.serverResponse,
+  //       });
+  //     }
+  //   } catch {
+  //     return res
+  //       .status(500)
+  //       .json({ ok: false, message: "Internal server error." });
+  //   }
+  // });
+
+  // ✅ Fix B: Microsoft IMAP XOAUTH2 two-step auth (NO SASL-IR inline blob)
+  // Paste this whole block to REPLACE your current /test-connection handler.
+  // (Keep your existing getProviderConfig(), buildImapAuth(), nodemailer, ImapFlow imports as-is.)
+
+
+  /** Build XOAUTH2 base64 payload */
+  function buildXoauth2B64(user, accessToken) {
+    // format: "user=<email>\x01auth=Bearer <token>\x01\x01"
+    const str = `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
+    return Buffer.from(str, "utf8").toString("base64");
+  }
+
+  /**
+   * Very small IMAP line reader over TLS for Microsoft Exchange IMAP.
+   * Does:
+   *  - waits greeting
+   *  - CAPABILITY (optional)
+   *  - AUTHENTICATE XOAUTH2   (no initial response)
+   *  - waits '+' challenge
+   *  - sends base64 on new line
+   *  - expects tagged OK
+   *  - LOGOUT
+   */
+  async function msImapXoauth2TwoStep({
+    host,
+    port = 993,
+    user,
+    accessToken,
+    timeoutMs = 120000,
+  }) {
+    if (!host) throw new Error("msImapXoauth2TwoStep: host is required");
+    if (!user) throw new Error("msImapXoauth2TwoStep: user is required");
+    if (!accessToken)
+      throw new Error("msImapXoauth2TwoStep: accessToken is required");
+
+    const xoauth2B64 = buildXoauth2B64(user, accessToken);
+
+    let socket;
+    let timer;
+
+    const startTimeout = (label) => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        try {
+          socket?.destroy(new Error(`IMAP timeout: ${label}`));
+        } catch {}
+      }, timeoutMs);
+    };
+
+    // Buffered line reader (handles \r\n framing)
+    let buf = "";
+    const waiters = [];
+    const pushLine = (line) => {
+      for (let i = 0; i < waiters.length; i++) {
+        const w = waiters[i];
+        if (w.predicate(line)) {
+          waiters.splice(i, 1);
+          w.resolve(line);
+          return;
+        }
+      }
+    };
+    const readLine = () =>
+      new Promise((resolve, reject) => {
+        waiters.push({
+          predicate: () => true,
+          resolve,
+        });
+      });
+
+    const readUntil = (predicate, label) =>
+      new Promise((resolve, reject) => {
+        startTimeout(label);
+        waiters.push({
+          predicate,
+          resolve,
+        });
+      });
+
+    const writeLine = (s) => {
+      socket.write(s + "\r\n");
+    };
+
+    const tag = (() => {
+      let n = 1;
+      return () => `A${String(n++).padStart(3, "0")}`;
+    })();
+
+    const execTagged = async (cmd, label) => {
+      const t = tag();
+      writeLine(`${t} ${cmd}`);
+
+      // Collect until we get tagged completion line
+      while (true) {
+        const line = await readLine(); // any line
+        // tagged OK/NO/BAD lines start with the same tag
+        if (line.startsWith(t + " ")) {
+          if (/^A\d+\s+OK\b/i.test(line)) return { ok: true, line };
+          // include server message in thrown error
+          throw new Error(`IMAP ${label} failed: ${line}`);
+        }
+        // ignore untagged lines here
+      }
+    };
+
+    return new Promise((resolve, reject) => {
+      try {
+        socket = tls.connect(
+          {
+            host,
+            port,
+            servername: host,
+            minVersion: "TLSv1.2",
+            rejectUnauthorized: true,
+          },
+          async () => {
+            try {
+              startTimeout("greeting");
+
+              // Wait greeting "* OK ..."
+              while (true) {
+                const line = await readLine();
+                if (/^\*\s+OK\b/i.test(line)) break;
+                // If server sends something weird, keep reading
+              }
+
+              // CAPABILITY (optional but nice)
+              try {
+                await execTagged("CAPABILITY", "CAPABILITY");
+              } catch {
+                // ignore capability failures; auth might still work
+              }
+
+              // AUTHENTICATE XOAUTH2 (two-step: no initial response)
+              const t = tag();
+              writeLine(`${t} AUTHENTICATE XOAUTH2`);
+
+              // Wait for "+" challenge OR immediate tagged fail
+              while (true) {
+                const line = await readLine();
+
+                // Server requests the response
+                if (line.startsWith("+")) break;
+
+                // Tagged completion without challenge => fail
+                if (line.startsWith(t + " ")) {
+                  throw new Error(`IMAP AUTHENTICATE failed: ${line}`);
+                }
+
+                // continue on untagged
+              }
+
+              // Send the base64 as its own line (no quotes)
+              writeLine(xoauth2B64);
+
+              // Now wait for tagged OK/NO/BAD for that tag
+              while (true) {
+                const line = await readLine();
+                if (line.startsWith(t + " ")) {
+                  if (/^A\d+\s+OK\b/i.test(line)) break;
+                  throw new Error(`IMAP XOAUTH2 rejected: ${line}`);
+                }
+              }
+
+              // Clean logout (best effort)
+              try {
+                await execTagged("LOGOUT", "LOGOUT");
+              } catch {}
+
+              clearTimeout(timer);
+              try {
+                socket.end();
+              } catch {}
+
+              resolve(true);
+            } catch (err) {
+              clearTimeout(timer);
+              try {
+                socket.destroy();
+              } catch {}
+              reject(err);
+            }
+          },
+        );
+
+        socket.setEncoding("utf8");
+
+        socket.on("data", (chunk) => {
+          buf += chunk;
+          while (true) {
+            const idx = buf.indexOf("\n");
+            if (idx === -1) break;
+            let line = buf.slice(0, idx);
+            buf = buf.slice(idx + 1);
+            line = line.replace(/\r$/, "");
+            if (line.length) pushLine(line);
+          }
+        });
+
+        socket.on("error", (e) => {
+          clearTimeout(timer);
+          reject(e);
+        });
+
+        socket.on("end", () => {
+          // If socket ends unexpectedly, any pending waits will hang; reject fast
+          clearTimeout(timer);
+        });
+      } catch (e) {
+        clearTimeout(timer);
+        try {
+          socket?.destroy();
+        } catch {}
+        reject(e);
+      }
+    });
+  }
+
   router.post("/test-connection", async (req, res) => {
     const { provider, mode = "imap", to } = req.body;
 
     try {
-      if (!provider)
+      if (!provider) {
         return res
           .status(400)
           .json({ ok: false, message: "Provider is required." });
+      }
 
       const cfg = getProviderConfig(provider);
       if (!cfg) {
@@ -3656,6 +4013,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       }
 
+      // ───────────────────────── SMTP test (non-MS + MS non-supported above)
       if (mode === "smtp") {
         const transporter = nodemailer.createTransport({
           host: cfg.smtp.host,
@@ -3682,12 +4040,12 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       }
 
+      // ───────────────────────── IMAP
       const auth = await buildImapAuth(provider, cfg);
       const isMs = provider === "microsoft_business";
 
+      // ✅ Microsoft: use manual two-step XOAUTH2 flow (Fix B)
       if (isMs) {
-        // buildImapAuth must return something that contains accessToken for MS
-        // If your buildImapAuth currently returns { user, pass }, change it to return { user, accessToken } for microsoft_business.
         const accessToken = auth?.accessToken;
 
         if (!accessToken) {
@@ -3701,10 +4059,10 @@ module.exports = function deliverabilityRouter(deps = {}) {
         try {
           await msImapXoauth2TwoStep({
             host: cfg.imap.host,
-            port: cfg.imap.port,
+            port: cfg.imap.port || 993,
             user: cfg.email,
             accessToken,
-            timeoutMs: 120_000,
+            timeoutMs: 120000,
           });
 
           return res.json({
@@ -3712,7 +4070,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
             mode: "imap",
             provider,
             email: cfg.email,
-            note: "IMAP login successful (Microsoft two-step XOAUTH2).",
+            note: "IMAP login successful (Microsoft XOAUTH2 two-step).",
           });
         } catch (e) {
           return res.status(500).json({
@@ -3723,15 +4081,15 @@ module.exports = function deliverabilityRouter(deps = {}) {
         }
       }
 
-      // Non-Microsoft providers: keep ImapFlow
+      // ───────────────────────── Non-Microsoft providers: keep ImapFlow
       const client = new ImapFlow({
         host: cfg.imap.host,
         port: cfg.imap.port,
         secure: cfg.imap.secure,
         auth,
         logger: false,
-        socketTimeout: 60_000,
-        greetingTimeout: 30_000,
+        socketTimeout: 60000,
+        greetingTimeout: 30000,
         tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
       });
 
@@ -3740,6 +4098,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
         const lock = await client.getMailboxLock(cfg.inboxFolder || "INBOX");
         lock.release();
         await client.logout();
+
         return res.json({
           ok: true,
           mode: "imap",
@@ -3752,6 +4111,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
         try {
           client.close();
         } catch {}
+
         return res.status(500).json({
           ok: false,
           message: "IMAP connection failed.",
@@ -3762,10 +4122,12 @@ module.exports = function deliverabilityRouter(deps = {}) {
           serverResponse: imapErr?.serverResponse,
         });
       }
-    } catch {
-      return res
-        .status(500)
-        .json({ ok: false, message: "Internal server error." });
+    } catch (e) {
+      return res.status(500).json({
+        ok: false,
+        message: "Internal server error.",
+        error: e?.message || String(e),
+      });
     }
   });
 
