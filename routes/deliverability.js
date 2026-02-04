@@ -400,7 +400,10 @@ async function exchangeMsCodeForTokens(code) {
   body.set("grant_type", "authorization_code");
   body.set("code", String(code));
   body.set("redirect_uri", redirectUri);
-  body.set("scope", "offline_access IMAP.AccessAsUser.All");
+  body.set(
+    "scope",
+    "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+  );
 
   const resp = await fetch(tokenUrl, {
     method: "POST",
@@ -440,7 +443,10 @@ async function fetchMsAccessTokenByRefreshToken() {
   body.set("grant_type", "refresh_token");
   body.set("refresh_token", refreshToken);
   body.set("redirect_uri", redirectUri);
-  body.set("scope", "offline_access IMAP.AccessAsUser.All");
+  body.set(
+    "scope",
+    "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+  );
 
   const resp = await fetch(tokenUrl, {
     method: "POST",
@@ -474,7 +480,10 @@ function msAuthorizeUrl() {
   params.set("client_id", clientId);
   params.set("response_type", "code");
   params.set("redirect_uri", redirectUri);
-  params.set("scope", "offline_access IMAP.AccessAsUser.All");
+  params.set(
+    "scope",
+    "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+  );
   params.set("prompt", "consent");
   params.set("state", "truesendr_ms_deliv");
 
