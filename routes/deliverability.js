@@ -402,7 +402,7 @@ async function exchangeMsCodeForTokens(code) {
   body.set("redirect_uri", redirectUri);
   body.set(
     "scope",
-    "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+    "offline_access https://outlook.office365.com/IMAP.AccessAsUser.All",
   );
 
   const resp = await fetch(tokenUrl, {
@@ -445,7 +445,7 @@ async function fetchMsAccessTokenByRefreshToken() {
   body.set("redirect_uri", redirectUri);
   body.set(
     "scope",
-    "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+    "offline_access https://outlook.office365.com/IMAP.AccessAsUser.All",
   );
 
   const resp = await fetch(tokenUrl, {
@@ -482,7 +482,7 @@ function msAuthorizeUrl() {
   params.set("redirect_uri", redirectUri);
   params.set(
     "scope",
-    "offline_access https://outlook.office.com/IMAP.AccessAsUser.All",
+    "offline_access https://outlook.office365.com/IMAP.AccessAsUser.All",
   );
   params.set("prompt", "consent");
   params.set("state", "truesendr_ms_deliv");
@@ -1714,13 +1714,17 @@ module.exports = function deliverabilityRouter(deps = {}) {
 
       const auth = await buildImapAuth(provider, cfg);
 
+      const isMs = provider === "microsoft_business";
+
       const client = new ImapFlow({
         host: cfg.imap.host,
         port: cfg.imap.port,
         secure: cfg.imap.secure,
         auth,
+        authMethod: isMs ? "XOAUTH2" : undefined, // ✅ force OAuth2 for Microsoft
         logger: false,
-        socketTimeout: 60_000,
+        socketTimeout: 120_000, // ✅ Microsoft can be slow
+        tls: { servername: cfg.imap.host }, // ✅ SNI
       });
 
       try {
