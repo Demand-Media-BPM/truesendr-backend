@@ -1819,6 +1819,7 @@ const mongoose = require("mongoose");
 const { ImapFlow } = require("imapflow");
 const nodemailer = require("nodemailer");
 const User = require("../models/User");
+const tls = require("tls");
 
 const DELIV_CREDITS_PER_MAILBOX = Number(
   process.env.DELIV_CREDITS_PER_MAILBOX || 1,
@@ -1915,6 +1916,10 @@ const PROVIDERS = {
   },
 };
 
+process.on("unhandledRejection", (err) => {
+  console.log("[deliverability] unhandledRejection:", err?.message || err);
+});
+
 const MS_48H = 48 * 60 * 60 * 1000;
 const RETRY_INTERVAL_MS = 60 * 1000;
 
@@ -1963,11 +1968,14 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
   const auth = await buildImapAuth(providerKey, cfg);
   const isMs = providerKey === "microsoft_business";
 
+  // ✅ For cleanup we still use ImapFlow, including Microsoft.
+  // (The XOAUTH2 problem is mainly with AUTH inline; cleanup uses normal IMAP ops after login.)
   const client = new ImapFlow({
     host: cfg.imap.host,
     port: cfg.imap.port,
     secure: cfg.imap.secure,
     auth,
+    authMethod: isMs ? "XOAUTH2" : undefined, // ✅ needed for MS in ImapFlow
     logger: {
       debug: (obj) => console.log("[IMAP][debug]", obj),
       info: (obj) => console.log("[IMAP][info]", obj),
@@ -2197,10 +2205,7 @@ async function exchangeMsCodeForTokens(code) {
   body.set("grant_type", "authorization_code");
   body.set("code", String(code));
   body.set("redirect_uri", redirectUri);
-  body.set(
-    "scope",
-    "https://outlook.office.com/IMAP.AccessAsUser.All",
-  );
+  body.set("scope", "https://outlook.office.com/IMAP.AccessAsUser.All");
 
   const resp = await fetch(tokenUrl, {
     method: "POST",
@@ -2424,6 +2429,376 @@ async function searchSubjectInFolder(client, folderName, subject) {
   }
 }
 
+async function msImapSearchSubjectInFolder({
+  host,
+  port = 993,
+  user,
+  accessToken,
+  folderName,
+  subject,
+  timeoutMs = 55_000,
+}) {
+  const xoauth2 = Buffer.from(
+    `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
+    "utf8",
+  ).toString("base64");
+
+  return await new Promise((resolve, reject) => {
+    const socket = tls.connect(
+      { host, port, servername: host, minVersion: "TLSv1.2" },
+      () => {},
+    );
+
+    const cleanup = () => {
+      try {
+        socket.end();
+      } catch {}
+      try {
+        socket.destroy();
+      } catch {}
+    };
+
+    socket.setTimeout(timeoutMs, () => {
+      cleanup();
+      reject(new Error("IMAP timeout"));
+    });
+
+    socket.on("error", (e) => {
+      cleanup();
+      reject(e);
+    });
+
+    let buf = "";
+    let tagN = 1;
+
+    const send = (line) => socket.write(line + "\r\n");
+
+    const waitTagged = (tag, onOk, onNoBad) => {
+      const handler = (line) => {
+        if (line.startsWith(tag + " OK")) {
+          off(handler);
+          onOk(line);
+        } else if (
+          line.startsWith(tag + " NO") ||
+          line.startsWith(tag + " BAD")
+        ) {
+          off(handler);
+          onNoBad(line);
+        }
+      };
+      on(handler);
+    };
+
+    const listeners = new Set();
+    const on = (fn) => listeners.add(fn);
+    const off = (fn) => listeners.delete(fn);
+
+    const emitLine = (line) => {
+      for (const fn of listeners) fn(line);
+    };
+
+    const searchTerm = String(subject || "")
+      .trim()
+      .toLowerCase();
+    if (!searchTerm) {
+      cleanup();
+      return resolve(false);
+    }
+
+    let stage = 0;
+    let found = false;
+    let msgIds = [];
+
+    socket.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      while (true) {
+        const idx = buf.indexOf("\n");
+        if (idx === -1) break;
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+
+        emitLine(line);
+
+        // greeting
+        if (stage === 0) {
+          if (/^\*\s+OK\b/i.test(line)) {
+            stage = 1;
+            const t = "a" + tagN++;
+            send(`${t} CAPABILITY`);
+            waitTagged(
+              t,
+              () => {
+                stage = 2;
+                const t2 = "a" + tagN++;
+                send(`${t2} AUTHENTICATE XOAUTH2`);
+                waitTagged(
+                  t2,
+                  () => {
+                    // authenticated
+                  },
+                  (bad) => {
+                    cleanup();
+                    reject(new Error(`AUTHENTICATE rejected: ${bad}`));
+                  },
+                );
+              },
+              (bad) => {
+                cleanup();
+                reject(new Error(`CAPABILITY failed: ${bad}`));
+              },
+            );
+          }
+          continue;
+        }
+
+        // AUTH continuation '+'
+        if (stage === 2) {
+          if (/^\+\s*/.test(line)) {
+            stage = 3;
+            send(xoauth2);
+            continue;
+          }
+        }
+
+        // After AUTH OK, do SELECT
+        if (stage === 3) {
+          // When auth finishes, server will send tagged OK for AUTHENTICATE
+          // We start SELECT after we see any "OK" tagged for AUTH (Imap servers vary).
+          if (/^a\d+\s+OK\b/i.test(line)) {
+            stage = 4;
+            const t3 = "a" + tagN++;
+            send(`${t3} SELECT "${folderName}"`);
+            waitTagged(
+              t3,
+              () => {
+                stage = 5;
+                const t4 = "a" + tagN++;
+                send(`${t4} SEARCH ALL`);
+                waitTagged(
+                  t4,
+                  () => {
+                    stage = 6;
+
+                    // last 50 ids
+                    msgIds = msgIds.slice(-50);
+
+                    if (msgIds.length === 0) {
+                      const tOut = "a" + tagN++;
+                      send(`${tOut} LOGOUT`);
+                      cleanup();
+                      return resolve(false);
+                    }
+
+                    let i = 0;
+                    const fetchNext = () => {
+                      if (i >= msgIds.length) {
+                        const tOut2 = "a" + tagN++;
+                        send(`${tOut2} LOGOUT`);
+                        cleanup();
+                        return resolve(found);
+                      }
+
+                      const id = msgIds[i++];
+                      const tF = "a" + tagN++;
+                      let headerBuf = [];
+
+                      const headerListener = (l) => {
+                        if (/^Subject:/i.test(l)) headerBuf.push(l);
+                      };
+                      on(headerListener);
+
+                      send(
+                        `${tF} FETCH ${id} (BODY.PEEK[HEADER.FIELDS (SUBJECT)])`,
+                      );
+                      waitTagged(
+                        tF,
+                        () => {
+                          off(headerListener);
+                          const subjLine = headerBuf.join(" ");
+                          if (subjLine.toLowerCase().includes(searchTerm)) {
+                            found = true;
+                          }
+                          fetchNext();
+                        },
+                        (bad) => {
+                          off(headerListener);
+                          // ignore this message, continue
+                          fetchNext();
+                        },
+                      );
+                    };
+
+                    fetchNext();
+                  },
+                  (bad) => {
+                    cleanup();
+                    reject(new Error(`SEARCH failed: ${bad}`));
+                  },
+                );
+              },
+              (bad) => {
+                // folder missing is common, treat as "not found"
+                cleanup();
+                resolve(false);
+              },
+            );
+          }
+
+          continue;
+        }
+
+        // collect SEARCH ids
+        if (stage >= 5) {
+          const m = line.match(/^\*\s+SEARCH\s*(.*)$/i);
+          if (m) {
+            const ids = m[1]
+              .trim()
+              .split(/\s+/)
+              .filter(Boolean)
+              .map((x) => parseInt(x, 10))
+              .filter((n) => Number.isFinite(n));
+            msgIds.push(...ids);
+          }
+        }
+      }
+    });
+  });
+}
+
+async function msImapXoauth2TwoStep({
+  host,
+  port = 993,
+  user,
+  accessToken,
+  timeoutMs = 55_000,
+}) {
+  if (!accessToken) throw new Error("Missing accessToken");
+
+  const xoauth2 = Buffer.from(
+    `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
+    "utf8",
+  ).toString("base64");
+
+  return await new Promise((resolve, reject) => {
+    const socket = tls.connect(
+      { host, port, servername: host, minVersion: "TLSv1.2" },
+      () => {},
+    );
+
+    const cleanup = () => {
+      try {
+        socket.end();
+      } catch {}
+      try {
+        socket.destroy();
+      } catch {}
+    };
+
+    socket.setTimeout(timeoutMs, () => {
+      cleanup();
+      reject(new Error("IMAP timeout"));
+    });
+
+    socket.on("error", (e) => {
+      cleanup();
+      reject(e);
+    });
+
+    let buf = "";
+    let tagN = 1;
+
+    const send = (line) => socket.write(line + "\r\n");
+
+    const listeners = new Set();
+    const on = (fn) => listeners.add(fn);
+    const off = (fn) => listeners.delete(fn);
+    const emitLine = (line) => {
+      for (const fn of listeners) fn(line);
+    };
+
+    const waitTagged = (tag, onOk, onNoBad) => {
+      const handler = (line) => {
+        if (line.startsWith(tag + " OK")) {
+          off(handler);
+          onOk(line);
+        } else if (
+          line.startsWith(tag + " NO") ||
+          line.startsWith(tag + " BAD")
+        ) {
+          off(handler);
+          onNoBad(line);
+        }
+      };
+      on(handler);
+    };
+
+    let stage = 0;
+
+    socket.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      while (true) {
+        const idx = buf.indexOf("\n");
+        if (idx === -1) break;
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+
+        emitLine(line);
+
+        // greeting
+        if (stage === 0) {
+          if (/^\*\s+OK\b/i.test(line)) {
+            stage = 1;
+            const t = "a" + tagN++;
+            send(`${t} CAPABILITY`);
+            waitTagged(
+              t,
+              () => {
+                stage = 2;
+                const t2 = "a" + tagN++;
+                send(`${t2} AUTHENTICATE XOAUTH2`);
+                waitTagged(
+                  t2,
+                  () => {
+                    // will continue with '+' then base64 then OK
+                  },
+                  (bad) => {
+                    cleanup();
+                    reject(new Error(`AUTHENTICATE rejected: ${bad}`));
+                  },
+                );
+              },
+              (bad) => {
+                cleanup();
+                reject(new Error(`CAPABILITY failed: ${bad}`));
+              },
+            );
+          }
+          continue;
+        }
+
+        // AUTH continuation '+'
+        if (stage === 2) {
+          if (/^\+\s*/.test(line)) {
+            stage = 3;
+            send(xoauth2);
+            continue;
+          }
+        }
+
+        // Success: tagged OK after auth
+        if (stage === 3) {
+          if (/^a\d+\s+OK\b/i.test(line)) {
+            const tOut = "a" + tagN++;
+            send(`${tOut} LOGOUT`);
+            cleanup();
+            return resolve(true);
+          }
+        }
+      }
+    });
+  });
+}
+
 async function checkSingleMailbox(providerKey, email, subject) {
   const cfg = getProviderConfig(providerKey);
 
@@ -2444,8 +2819,76 @@ async function checkSingleMailbox(providerKey, email, subject) {
   }
 
   const auth = await buildImapAuth(providerKey, cfg);
-
   const isMs = providerKey === "microsoft_business";
+
+  if (isMs) {
+    try {
+      const accessToken = auth?.accessToken;
+      if (!accessToken) {
+        return {
+          ...result,
+          status: "error",
+          error: "Missing Microsoft accessToken (refresh flow failed).",
+          lastCheckedAt: new Date(),
+        };
+      }
+
+      const inboxFolder = cfg.inboxFolder || "INBOX";
+
+      const foundInbox = await msImapSearchSubjectInFolder({
+        host: cfg.imap.host,
+        port: cfg.imap.port,
+        user: cfg.email,
+        accessToken,
+        folderName: inboxFolder,
+        subject,
+        timeoutMs: 55_000,
+      });
+
+      if (foundInbox) {
+        return {
+          ...result,
+          status: "inbox",
+          folder: inboxFolder,
+          lastCheckedAt: new Date(),
+        };
+      }
+
+      const spamFoldersToTry = [];
+      if (cfg.spamFolder) spamFoldersToTry.push(cfg.spamFolder);
+      if (Array.isArray(cfg.spamFolderAlternates))
+        spamFoldersToTry.push(...cfg.spamFolderAlternates);
+
+      for (const sf of spamFoldersToTry) {
+        const foundSpam = await msImapSearchSubjectInFolder({
+          host: cfg.imap.host,
+          port: cfg.imap.port,
+          user: cfg.email,
+          accessToken,
+          folderName: sf,
+          subject,
+          timeoutMs: 55_000,
+        });
+        if (foundSpam) {
+          return {
+            ...result,
+            status: "spam",
+            folder: sf,
+            lastCheckedAt: new Date(),
+          };
+        }
+      }
+
+      return { ...result, status: "not_received", lastCheckedAt: new Date() };
+    } catch (e) {
+      return {
+        ...result,
+        status: "error",
+        error: e?.message || String(e),
+        lastCheckedAt: new Date(),
+      };
+    }
+  }
 
   const client = new ImapFlow({
     host: cfg.imap.host,
@@ -3507,20 +3950,63 @@ module.exports = function deliverabilityRouter(deps = {}) {
       }
 
       // IMAP test (ALL providers including Microsoft via ImapFlow)
+      // const auth = await buildImapAuth(provider, cfg);
+      // const isMs = provider === "microsoft_business";
+
+      // const client = new ImapFlow({
+      //   host: cfg.imap.host,
+      //   port: cfg.imap.port,
+      //   secure: cfg.imap.secure,
+      //   auth,
+      //   logger: false,
+
+      //   // ✅ keep under nginx proxy timeout to avoid 504
+      //   socketTimeout: isMs ? 55_000 : 60_000,
+      //   greetingTimeout: isMs ? 55_000 : 30_000,
+
+      //   tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
+      // });
+
+      // IMAP test
       const auth = await buildImapAuth(provider, cfg);
       const isMs = provider === "microsoft_business";
 
+      if (isMs) {
+        // ✅ Exchange hates ImapFlow's inline XOAUTH2; use two-step AUTHENTICATE
+        try {
+          await msImapXoauth2TwoStep({
+            host: cfg.imap.host,
+            port: cfg.imap.port,
+            user: cfg.email,
+            accessToken: auth?.accessToken,
+            timeoutMs: 55_000, // keep below nginx timeouts
+          });
+
+          return res.json({
+            ok: true,
+            mode: "imap",
+            provider,
+            email: cfg.email,
+            note: "IMAP login successful (Microsoft XOAUTH2 two-step).",
+          });
+        } catch (e) {
+          return res.status(500).json({
+            ok: false,
+            message: "IMAP connection failed.",
+            error: e?.message || String(e),
+          });
+        }
+      }
+
+      // ✅ Non-Microsoft providers: keep ImapFlow
       const client = new ImapFlow({
         host: cfg.imap.host,
         port: cfg.imap.port,
         secure: cfg.imap.secure,
         auth,
         logger: false,
-
-        // ✅ keep under nginx proxy timeout to avoid 504
-        socketTimeout: isMs ? 55_000 : 60_000,
-        greetingTimeout: isMs ? 55_000 : 30_000,
-
+        socketTimeout: 60_000,
+        greetingTimeout: 30_000,
         tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
       });
 
