@@ -187,7 +187,8 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
       error: (obj) => console.log("[IMAP][error]", obj),
     },
     socketTimeout: isMs ? 120_000 : 60_000,
-    tls: { servername: cfg.imap.host },
+    greetingTimeout: isMs ? 120_000 : 30_000,
+    tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
   });
 
   const details = [];
@@ -518,11 +519,12 @@ async function buildImapAuth(providerKey, cfg) {
   if (isMicrosoftProvider(providerKey)) {
     const token = await fetchMsAccessTokenByRefreshToken();
 
-    // ✅ Give ImapFlow the access token (not base64 "pass")
+    // ✅ Office365 + ImapFlow: use base64 xoauth2 string as "pass"
     const xoauth2 = buildXOAuth2(cfg.email, token);
+
     return {
       user: cfg.email,
-      pass: xoauth2, // ✅ base64 XOAUTH2 initial response
+      pass: xoauth2,
     };
   }
 
@@ -683,7 +685,8 @@ async function checkSingleMailbox(providerKey, email, subject) {
 
     logger: false,
     socketTimeout: isMs ? 120_000 : 60_000,
-    tls: { servername: cfg.imap.host },
+    greetingTimeout: isMs ? 120_000 : 30_000,
+    tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
   });
 
   client.on("error", () => {});
@@ -1769,8 +1772,9 @@ module.exports = function deliverabilityRouter(deps = {}) {
         auth,
         authMethod: isMs ? "XOAUTH2" : undefined, // ✅ force OAuth2 for Microsoft
         logger: false,
-        socketTimeout: 120_000, // ✅ Microsoft can be slow
-        tls: { servername: cfg.imap.host }, // ✅ SNI
+        socketTimeout: isMs ? 120_000 : 60_000,
+        greetingTimeout: isMs ? 120_000 : 30_000,
+        tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
       });
 
       try {
