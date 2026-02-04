@@ -160,12 +160,26 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
 
   const auth = await buildImapAuth(providerKey, cfg);
 
+  // const client = new ImapFlow({
+  //   host: cfg.imap.host,
+  //   port: cfg.imap.port,
+  //   secure: cfg.imap.secure,
+  //   auth,
+  //   logger: false,
+  //   socketTimeout: 60_000,
+  // });
+
   const client = new ImapFlow({
     host: cfg.imap.host,
     port: cfg.imap.port,
     secure: cfg.imap.secure,
     auth,
-    logger: false,
+    logger: {
+      debug: (obj) => console.log("[IMAP][debug]", obj),
+      info: (obj) => console.log("[IMAP][info]", obj),
+      warn: (obj) => console.log("[IMAP][warn]", obj),
+      error: (obj) => console.log("[IMAP][error]", obj),
+    },
     socketTimeout: 60_000,
   });
 
@@ -436,6 +450,9 @@ async function fetchMsAccessTokenByRefreshToken() {
   }
 
   const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+
+  console.log("[MS] tenant:", tenant);
+  console.log("[MS] has refresh token:", !!refreshToken);
 
   const body = new URLSearchParams();
   body.set("client_id", clientId);
@@ -1746,7 +1763,11 @@ module.exports = function deliverabilityRouter(deps = {}) {
         return res.status(500).json({
           ok: false,
           message: "IMAP connection failed.",
-          error: imapErr.message || String(imapErr),
+          error: imapErr?.message || String(imapErr),
+          code: imapErr?.code,
+          responseStatus: imapErr?.responseStatus,
+          responseText: imapErr?.responseText,
+          serverResponse: imapErr?.serverResponse,
         });
       }
     } catch {
