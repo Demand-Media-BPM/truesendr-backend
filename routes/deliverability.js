@@ -169,18 +169,25 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
   //   socketTimeout: 60_000,
   // });
 
+  const isMs = providerKey === "microsoft_business";
+
   const client = new ImapFlow({
     host: cfg.imap.host,
     port: cfg.imap.port,
     secure: cfg.imap.secure,
     auth,
+
+    // ✅ MUST for Exchange
+    authMethod: isMs ? "XOAUTH2" : undefined,
+
     logger: {
       debug: (obj) => console.log("[IMAP][debug]", obj),
       info: (obj) => console.log("[IMAP][info]", obj),
       warn: (obj) => console.log("[IMAP][warn]", obj),
       error: (obj) => console.log("[IMAP][error]", obj),
     },
-    socketTimeout: 60_000,
+    socketTimeout: isMs ? 120_000 : 60_000,
+    tls: { servername: cfg.imap.host },
   });
 
   const details = [];
@@ -510,8 +517,16 @@ function msAuthorizeUrl() {
 async function buildImapAuth(providerKey, cfg) {
   if (isMicrosoftProvider(providerKey)) {
     const token = await fetchMsAccessTokenByRefreshToken();
-    return { user: cfg.email, accessToken: token };
+
+    // ✅ Exchange is picky: provide XOAUTH2 "pass" string instead of accessToken field
+    const xoauth2 = buildXOAuth2(cfg.email, token);
+
+    return {
+      user: cfg.email,
+      pass: xoauth2,
+    };
   }
+
   return { user: cfg.email, pass: cfg.pass };
 }
 
@@ -656,13 +671,20 @@ async function checkSingleMailbox(providerKey, email, subject) {
 
   const auth = await buildImapAuth(providerKey, cfg);
 
+  const isMs = providerKey === "microsoft_business";
+
   const client = new ImapFlow({
     host: cfg.imap.host,
     port: cfg.imap.port,
     secure: cfg.imap.secure,
     auth,
+
+    // ✅ MUST for Exchange
+    authMethod: isMs ? "XOAUTH2" : undefined,
+
     logger: false,
-    socketTimeout: 60_000,
+    socketTimeout: isMs ? 120_000 : 60_000,
+    tls: { servername: cfg.imap.host },
   });
 
   client.on("error", () => {});
@@ -764,6 +786,11 @@ function makePusher(deps) {
       push(username, payload);
     } catch {}
   };
+}
+
+function buildXOAuth2(userEmail, accessToken) {
+  const s = `user=${userEmail}\x01auth=Bearer ${accessToken}\x01\x01`;
+  return Buffer.from(s, "utf8").toString("base64");
 }
 
 function buildRealtimePayload(testDoc, extra = {}) {
