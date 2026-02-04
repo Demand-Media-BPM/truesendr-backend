@@ -1,1306 +1,3 @@
-// // backend/routes/deliverability.js
-// const express = require("express");
-// const router = express.Router();
-// const mongoose = require("mongoose");
-// const { ImapFlow } = require("imapflow");
-// const nodemailer = require("nodemailer");
-// const User = require("../models/User");
-// const DELIV_CREDITS_PER_MAILBOX = 1;
-
-// // ───────────────────────────────────────────────────────────────
-// // Provider configuration (Gmail + Zoho for now)
-// // ───────────────────────────────────────────────────────────────
-// const PROVIDERS = {
-//   gmail: {
-//     label: "Google",
-//     emailEnv: "DELIV_GMAIL_EMAIL",
-//     passEnv: "DELIV_GMAIL_APP_PW",
-//     imap: { host: "imap.gmail.com", port: 993, secure: true },
-//     smtp: { host: "smtp.gmail.com", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "[Gmail]/Spam",
-//     extraFolders: ["[Gmail]/All Mail"],
-//   },
-//   zoho: {
-//     label: "Zoho",
-//     emailEnv: "DELIV_ZOHO_EMAIL",
-//     passEnv: "DELIV_ZOHO_APP_PW",
-//     imap: { host: "imap.zoho.in", port: 993, secure: true },
-//     smtp: { host: "smtp.zoho.in", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Spam",
-//   },
-//   // Google Workspace / Google Business (same servers as Gmail, different creds)
-//   google_business: {
-//     label: "Google Business",
-//     emailEnv: "DELIV_GBUSINESS_EMAIL",
-//     passEnv: "DELIV_GBUSINESS_APP_PW",
-//     imap: { host: "imap.gmail.com", port: 993, secure: true },
-//     smtp: { host: "smtp.gmail.com", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "[Gmail]/Spam",
-//     extraFolders: ["[Gmail]/All Mail"],
-//   },
-
-//   // Yahoo
-//   yahoo: {
-//     label: "Yahoo",
-//     emailEnv: "DELIV_YAHOO_EMAIL",
-//     passEnv: "DELIV_YAHOO_APP_PW",
-//     imap: { host: "imap.mail.yahoo.com", port: 993, secure: true },
-//     smtp: { host: "smtp.mail.yahoo.com", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Bulk",
-//   },
-
-//   // AOL
-//   aol: {
-//     label: "AOL",
-//     emailEnv: "DELIV_AOL_EMAIL",
-//     passEnv: "DELIV_AOL_APP_PW",
-//     imap: { host: "imap.aol.com", port: 993, secure: true },
-//     smtp: { host: "smtp.aol.com", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Bulk",
-//   },
-
-//   // Hotmail / Outlook.com (consumer Microsoft accounts)
-//   hotmail: {
-//     label: "Hotmail",
-//     emailEnv: "DELIV_HOTMAIL_EMAIL",
-//     passEnv: "DELIV_HOTMAIL_APP_PW",
-//     imap: { host: "imap-mail.outlook.com", port: 993, secure: true },
-//     // Port 587 + STARTTLS => secure: false
-//     smtp: { host: "smtp-mail.outlook.com", port: 587, secure: false },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Junk",
-//   },
-
-//   // Microsoft Business (Office 365 / Microsoft 365)
-//   microsoft_business: {
-//     label: "Microsoft Business",
-//     emailEnv: "DELIV_MS_BUSINESS_EMAIL",
-//     passEnv: "DELIV_MS_BUSINESS_APP_PW",
-//     imap: { host: "outlook.office365.com", port: 993, secure: true },
-//     smtp: { host: "smtp.office365.com", port: 587, secure: false },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Junk Email",
-//   },
-
-//   // Ziggo
-//   ziggo: {
-//     label: "Ziggo",
-//     emailEnv: "DELIV_ZIGGO_EMAIL",
-//     passEnv: "DELIV_ZIGGO_APP_PW",
-//     imap: { host: "imap.ziggo.nl", port: 993, secure: true },
-//     smtp: { host: "smtp.ziggo.nl", port: 587, secure: false },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Spam",
-//   },
-
-//   // Rambler
-//   rambler: {
-//     label: "Rambler",
-//     emailEnv: "DELIV_RAMBLER_EMAIL",
-//     passEnv: "DELIV_RAMBLER_APP_PW",
-//     imap: { host: "imap.rambler.ru", port: 993, secure: true },
-//     smtp: { host: "smtp.rambler.ru", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Spam",
-//   },
-
-//   // GMX
-//   gmx: {
-//     label: "GMX",
-//     emailEnv: "DELIV_GMX_EMAIL",
-//     passEnv: "DELIV_GMX_APP_PW",
-//     imap: { host: "imap.gmx.com", port: 993, secure: true },
-//     smtp: { host: "mail.gmx.com", port: 587, secure: false },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Spam",
-//   },
-
-//   // SAPO
-//   sapo: {
-//     label: "Sapo",
-//     emailEnv: "DELIV_SAPO_EMAIL",
-//     passEnv: "DELIV_SAPO_APP_PW",
-//     imap: { host: "imap.sapo.pt", port: 993, secure: true },
-//     smtp: { host: "smtp.sapo.pt", port: 587, secure: false },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Spam",
-//   },
-
-//   // Seznam
-//   seznam: {
-//     label: "Seznam",
-//     emailEnv: "DELIV_SEZNAM_EMAIL",
-//     passEnv: "DELIV_SEZNAM_APP_PW",
-//     imap: { host: "imap.seznam.cz", port: 993, secure: true },
-//     smtp: { host: "smtp.seznam.cz", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "spam",
-//   },
-
-//   // iCloud
-//   icloud: {
-//     label: "iCloud",
-//     emailEnv: "DELIV_ICLOUD_EMAIL",
-//     passEnv: "DELIV_ICLOUD_APP_PW",
-//     imap: { host: "imap.mail.me.com", port: 993, secure: true },
-//     smtp: { host: "smtp.mail.me.com", port: 587, secure: false },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Junk",
-//   },
-
-//   // Ukr.net
-//   ukrnet: {
-//     label: "Ukr.net",
-//     emailEnv: "DELIV_UKRNET_EMAIL",
-//     passEnv: "DELIV_UKRNET_APP_PW",
-//     imap: { host: "imap.ukr.net", port: 993, secure: true },
-//     smtp: { host: "smtp.ukr.net", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Spam",
-//   },
-
-//   // Yandex
-//   yandex: {
-//     label: "Yandex",
-//     emailEnv: "DELIV_YANDEX_EMAIL",
-//     passEnv: "DELIV_YANDEX_APP_PW",
-//     imap: { host: "imap.yandex.com", port: 993, secure: true },
-//     smtp: { host: "smtp.yandex.com", port: 465, secure: true },
-//     inboxFolder: "INBOX",
-//     spamFolder: "Spam",
-//   },
-// };
-
-// // ───────────────────────────────────────────────────────────────
-// // Logging helper: prepend IST timestamp to logs
-// // ───────────────────────────────────────────────────────────────
-// const IST_LOG_OPTS = {
-//   timeZone: "Asia/Kolkata",
-//   year: "numeric",
-//   month: "2-digit",
-//   day: "2-digit",
-//   hour: "2-digit",
-//   minute: "2-digit",
-//   second: "2-digit",
-//   hour12: false,
-// };
-
-// function logIST(...args) {
-//   const ts = new Date().toLocaleString("en-IN", IST_LOG_OPTS);
-//   console.log(`[${ts} IST]`, ...args);
-// }
-
-// // const MS_24H = 24 * 60 * 60 * 1000;
-// // const MS_72H = 72 * 60 * 60 * 1000;
-
-// const MS_48H = 48 * 60 * 60 * 1000; // 48 hours window
-// const RETRY_INTERVAL_MS = 60 * 1000; // retry every 1 minute
-
-// // Decide global test.status based on mailboxes + age
-// function computeTestStatus(testDoc) {
-//   if (!testDoc) return "ACTIVE";
-
-//   const now = new Date();
-//   const createdAt = new Date(testDoc.createdAt);
-//   const ageMs = now - createdAt;
-//   const mailboxes = Array.isArray(testDoc.mailboxes) ? testDoc.mailboxes : [];
-
-//   const allInboxOrSpam =
-//     mailboxes.length > 0 &&
-//     mailboxes.every((m) => m.status === "inbox" || m.status === "spam");
-
-//   // Rule 1: if 48h+ old → COMPLETED no matter what
-//   if (ageMs >= MS_48H) return "COMPLETED";
-
-//   // Rule 2: if all are inbox or spam → COMPLETED
-//   if (allInboxOrSpam) return "COMPLETED";
-
-//   // Otherwise still in progress
-//   return "ACTIVE";
-// }
-
-// // ───────────────────────────────────────────────────────────────
-// // Mongo multi-tenant per-username DB
-// // ───────────────────────────────────────────────────────────────
-
-// const BASE_MONGO_URI =
-//   process.env.MONGODB_URI ||
-//   process.env.MONGO_URI ||
-//   "mongodb://127.0.0.1:27017/emailTool";
-
-// const userConnections = {};
-
-// function normalizeUsername(rawUsername) {
-//   const u = String(rawUsername || "")
-//     .trim()
-//     .toLowerCase();
-//   if (!u) return null;
-//   return u.replace(/[^a-z0-9_-]/gi, "_");
-// }
-
-// function getUsernameFromReq(req) {
-//   const u =
-//     (req.body && req.body.username) || (req.query && req.query.username) || "";
-//   return (u || "").toString().trim();
-// }
-
-// function getUserConnection(usernameRaw) {
-//   const normalized = normalizeUsername(usernameRaw);
-//   if (!normalized) return null;
-
-//   if (userConnections[normalized]) {
-//     return userConnections[normalized];
-//   }
-
-//   const dbName = `${normalized}-emailTool`;
-
-//   const conn = mongoose.createConnection(BASE_MONGO_URI, {
-//     dbName,
-//   });
-
-//   userConnections[normalized] = conn;
-//   return conn;
-// }
-
-// // ───────────────────────────────────────────────────────────────
-// // Schemas
-// // ───────────────────────────────────────────────────────────────
-// const deliverabilityMailboxSchema = new mongoose.Schema(
-//   {
-//     provider: { type: String, required: true },
-//     email: { type: String, required: true },
-//     status: {
-//       type: String,
-//       enum: ["pending", "inbox", "spam", "not_received", "error"],
-//       default: "pending",
-//     },
-//     folder: { type: String },
-//     lastCheckedAt: { type: Date },
-//     error: { type: String },
-//   },
-//   { _id: false }
-// );
-
-// const deliverabilityTestSchema = new mongoose.Schema(
-//   {
-//     name: { type: String, required: true },
-//     subject: { type: String },
-//     status: {
-//       type: String,
-//       enum: ["NEW", "ACTIVE", "COMPLETED"],
-//       default: "NEW",
-//     },
-//     mailboxes: [deliverabilityMailboxSchema],
-//     createdBy: {
-//       type: mongoose.Schema.Types.ObjectId,
-//       ref: "User",
-//       required: false,
-//     },
-//   },
-//   { timestamps: true }
-// );
-
-// function getDeliverabilityModel(usernameRaw) {
-//   const conn = getUserConnection(usernameRaw);
-//   if (!conn) return null;
-
-//   if (conn.models.DeliverabilityTest) {
-//     return conn.models.DeliverabilityTest;
-//   }
-
-//   return conn.model(
-//     "DeliverabilityTest",
-//     deliverabilityTestSchema,
-//     "deliverability-tests"
-//   );
-// }
-
-// // ───────────────────────────────────────────────────────────────
-// // Helpers
-// // ───────────────────────────────────────────────────────────────
-// function getProviderConfig(key) {
-//   const cfg = PROVIDERS[key];
-//   if (!cfg) return null;
-//   const email = process.env[cfg.emailEnv];
-//   const pass = process.env[cfg.passEnv];
-//   if (!email || !pass) return null;
-//   return { ...cfg, email, pass };
-// }
-
-// // Search for subject (substring, case-insensitive) in a folder
-// async function searchSubjectInFolder(client, folderName, subject) {
-//   if (!folderName) return false;
-//   if (!subject || !subject.trim()) return false;
-
-//   const searchTerm = subject.trim().toLowerCase();
-
-//   const lock = await client.getMailboxLock(folderName);
-//   try {
-//     const uids = await client.search({ all: true });
-//     if (!uids || uids.length === 0) {
-//       // logIST(`[imap] No messages in ${folderName}`);
-//       return false;
-//     }
-
-//     const lastUids = uids.slice(-50); // last 50 messages
-
-//     for await (const msg of client.fetch(lastUids, { envelope: true })) {
-//       const msgSubj = (msg.envelope && msg.envelope.subject) || "";
-//       if (
-//         typeof msgSubj === "string" &&
-//         msgSubj.toLowerCase().includes(searchTerm)
-//       ) {
-//         // logIST(
-//         //   `[imap] MATCH in ${folderName}: "${msgSubj}" contains "${subject}"`
-//         // );
-//         return true;
-//       }
-//     }
-
-//     // logIST(
-//     //   `[imap] No subject match for "${subject}" in ${folderName}, checked ${lastUids.length} messages`
-//     // );
-//     return false;
-//   } finally {
-//     lock.release();
-//   }
-// }
-
-// // Run IMAP check for a single mailbox entry – returns a plain result object
-// async function checkSingleMailbox(providerKey, email, subject) {
-//   const cfg = getProviderConfig(providerKey);
-//   const label = `${providerKey}:${email}`;
-
-//   const result = {
-//     provider: providerKey,
-//     email,
-//     status: "not_received",
-//     folder: undefined,
-//     error: undefined,
-//     lastCheckedAt: new Date(),
-//   };
-
-//   if (!cfg) {
-//     result.status = "error";
-//     result.error =
-//       "Provider not configured. Please check .env email & app password.";
-//     // logIST(`[run-check] Provider config missing for ${label}`);
-//     return result;
-//   }
-
-//   const client = new ImapFlow({
-//     host: cfg.imap.host,
-//     port: cfg.imap.port,
-//     secure: cfg.imap.secure,
-//     auth: {
-//       user: cfg.email,
-//       pass: cfg.pass,
-//     },
-//     logger: false,
-//     // disable ImapFlow's own socket timeout, as requested
-//     // socketTimeout: 0,
-//     socketTimeout: 60_000,
-//   });
-
-//   // IMPORTANT: handle client-level errors so they don't crash the process
-//   client.on("error", (err) => {
-//     if (err && err.code === "ETIMEOUT") {
-//       // logIST(`[imap] socket timeout for ${label} (ignored)`);
-//     } else {
-//       // logIST(`[imap] client-level error for ${label}:`, err);
-//     }
-//   });
-
-//   try {
-//     await client.connect();
-
-//     // logIST(
-//     //   `[imap] Connected to ${providerKey} as ${cfg.email}, checking subject "${subject}"`
-//     // );
-
-//     const inboxFolder = cfg.inboxFolder || "INBOX";
-
-//     let foundInbox = false;
-//     let folderUsed = inboxFolder;
-
-//     // 1) Primary inbox folder
-//     try {
-//       foundInbox = await searchSubjectInFolder(client, inboxFolder, subject);
-//     } catch (e) {
-//       // logIST(`Error searching ${inboxFolder} for ${label}:`, e);
-//     }
-
-//     // 2) Extra folders (Gmail All Mail, etc.)
-//     if (!foundInbox && Array.isArray(cfg.extraFolders)) {
-//       for (const folder of cfg.extraFolders) {
-//         try {
-//           const f = await searchSubjectInFolder(client, folder, subject);
-//           if (f) {
-//             foundInbox = true;
-//             folderUsed = folder;
-//             break;
-//           }
-//         } catch (e) {
-//           // logIST(`Error searching extra folder ${folder} for ${label}:`, e);
-//         }
-//       }
-//     }
-
-//     if (foundInbox) {
-//       result.status = "inbox";
-//       result.folder = folderUsed;
-//       result.error = undefined;
-//     } else {
-//       // 3) Spam folder
-//       let foundSpam = false;
-//       let spamError = null;
-
-//       if (cfg.spamFolder) {
-//         try {
-//           foundSpam = await searchSubjectInFolder(
-//             client,
-//             cfg.spamFolder,
-//             subject
-//           );
-//         } catch (e) {
-//           spamError = e;
-//           // logIST(
-//           //   `Error searching spam folder ${cfg.spamFolder} for ${label}:`,
-//           //   e
-//           // );
-//         }
-//       }
-
-//       if (foundSpam) {
-//         result.status = "spam";
-//         result.folder = cfg.spamFolder;
-//         result.error = undefined;
-//       } else if (spamError && spamError.mailboxMissing) {
-//         // This is exactly your Seznam case: "Invalid mailbox name: Spam"
-//         result.status = "error";
-//         result.folder = undefined;
-//         result.error = "Spam folder not found on this provider.";
-//       } else {
-//         result.status = "not_received";
-//         result.folder = undefined;
-//         result.error = undefined;
-//       }
-//     }
-
-//     result.lastCheckedAt = new Date();
-//   } catch (err) {
-//     // logIST(`checkSingleMailbox error for ${label}:`, err);
-//     result.status = "error";
-//     result.folder = undefined;
-//     result.error = err.message || String(err);
-//     result.lastCheckedAt = new Date();
-//   } finally {
-//     try {
-//       // await client.logout();
-//       client.logout().catch(() => {}); // don't block on slow logout
-//     } catch (_) {}
-//   }
-
-//   // logIST(
-//   //   `[run-check] Result for ${label}: status=${result.status}, folder=${result.folder}, error=${result.error}`
-//   // );
-
-//   return result;
-// }
-
-// // ───────────────────────────────────────────────────────────────
-// // Routes
-// // ───────────────────────────────────────────────────────────────
-
-// // POST /api/deliverability/tests
-// router.post("/tests", async (req, res) => {
-//   try {
-//     const username = getUsernameFromReq(req);
-//     if (!username) {
-//       return res.status(400).json({ message: "Username is required." });
-//     }
-
-//     const DeliverabilityTest = getDeliverabilityModel(username);
-//     if (!DeliverabilityTest) {
-//       return res
-//         .status(500)
-//         .json({ message: "Could not resolve DB for username." });
-//     }
-
-//     const { name, providers } = req.body;
-
-//     if (!name || !name.trim()) {
-//       return res.status(400).json({ message: "Test name is required." });
-//     }
-//     if (!providers || !Array.isArray(providers) || providers.length === 0) {
-//       return res
-//         .status(400)
-//         .json({ message: "At least one provider must be selected." });
-//     }
-
-//     // 1) Build mailboxes list from valid providers
-//     const mailboxes = [];
-//     providers.forEach((pKey) => {
-//       const cfg = getProviderConfig(pKey);
-//       if (cfg) {
-//         mailboxes.push({
-//           provider: pKey,
-//           email: cfg.email,
-//           status: "pending",
-//         });
-//       }
-//     });
-
-//     if (mailboxes.length === 0) {
-//       return res.status(400).json({
-//         message:
-//           "No valid providers found. Please check your .env configuration.",
-//       });
-//     }
-
-//     // 2) Calculate required credits based on number of seed mailboxes
-//     const requiredCredits = mailboxes.length * DELIV_CREDITS_PER_MAILBOX;
-
-//     // 3) Load user from global User collection
-//     const user = await User.findOne({ username }).lean(false); // lean(false) to get a full document
-//     if (!user) {
-//       return res.status(404).json({
-//         ok: false,
-//         message: "User not found for credits check.",
-//       });
-//     }
-
-//     const availableCredits =
-//       typeof user.credits === "number" ? user.credits : 0;
-
-//     // 4) If user does not have enough credits → block test creation
-//     if (availableCredits < requiredCredits) {
-//       return res.status(400).json({
-//         ok: false,
-//         code: "INSUFFICIENT_CREDITS",
-//         message: "You have insufficient credit balance for this test.",
-//         requiredCredits,
-//         availableCredits,
-//         mailboxesCount: mailboxes.length,
-//       });
-//     }
-
-//     // 5) Deduct credits and save user
-//     user.credits = availableCredits - requiredCredits;
-//     await user.save();
-
-//     // 6) Finally, create the deliverability test
-//     const test = await DeliverabilityTest.create({
-//       name: name.trim(),
-//       mailboxes,
-//       status: "NEW",
-//     });
-
-//     return res.json({
-//       ok: true,
-//       test,
-//       addresses: mailboxes.map((m) => m.email),
-//       creditsUsed: requiredCredits,
-//       remainingCredits: user.credits,
-//     });
-//   } catch (err) {
-//     console.error("Create deliverability test error:", err);
-//     return res.status(500).json({ message: "Internal server error." });
-//   }
-// });
-
-// // GET /api/deliverability/history
-// // Returns all tests with aggregated counts for each one
-// router.get("/history", async (req, res) => {
-//   try {
-//     const username = getUsernameFromReq(req);
-//     if (!username) {
-//       return res.status(400).json({ message: "Username is required." });
-//     }
-
-//     const DeliverabilityTest = getDeliverabilityModel(username);
-//     if (!DeliverabilityTest) {
-//       return res
-//         .status(500)
-//         .json({ message: "Could not resolve DB for username." });
-//     }
-
-//     // logIST(
-//     //   `[deliverability] GET /history for user="${username}" from DB "${normalizeUsername(
-//     //     username
-//     //   )}-emailTool"`
-//     // );
-
-//     // You can change limit if you want more / fewer
-//     const tests = await DeliverabilityTest.find({})
-//       .sort({ createdAt: -1 })
-//       .limit(100)
-//       .lean();
-
-//     const enriched = tests.map((t) => {
-//       const mailboxes = Array.isArray(t.mailboxes) ? t.mailboxes : [];
-//       const counts = {
-//         inbox: 0,
-//         spam: 0,
-//         not_received: 0,
-//         error: 0,
-//         waiting: 0,
-//       };
-
-//       mailboxes.forEach((mb) => {
-//         switch (mb.status) {
-//           case "inbox":
-//             counts.inbox++;
-//             break;
-//           case "spam":
-//             counts.spam++;
-//             break;
-//           case "not_received":
-//             counts.not_received++;
-//             break;
-//           case "error":
-//             counts.error++;
-//             break;
-//           default:
-//             counts.waiting++;
-//         }
-//       });
-
-//       return {
-//         ...t,
-//         totalMailboxes: mailboxes.length,
-//         counts,
-//       };
-//     });
-
-//     return res.json({ ok: true, tests: enriched });
-//   } catch (err) {
-//     // logIST("History deliverability tests error:", err);
-//     return res.status(500).json({ message: "Internal server error." });
-//   }
-// });
-
-// // GET /api/deliverability/tests/:id/report
-// // Returns a CSV file for the given test
-// router.get("/tests/:id/report", async (req, res) => {
-//   try {
-//     const username = getUsernameFromReq(req);
-//     if (!username) {
-//       return res.status(400).json({ message: "Username is required." });
-//     }
-
-//     const DeliverabilityTest = getDeliverabilityModel(username);
-//     if (!DeliverabilityTest) {
-//       return res
-//         .status(500)
-//         .json({ message: "Could not resolve DB for username." });
-//     }
-
-//     const { id } = req.params;
-//     const test = await DeliverabilityTest.findById(id).lean();
-
-//     if (!test) {
-//       return res.status(404).json({ message: "Test not found." });
-//     }
-
-//     const mailboxes = Array.isArray(test.mailboxes) ? test.mailboxes : [];
-
-//     const esc = (v) => (v == null ? "" : String(v).replace(/"/g, '""')); // escape quotes for CSV
-
-//     const rows = [];
-
-//     // Meta information rows
-//     rows.push(["Test name", esc(test.name || "")]);
-//     rows.push(["Subject", esc(test.subject || "")]);
-//     rows.push(["Status", esc(test.status || "")]);
-//     rows.push([
-//       "Created at",
-//       test.createdAt ? new Date(test.createdAt).toISOString() : "",
-//     ]);
-//     rows.push([
-//       "Updated at",
-//       test.updatedAt ? new Date(test.updatedAt).toISOString() : "",
-//     ]);
-
-//     // Blank line
-//     rows.push([]);
-
-//     // Header for mailbox table
-//     rows.push([
-//       "Provider",
-//       "Email",
-//       "Status",
-//       "Folder",
-//       "Last checked",
-//       "Error",
-//     ]);
-
-//     // Mailboxes
-//     mailboxes.forEach((mb) => {
-//       rows.push([
-//         esc(mb.provider || ""),
-//         esc(mb.email || ""),
-//         esc(mb.status || ""),
-//         esc(mb.folder || ""),
-//         mb.lastCheckedAt ? new Date(mb.lastCheckedAt).toISOString() : "",
-//         esc(mb.error || ""),
-//       ]);
-//     });
-
-//     const csv = rows.map((r) => r.map((v) => `"${v}"`).join(",")).join("\r\n");
-
-//     const baseName =
-//       (test.name || `test-${id}`).replace(/[^\w.-]+/g, "_") || "report";
-//     const filename = `deliverability_${baseName}.csv`;
-
-//     res.setHeader("Content-Type", "text/csv; charset=utf-8");
-//     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
-
-//     return res.status(200).send(csv);
-//   } catch (err) {
-//     // logIST("Download deliverability report error:", err);
-//     return res.status(500).json({ message: "Internal server error." });
-//   }
-// });
-
-// // GET /api/deliverability/tests/:id
-// router.get("/tests/:id", async (req, res) => {
-//   try {
-//     const username = getUsernameFromReq(req);
-//     if (!username) {
-//       // logIST(
-//       //   `[deliverability] GET /tests/:id missing username. query=`,
-//       //   req.query
-//       // );
-//       return res
-//         .status(400)
-//         .json({ ok: false, message: "Username is required." });
-//     }
-//     const DeliverabilityTest = getDeliverabilityModel(username);
-//     if (!DeliverabilityTest) {
-//       // logIST(
-//       //   `[deliverability] GET /tests/:id cannot resolve DB for username="${username}"`
-//       // );
-//       return res
-//         .status(500)
-//         .json({ ok: false, message: "Could not resolve DB for username." });
-//     }
-
-//     const { id } = req.params;
-//     // logIST(
-//     //   `[deliverability] GET /tests/${id} for user="${username}" (db="${normalizeUsername(
-//     //     username
-//     //   )}-emailTool")`
-//     // );
-
-//     const test = await DeliverabilityTest.findById(id).lean();
-//     if (!test) {
-//       // logIST(
-//       //   `[deliverability] Test not found for id=${id} in user db "${normalizeUsername(
-//       //     username
-//       //   )}-emailTool"`
-//       // );
-//       return res.status(404).json({ ok: false, message: "Test not found." });
-//     }
-
-//     // logIST(
-//     //   `[deliverability] Returning test ${id} statuses=`,
-//     //   (test.mailboxes || []).map((m) => m.status),
-//     //   "updatedAt=",
-//     //   test.updatedAt
-//     // );
-
-//     return res.json({ ok: true, test });
-//   } catch (err) {
-//     // logIST("Get deliverability test error:", err);
-//     return res
-//       .status(500)
-//       .json({ ok: false, message: "Internal server error." });
-//   }
-// });
-
-// function scheduleUnreceivedRetry(
-//   DeliverabilityTest,
-//   testId,
-//   mbEmail,
-//   provider,
-//   subject,
-//   attempt = 1
-// ) {
-//   setTimeout(async () => {
-//     try {
-//       const now = new Date();
-
-//       // 1) Load latest test
-//       const test = await DeliverabilityTest.findById(testId).lean();
-//       if (!test) {
-//         // logIST(
-//         //   `[retry-check] Test ${testId} not found, stopping retries for ${provider}:${mbEmail}`
-//         // );
-//         return;
-//       }
-
-//       // 2) Stop if test is older than 48h
-//       const ageMs = now - new Date(test.createdAt);
-//       if (ageMs >= MS_48H) {
-//         // logIST(
-//         //   `[retry-check] Test ${testId} >=48h old, stopping retries for ${provider}:${mbEmail}`
-//         // );
-//         return;
-//       }
-
-//       // 3) Get current mailbox status from DB
-//       const mb = (test.mailboxes || []).find((m) => m.email === mbEmail);
-//       if (!mb) {
-//         // logIST(
-//         //   `[retry-check] Mailbox ${provider}:${mbEmail} not found in test ${testId}, stopping`
-//         // );
-//         return;
-//       }
-
-//       // If already final, stop retrying
-//       if (["inbox", "spam", "error"].includes(mb.status)) {
-//         // logIST(
-//         //   `[retry-check] ${provider}:${mbEmail} already final (${mb.status}), stopping retries`
-//         // );
-//         return;
-//       }
-
-//       // logIST(
-//       //   `[retry-check] Attempt #${attempt} for ${provider}:${mbEmail} (current status=${mb.status})`
-//       // );
-
-//       // 4) Re-run IMAP check
-//       const retry = await checkSingleMailbox(provider, mbEmail, subject);
-
-//       // 5) Update DB with the new result
-//       await DeliverabilityTest.updateOne(
-//         { _id: testId, "mailboxes.email": mbEmail },
-//         {
-//           $set: {
-//             "mailboxes.$.status": retry.status,
-//             "mailboxes.$.folder": retry.folder,
-//             "mailboxes.$.error": retry.error,
-//             "mailboxes.$.lastCheckedAt": retry.lastCheckedAt,
-//             updatedAt: new Date(),
-//           },
-//         }
-//       );
-
-//       // logIST(
-//       //   `[retry-check] Updated ${provider}:${mbEmail} -> status=${retry.status}, folder=${retry.folder}`
-//       // );
-
-//       // 🔄 Recompute global test.status after this mailbox update
-//       const freshAfterRetry = await DeliverabilityTest.findById(testId).lean();
-//       if (freshAfterRetry) {
-//         const newStatus = computeTestStatus(freshAfterRetry);
-//         if (freshAfterRetry.status !== newStatus) {
-//           await DeliverabilityTest.updateOne(
-//             { _id: testId },
-//             { $set: { status: newStatus } }
-//           );
-//           // logIST(
-//           //   `[retry-check] Test ${testId} global status set to ${newStatus} after retry`
-//           // );
-//         }
-//       }
-
-//       // 6) If still unreceived, schedule another retry
-//       if (retry.status === "not_received") {
-//         scheduleUnreceivedRetry(
-//           DeliverabilityTest,
-//           testId,
-//           mbEmail,
-//           provider,
-//           subject,
-//           attempt + 1
-//         );
-//       } else {
-//         // logIST(
-//         //   `[retry-check] ${provider}:${mbEmail} delivered as ${retry.status}, stopping retries`
-//         // );
-//       }
-//     } catch (err) {
-//       // logIST(
-//       //   `[retry-check] Error during retry for ${provider}:${mbEmail}:`,
-//       //   err
-//       // );
-//       // Optional: you can schedule another retry even after error, if you want:
-//       scheduleUnreceivedRetry(
-//         DeliverabilityTest,
-//         testId,
-//         mbEmail,
-//         provider,
-//         subject,
-//         attempt + 1
-//       );
-//     }
-//   }, RETRY_INTERVAL_MS);
-// }
-
-// // Run mailbox checks in the background and update Mongo as each finishes
-// function runChecksInBackground(DeliverabilityTest, testId, finalSubject) {
-//   (async () => {
-//     try {
-//       const initial = await DeliverabilityTest.findById(testId).lean();
-//       if (!initial) {
-//         // logIST(`[run-check-bg] Test ${testId} not found`);
-//         return;
-//       }
-
-//       const createdAt = new Date(initial.createdAt);
-//       const now = new Date();
-//       const ageMs = now - createdAt;
-//       // logIST(
-//       //   `[run-check-bg] Starting background checks for ${testId}, ageMs=${ageMs}`
-//       // );
-
-//       // If older than 72h, just finalize and stop
-//       if (ageMs >= MS_48H) {
-//         await DeliverabilityTest.updateOne(
-//           { _id: testId },
-//           { $set: { status: "COMPLETED" } }
-//         );
-//         // logIST(
-//         //   `[run-check-bg] Test ${testId} >=48h old, marking COMPLETED and stopping.`
-//         // );
-//         return;
-//       }
-
-//       const mailboxes = initial.mailboxes || [];
-
-//       // ✅ Run all non-final mailboxes in parallel (like your old code)
-//       const tasks = mailboxes
-//         .filter((mb) => !["inbox", "spam", "error"].includes(mb.status))
-//         .map(async (mb) => {
-//           // logIST(
-//           //   `[run-check-bg] Checking ${mb.provider}:${mb.email} for subject "${finalSubject}"`
-//           // );
-
-//           const result = await checkSingleMailbox(
-//             mb.provider,
-//             mb.email,
-//             finalSubject
-//           );
-
-//           await DeliverabilityTest.updateOne(
-//             { _id: testId, "mailboxes.email": mb.email },
-//             {
-//               $set: {
-//                 "mailboxes.$.status": result.status,
-//                 "mailboxes.$.folder": result.folder,
-//                 "mailboxes.$.error": result.error,
-//                 "mailboxes.$.lastCheckedAt": result.lastCheckedAt,
-//                 subject: finalSubject,
-//                 updatedAt: new Date(),
-//               },
-//             }
-//           );
-
-//           // logIST(
-//           //   `[run-check-bg] Updated ${mb.provider}:${mb.email} -> status=${result.status}, folder=${result.folder}`
-//           // );
-
-//           // Start retry loop if still not_received
-//           if (result.status === "not_received") {
-//             scheduleUnreceivedRetry(
-//               DeliverabilityTest,
-//               testId,
-//               mb.email,
-//               mb.provider,
-//               finalSubject
-//             );
-//           }
-//         });
-
-//       await Promise.all(tasks); // ← parallel!
-
-//       // Re-compute global status using the new rules
-//       const fresh = await DeliverabilityTest.findById(testId).lean();
-//       if (!fresh) return;
-
-//       const newStatus = computeTestStatus(fresh);
-
-//       if (fresh.status !== newStatus) {
-//         await DeliverabilityTest.updateOne(
-//           { _id: testId },
-//           { $set: { status: newStatus } }
-//         );
-//       }
-
-//       // logIST(
-//       //   `[run-check-bg] Finished background checks for test ${testId}, status=${newStatus}`
-//       // );
-//     } catch (err) {
-//       // logIST("[run-check-bg] Background error for test " + testId, err);
-//     }
-//   })();
-// }
-
-// // POST /api/deliverability/tests/:id/run-check
-// // Now: trigger background IMAP checks and return quickly
-// router.post("/tests/:id/run-check", async (req, res) => {
-//   try {
-//     const username = getUsernameFromReq(req);
-//     if (!username) {
-//       return res.status(400).json({ message: "Username is required." });
-//     }
-//     // logIST(
-//     //   `[deliverability] POST /tests/${
-//     //     req.params.id
-//     //   }/run-check for user="${username}" (db="${normalizeUsername(
-//     //     username
-//     //   )}-emailTool")`
-//     // );
-//     const DeliverabilityTest = getDeliverabilityModel(username);
-//     if (!DeliverabilityTest) {
-//       return res
-//         .status(500)
-//         .json({ message: "Could not resolve DB for username." });
-//     }
-
-//     const { id } = req.params;
-//     let { subject } = req.body || {};
-
-//     const test = await DeliverabilityTest.findById(id).lean();
-//     if (!test) {
-//       return res.status(404).json({ message: "Test not found." });
-//     }
-
-//     if (subject && typeof subject === "string") {
-//       subject = subject.trim();
-//     }
-//     const finalSubject = subject || test.subject;
-//     if (!finalSubject) {
-//       return res.status(400).json({
-//         message:
-//           "Subject is required. Provide it in body or save it on the test.",
-//       });
-//     }
-
-//     const now = new Date();
-//     const ageMs = now - new Date(test.createdAt);
-//     // logIST(`[run-check] Test ${id} ageMs=${ageMs}`);
-
-//     // If too old, just mark completed and return
-//     if (ageMs >= MS_48H) {
-//       await DeliverabilityTest.updateOne(
-//         { _id: id },
-//         { $set: { status: "COMPLETED", subject: finalSubject } }
-//       );
-//       const fresh = await DeliverabilityTest.findById(id).lean();
-//       return res.json({ ok: true, test: fresh });
-//     }
-
-//     // Make sure subject + status are set immediately
-//     await DeliverabilityTest.updateOne(
-//       { _id: id },
-//       { $set: { subject: finalSubject, status: "ACTIVE" } }
-//     );
-
-//     // Kick off background checks (does NOT block this response)
-//     runChecksInBackground(DeliverabilityTest, id, finalSubject);
-
-//     // Return the current doc (before background checks finish)
-//     const fresh = await DeliverabilityTest.findById(id).lean();
-//     return res.json({ ok: true, test: fresh });
-//   } catch (err) {
-//     // logIST("run-check error:", err);
-//     return res.status(500).json({ message: "Internal server error." });
-//   }
-// });
-
-// // POST /api/deliverability/test-connection
-// router.post("/test-connection", async (req, res) => {
-//   const { provider, mode = "imap", to } = req.body;
-
-//   try {
-//     if (!provider) {
-//       return res
-//         .status(400)
-//         .json({ message: "Provider is required (gmail, zoho)." });
-//     }
-//     const cfg = getProviderConfig(provider);
-//     if (!cfg) {
-//       return res.status(400).json({
-//         message:
-//           "Provider not configured. Please check .env email & app password.",
-//       });
-//     }
-
-//     if (mode === "smtp") {
-//       const transporter = nodemailer.createTransport({
-//         host: cfg.smtp.host,
-//         port: cfg.smtp.port,
-//         secure: cfg.smtp.secure,
-//         auth: {
-//           user: cfg.email,
-//           pass: cfg.pass,
-//         },
-//       });
-
-//       const recipient = to || cfg.email;
-//       const info = await transporter.sendMail({
-//         from: `"Deliverability Debug" <${cfg.email}>`,
-//         to: recipient,
-//         subject: `Deliverability debug ${new Date().toISOString()}`,
-//         text: "This is a test email from /test-connection SMTP.",
-//       });
-
-//       return res.json({
-//         ok: true,
-//         mode: "smtp",
-//         provider,
-//         from: cfg.email,
-//         to: recipient,
-//         messageId: info.messageId,
-//       });
-//     } else {
-//       const client = new ImapFlow({
-//         host: cfg.imap.host,
-//         port: cfg.imap.port,
-//         secure: cfg.imap.secure,
-//         auth: {
-//           user: cfg.email,
-//           pass: cfg.pass,
-//         },
-//         logger: false,
-//         // socketTimeout: 0,
-//         socketTimeout: 60_000,
-//       });
-
-//       client.on("error", (err) => {
-//         if (err && err.code === "ETIMEOUT") {
-//           // logIST(
-//           //   `[imap] socket timeout in /test-connection for ${provider} (ignored)`
-//           // );
-//         } else {
-//           // logIST(
-//           //   `[imap] client-level error in /test-connection for ${provider}:`,
-//           //   err
-//           // );
-//         }
-//       });
-
-//       try {
-//         await client.connect();
-//         try {
-//           const lock = await client.getMailboxLock(cfg.inboxFolder || "INBOX");
-//           lock.release();
-//         } catch (e) {
-//           // logIST("INBOX lock error (can ignore for some servers):", e);
-//         }
-//         await client.logout();
-//         return res.json({
-//           ok: true,
-//           mode: "imap",
-//           provider,
-//           email: cfg.email,
-//           note: "IMAP login successful.",
-//         });
-//       } catch (imapErr) {
-//         // logIST("IMAP debug error:", imapErr);
-//         try {
-//           await client.logout();
-//         } catch (_) {}
-//         return res.status(500).json({
-//           message: "IMAP connection failed.",
-//           error: imapErr.message || String(imapErr),
-//           // TEMP: expose extra fields for debugging
-//           code: imapErr.code || null,
-//           response: imapErr.response || null,
-//           responseStatus: imapErr.responseStatus || null,
-//           responseText: imapErr.responseText || null,
-//         });
-//       }
-//     }
-//   } catch (err) {
-//     // logIST("test-connection error:", err);
-//     return res.status(500).json({ message: "Internal server error." });
-//   }
-// });
-
-// // POST /api/deliverability/list-folders
-// // Debug helper: list all IMAP folders for one provider
-// router.post("/list-folders", async (req, res) => {
-//   const { provider } = req.body || {};
-
-//   try {
-//     if (!provider) {
-//       return res.status(400).json({ message: "Provider is required." });
-//     }
-
-//     const cfg = getProviderConfig(provider);
-//     if (!cfg) {
-//       return res.status(400).json({
-//         message:
-//           "Provider not configured. Please check .env email & app password.",
-//       });
-//     }
-
-//     const client = new ImapFlow({
-//       host: cfg.imap.host,
-//       port: cfg.imap.port,
-//       secure: cfg.imap.secure,
-//       auth: {
-//         user: cfg.email,
-//         pass: cfg.pass,
-//       },
-//       logger: false,
-//       // socketTimeout: 0,
-//       socketTimeout: 60_000,
-//     });
-
-//     client.on("error", (err) => {
-//       // logIST("list-folders IMAP error:", err);
-//     });
-
-//     try {
-//       await client.connect();
-
-//       // NOTE: in your imapflow version, list() returns an array, not an async iterator
-//       const list = await client.list();
-
-//       // Simplify the data we return
-//       const folders = list.map((mb) => ({
-//         path: mb.path, // full IMAP path
-//         name: mb.name, // human name (if present)
-//         flags: mb.flags || [], // e.g. ["\\HasNoChildren"]
-//         specialUse: mb.specialUse, // e.g. "\\Junk", "\\Trash", "\\Sent"
-//       }));
-
-//       await client.logout();
-
-//       return res.json({
-//         ok: true,
-//         provider,
-//         email: cfg.email,
-//         folders,
-//       });
-//     } catch (err) {
-//       // logIST("list-folders IMAP error:", err);
-//       try {
-//         await client.logout();
-//       } catch (_) {}
-//       return res.status(500).json({
-//         message: "IMAP folder listing failed.",
-//         error: err.message || String(err),
-//       });
-//     }
-//   } catch (err) {
-//     // logIST("list-folders error (outer):", err);
-//     return res.status(500).json({ message: "Internal server error." });
-//   }
-// });
-
-// module.exports = router;
-
 // routes/deliverability.js
 const express = require("express");
 const mongoose = require("mongoose");
@@ -1388,6 +85,19 @@ const PROVIDERS = {
     inboxFolder: "INBOX",
     spamFolder: "Spam",
   },
+
+  microsoft_business: {
+    label: "Microsoft Business",
+    emailEnv: "DELIV_MS_EMAIL",
+    passEnv: null, // OAuth2, not password
+    imap: { host: "outlook.office365.com", port: 993, secure: true },
+    smtp: { host: "smtp.office365.com", port: 587, secure: false }, // optional
+    inboxFolder: "INBOX",
+
+    // folder name varies in Exchange tenants
+    spamFolder: "Junk Email",
+    spamFolderAlternates: ["Junk", "Junk E-mail", "Spam"],
+  },
 };
 
 const MS_48H = 48 * 60 * 60 * 1000;
@@ -1448,11 +158,13 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
 
   const olderThanDate = daysAgoDate(days);
 
+  const auth = await buildImapAuth(providerKey, cfg);
+
   const client = new ImapFlow({
     host: cfg.imap.host,
     port: cfg.imap.port,
     secure: cfg.imap.secure,
-    auth: { user: cfg.email, pass: cfg.pass },
+    auth,
     logger: false,
     socketTimeout: 60_000,
   });
@@ -1468,7 +180,7 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
       const r = await deleteOldMessagesFromFolder(
         client,
         cfg.inboxFolder,
-        olderThanDate
+        olderThanDate,
       );
       details.push(r);
       totalDeleted += r.deleted || 0;
@@ -1480,7 +192,7 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
         const r = await deleteOldMessagesFromFolder(
           client,
           cfg.spamFolder,
-          olderThanDate
+          olderThanDate,
         );
         details.push(r);
         totalDeleted += r.deleted || 0;
@@ -1585,7 +297,7 @@ const deliverabilityMailboxSchema = new mongoose.Schema(
     lastCheckedAt: { type: Date },
     error: { type: String },
   },
-  { _id: false }
+  { _id: false },
 );
 
 const deliverabilityTestSchema = new mongoose.Schema(
@@ -1632,7 +344,7 @@ const deliverabilityTestSchema = new mongoose.Schema(
       required: false,
     },
   },
-  { timestamps: true }
+  { timestamps: true },
 );
 
 function getDeliverabilityModel(usernameRaw) {
@@ -1643,8 +355,138 @@ function getDeliverabilityModel(usernameRaw) {
   return conn.model(
     "DeliverabilityTest",
     deliverabilityTestSchema,
-    "deliverability-tests"
+    "deliverability-tests",
   );
+}
+
+// ─────────────────────────────────────────────
+// Microsoft OAuth helpers (Deliverability)
+// ─────────────────────────────────────────────
+function isMicrosoftProvider(key) {
+  return String(key || "") === "microsoft_business";
+}
+
+function requireMsSetupKey(req, res) {
+  const need = process.env.DELIV_MS_SETUP_KEY || "";
+  if (!need) return true; // allow if not set (not recommended)
+  const got =
+    (req.query && req.query.key) ||
+    (req.headers && req.headers["x-ms-setup-key"]) ||
+    "";
+  if (String(got) !== String(need)) {
+    res.status(403).send("Forbidden: invalid setup key");
+    return false;
+  }
+  return true;
+}
+
+async function exchangeMsCodeForTokens(code) {
+  const tenant = process.env.DELIV_MS_TENANT || "common";
+  const clientId = process.env.DELIV_MS_CLIENT_ID;
+  const clientSecret = process.env.DELIV_MS_CLIENT_SECRET;
+  const redirectUri = process.env.DELIV_MS_REDIRECT_URI;
+
+  if (!clientId || !clientSecret || !redirectUri) {
+    throw new Error(
+      "Missing DELIV_MS_CLIENT_ID / DELIV_MS_CLIENT_SECRET / DELIV_MS_REDIRECT_URI",
+    );
+  }
+
+  const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+
+  const body = new URLSearchParams();
+  body.set("client_id", clientId);
+  body.set("client_secret", clientSecret);
+  body.set("grant_type", "authorization_code");
+  body.set("code", String(code));
+  body.set("redirect_uri", redirectUri);
+  body.set("scope", "offline_access IMAP.AccessAsUser.All");
+
+  const resp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(
+      `MS code exchange failed (${resp.status}): ${json.error || ""} ${
+        json.error_description || ""
+      }`,
+    );
+  }
+  return json;
+}
+
+async function fetchMsAccessTokenByRefreshToken() {
+  const tenant = process.env.DELIV_MS_TENANT || "common";
+  const clientId = process.env.DELIV_MS_CLIENT_ID;
+  const clientSecret = process.env.DELIV_MS_CLIENT_SECRET;
+  const redirectUri = process.env.DELIV_MS_REDIRECT_URI;
+  const refreshToken = process.env.DELIV_MS_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !redirectUri || !refreshToken) {
+    throw new Error(
+      "Microsoft OAuth env missing. Need DELIV_MS_CLIENT_ID, DELIV_MS_CLIENT_SECRET, DELIV_MS_REDIRECT_URI, DELIV_MS_REFRESH_TOKEN",
+    );
+  }
+
+  const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
+
+  const body = new URLSearchParams();
+  body.set("client_id", clientId);
+  body.set("client_secret", clientSecret);
+  body.set("grant_type", "refresh_token");
+  body.set("refresh_token", refreshToken);
+  body.set("redirect_uri", redirectUri);
+  body.set("scope", "offline_access IMAP.AccessAsUser.All");
+
+  const resp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+
+  const json = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    throw new Error(
+      `MS token refresh failed (${resp.status}): ${json.error || ""} ${
+        json.error_description || ""
+      }`,
+    );
+  }
+  return json.access_token;
+}
+
+function msAuthorizeUrl() {
+  const tenant = process.env.DELIV_MS_TENANT || "common";
+  const clientId = process.env.DELIV_MS_CLIENT_ID;
+  const redirectUri = process.env.DELIV_MS_REDIRECT_URI;
+
+  if (!clientId || !redirectUri) {
+    throw new Error("Missing DELIV_MS_CLIENT_ID or DELIV_MS_REDIRECT_URI");
+  }
+
+  const base = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/authorize`;
+
+  const params = new URLSearchParams();
+  params.set("client_id", clientId);
+  params.set("response_type", "code");
+  params.set("redirect_uri", redirectUri);
+  params.set("scope", "offline_access IMAP.AccessAsUser.All");
+  params.set("prompt", "consent");
+  params.set("state", "truesendr_ms_deliv");
+
+  return `${base}?${params.toString()}`;
+}
+
+async function buildImapAuth(providerKey, cfg) {
+  if (isMicrosoftProvider(providerKey)) {
+    const token = await fetchMsAccessTokenByRefreshToken();
+    return { user: cfg.email, accessToken: token };
+  }
+  return { user: cfg.email, pass: cfg.pass };
 }
 
 /** ---------------- Helpers ---------------- */
@@ -1656,6 +498,14 @@ function getProviderConfig(key) {
   const cfg = PROVIDERS[key];
   if (!cfg) return null;
 
+  // Microsoft Business uses OAuth (no password)
+  if (isMicrosoftProvider(key)) {
+    const email = process.env[cfg.emailEnv];
+    if (!email) return null;
+    return { ...cfg, email, pass: null };
+  }
+
+  // Other providers use app password
   const email = process.env[cfg.emailEnv];
   const pass = process.env[cfg.passEnv];
 
@@ -1725,7 +575,7 @@ async function normalizeAndPersistStatus(DeliverabilityTest, testDoc) {
   if (testDoc.status !== newStatus) {
     await DeliverabilityTest.updateOne(
       { _id: testDoc._id },
-      { $set: { status: newStatus, updatedAt: new Date() } }
+      { $set: { status: newStatus, updatedAt: new Date() } },
     );
     return { ...testDoc, status: newStatus };
   }
@@ -1778,11 +628,13 @@ async function checkSingleMailbox(providerKey, email, subject) {
     return result;
   }
 
+  const auth = await buildImapAuth(providerKey, cfg);
+
   const client = new ImapFlow({
     host: cfg.imap.host,
     port: cfg.imap.port,
     secure: cfg.imap.secure,
-    auth: { user: cfg.email, pass: cfg.pass },
+    auth,
     logger: false,
     socketTimeout: 60_000,
   });
@@ -1821,13 +673,32 @@ async function checkSingleMailbox(providerKey, email, subject) {
       let foundSpam = false;
       let spamError = null;
 
-      if (cfg.spamFolder) {
+      // if (cfg.spamFolder) {
+      //   try {
+      //     foundSpam = await searchSubjectInFolder(
+      //       client,
+      //       cfg.spamFolder,
+      //       subject,
+      //     );
+      //   } catch (e) {
+      //     spamError = e;
+      //   }
+      // }
+      const spamFoldersToTry = [];
+      if (cfg.spamFolder) spamFoldersToTry.push(cfg.spamFolder);
+      if (Array.isArray(cfg.spamFolderAlternates)) {
+        spamFoldersToTry.push(...cfg.spamFolderAlternates);
+      }
+
+      for (const sf of spamFoldersToTry) {
+        if (!sf) continue;
         try {
-          foundSpam = await searchSubjectInFolder(
-            client,
-            cfg.spamFolder,
-            subject
-          );
+          const ok = await searchSubjectInFolder(client, sf, subject);
+          if (ok) {
+            foundSpam = true;
+            result.folder = sf;
+            break;
+          }
         } catch (e) {
           spamError = e;
         }
@@ -1835,7 +706,6 @@ async function checkSingleMailbox(providerKey, email, subject) {
 
       if (foundSpam) {
         result.status = "spam";
-        result.folder = cfg.spamFolder;
         result.error = undefined;
       } else if (spamError && spamError.mailboxMissing) {
         result.status = "error";
@@ -1905,7 +775,7 @@ function scheduleUnreceivedRetry(
   provider,
   subject,
   username,
-  push
+  push,
 ) {
   setTimeout(async () => {
     try {
@@ -1916,13 +786,13 @@ function scheduleUnreceivedRetry(
       if (ageMs >= MS_48H) {
         await DeliverabilityTest.updateOne(
           { _id: testId },
-          { $set: { status: "COMPLETED", updatedAt: new Date() } }
+          { $set: { status: "COMPLETED", updatedAt: new Date() } },
         );
         const freshDone = await DeliverabilityTest.findById(testId).lean();
         if (freshDone)
           push(
             username,
-            buildRealtimePayload(freshDone, { event: "completed" })
+            buildRealtimePayload(freshDone, { event: "completed" }),
           );
         return;
       }
@@ -1943,7 +813,7 @@ function scheduleUnreceivedRetry(
             "mailboxes.$.lastCheckedAt": retry.lastCheckedAt,
             updatedAt: new Date(),
           },
-        }
+        },
       );
 
       const fresh = await DeliverabilityTest.findById(testId).lean();
@@ -1952,7 +822,7 @@ function scheduleUnreceivedRetry(
         if (fresh.status !== newStatus) {
           await DeliverabilityTest.updateOne(
             { _id: testId },
-            { $set: { status: newStatus, updatedAt: new Date() } }
+            { $set: { status: newStatus, updatedAt: new Date() } },
           );
         }
 
@@ -1971,7 +841,7 @@ function scheduleUnreceivedRetry(
                 error: retry.error,
                 lastCheckedAt: retry.lastCheckedAt,
               },
-            })
+            }),
           );
         }
       }
@@ -1984,7 +854,7 @@ function scheduleUnreceivedRetry(
           provider,
           subject,
           username,
-          push
+          push,
         );
       }
     } catch {
@@ -1995,7 +865,7 @@ function scheduleUnreceivedRetry(
         provider,
         subject,
         username,
-        push
+        push,
       );
     }
   }, RETRY_INTERVAL_MS);
@@ -2006,7 +876,7 @@ function runChecksInBackground(
   testId,
   finalSubject,
   username,
-  push
+  push,
 ) {
   (async () => {
     try {
@@ -2017,7 +887,7 @@ function runChecksInBackground(
       if (ageMs >= MS_48H) {
         await DeliverabilityTest.updateOne(
           { _id: testId },
-          { $set: { status: "COMPLETED", updatedAt: new Date() } }
+          { $set: { status: "COMPLETED", updatedAt: new Date() } },
         );
         const done = await DeliverabilityTest.findById(testId).lean();
         if (done)
@@ -2033,7 +903,7 @@ function runChecksInBackground(
           const result = await checkSingleMailbox(
             mb.provider,
             mb.email,
-            finalSubject
+            finalSubject,
           );
 
           await DeliverabilityTest.updateOne(
@@ -2047,7 +917,7 @@ function runChecksInBackground(
                 subject: finalSubject,
                 updatedAt: new Date(),
               },
-            }
+            },
           );
 
           const pushed = await DeliverabilityTest.findById(testId).lean();
@@ -2064,7 +934,7 @@ function runChecksInBackground(
                   error: result.error,
                   lastCheckedAt: result.lastCheckedAt,
                 },
-              })
+              }),
             );
           }
 
@@ -2076,7 +946,7 @@ function runChecksInBackground(
               mb.provider,
               finalSubject,
               username,
-              push
+              push,
             );
           }
         });
@@ -2090,7 +960,7 @@ function runChecksInBackground(
       if (fresh.status !== newStatus) {
         await DeliverabilityTest.updateOne(
           { _id: testId },
-          { $set: { status: newStatus, updatedAt: new Date() } }
+          { $set: { status: newStatus, updatedAt: new Date() } },
         );
       }
 
@@ -2101,7 +971,7 @@ function runChecksInBackground(
           buildRealtimePayload(pushedFinal, {
             event:
               pushedFinal.status === "COMPLETED" ? "completed" : "batch_done",
-          })
+          }),
         );
       }
     } catch {}
@@ -2112,6 +982,55 @@ function runChecksInBackground(
 module.exports = function deliverabilityRouter(deps = {}) {
   const router = express.Router();
   const push = makePusher(deps);
+
+  // ─────────────────────────────────────────────
+  // Microsoft OAuth one-time setup endpoints
+  // ─────────────────────────────────────────────
+
+  // GET /api/deliverability/ms/start?key=DELIV_MS_SETUP_KEY
+  router.get("/ms/start", async (req, res) => {
+    try {
+      if (!requireMsSetupKey(req, res)) return;
+      const url = msAuthorizeUrl();
+      return res.redirect(url);
+    } catch (e) {
+      return res
+        .status(500)
+        .send(e?.message || "Failed to start Microsoft OAuth");
+    }
+  });
+
+  // GET /api/deliverability/ms/callback?code=...
+  router.get("/ms/callback", async (req, res) => {
+    try {
+      if (!requireMsSetupKey(req, res)) return;
+
+      const code = req.query && req.query.code;
+      if (!code) return res.status(400).send("Missing code");
+
+      const tokenJson = await exchangeMsCodeForTokens(String(code));
+      const refresh = tokenJson.refresh_token;
+
+      if (!refresh) {
+        return res
+          .status(500)
+          .send(
+            "No refresh_token received. Check API permissions + Admin consent. Then retry.",
+          );
+      }
+
+      // show once so you paste into .env
+      return res
+        .status(200)
+        .send(
+          `✅ Microsoft connected.\n\nPaste this into EC2 .env:\n\nDELIV_MS_REFRESH_TOKEN=${refresh}\n\nThen restart backend.\n`,
+        );
+    } catch (e) {
+      return res
+        .status(500)
+        .send(e?.message || "Microsoft OAuth callback failed");
+    }
+  });
 
   // Auto cleanup runner (runs in same node process)
   if (CLEANUP_ENABLED && !global.__DELIV_CLEANUP_STARTED__) {
@@ -2164,7 +1083,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
 
       const selectedProviders = [
         ...new Set(
-          providers.map((p) => String(p || "").trim()).filter(Boolean)
+          providers.map((p) => String(p || "").trim()).filter(Boolean),
         ),
       ];
 
@@ -2278,7 +1197,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
       for (const t of testsRaw) {
         const normalized = await normalizeAndPersistStatus(
           DeliverabilityTest,
-          t
+          t,
         );
         const mailboxes = normalized.mailboxes || [];
         const counts = computeCounts(mailboxes);
@@ -2490,7 +1409,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
               creditsCharged: true,
               updatedAt: new Date(),
             },
-          }
+          },
         );
       }
 
@@ -2513,7 +1432,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
               subject: finalSubject,
               updatedAt: new Date(),
             },
-          }
+          },
         );
         const fresh = await DeliverabilityTest.findById(id).lean();
         if (fresh)
@@ -2530,7 +1449,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
             lastRunRequestedAt: new Date(),
             updatedAt: new Date(),
           },
-        }
+        },
       );
 
       const startedDoc = await DeliverabilityTest.findById(id).lean();
@@ -2542,7 +1461,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
         id,
         finalSubject,
         username,
-        push
+        push,
       );
 
       const fresh = await DeliverabilityTest.findById(id).lean();
@@ -2698,7 +1617,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
       res.setHeader("Content-Type", "text/csv; charset=utf-8");
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="${filename}"`
+        `attachment; filename="${filename}"`,
       );
       return res.status(200).send(csv);
     } catch (err) {
@@ -2752,6 +1671,15 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       }
 
+      if (provider === "microsoft_business" && mode === "smtp") {
+        return res
+          .status(400)
+          .json({
+            ok: false,
+            message: "SMTP debug not supported for Microsoft OAuth mailbox.",
+          });
+      }
+
       if (mode === "smtp") {
         const transporter = nodemailer.createTransport({
           host: cfg.smtp.host,
@@ -2778,11 +1706,13 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       }
 
+      const auth = await buildImapAuth(provider, cfg);
+
       const client = new ImapFlow({
         host: cfg.imap.host,
         port: cfg.imap.port,
         secure: cfg.imap.secure,
-        auth: { user: cfg.email, pass: cfg.pass },
+        auth,
         logger: false,
         socketTimeout: 60_000,
       });
