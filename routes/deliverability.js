@@ -518,12 +518,11 @@ async function buildImapAuth(providerKey, cfg) {
   if (isMicrosoftProvider(providerKey)) {
     const token = await fetchMsAccessTokenByRefreshToken();
 
-    // ✅ Exchange is picky: provide XOAUTH2 "pass" string instead of accessToken field
+    // ✅ Give ImapFlow the access token (not base64 "pass")
     const xoauth2 = buildXOAuth2(cfg.email, token);
-
     return {
       user: cfg.email,
-      pass: xoauth2,
+      pass: xoauth2, // ✅ base64 XOAUTH2 initial response
     };
   }
 
@@ -769,8 +768,11 @@ async function checkSingleMailbox(providerKey, email, subject) {
     result.error = err?.message || String(err);
     result.lastCheckedAt = new Date();
   } finally {
+    // try {
+    //   client.logout().catch(() => {});
+    // } catch {}
     try {
-      client.logout().catch(() => {});
+      await client.logout();
     } catch {}
   }
 
