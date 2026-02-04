@@ -1928,24 +1928,14 @@ function daysAgoDate(days) {
   return d;
 }
 
-/**
- * Delete messages older than N days from a folder using IMAP.
- * - Uses "BEFORE" search to find old messages.
- * - Deletes them (moves to Trash / marks deleted + expunge depending on provider).
- */
 async function deleteOldMessagesFromFolder(client, folderName, olderThanDate) {
   const lock = await client.getMailboxLock(folderName);
   try {
-    // Search messages BEFORE the date (IMAP supports BEFORE)
-    // ImapFlow accepts Date objects for before:
     const uids = await client.search({ before: olderThanDate });
     if (!uids || uids.length === 0) return { folder: folderName, deleted: 0 };
 
     // Mark as deleted
     await client.messageFlagsAdd(uids, ["\\Deleted"]);
-
-    // Expunge to actually remove
-    // Some providers only expunge deleted messages at logout, but expunge helps.
     try {
       await client.expunge();
     } catch {}
@@ -1956,9 +1946,6 @@ async function deleteOldMessagesFromFolder(client, folderName, olderThanDate) {
   }
 }
 
-/**
- * Cleanup one provider mailbox: deletes old mail from INBOX + Spam (+ extraFolders if you want).
- */
 async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
   const cfg = getProviderConfig(providerKey);
   if (!cfg) {
@@ -1974,16 +1961,6 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
   const olderThanDate = daysAgoDate(days);
 
   const auth = await buildImapAuth(providerKey, cfg);
-
-  // const client = new ImapFlow({
-  //   host: cfg.imap.host,
-  //   port: cfg.imap.port,
-  //   secure: cfg.imap.secure,
-  //   auth,
-  //   logger: false,
-  //   socketTimeout: 60_000,
-  // });
-
   const isMs = providerKey === "microsoft_business";
 
   const client = new ImapFlow({
@@ -2043,16 +2020,6 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
       }
     }
 
-    // (Optional) Cleanup extra folders (like Gmail All Mail) — be careful!
-    // If you enable this for Gmail, it can delete a LOT.
-    // if (Array.isArray(cfg.extraFolders)) {
-    //   for (const f of cfg.extraFolders) {
-    //     const r = await deleteOldMessagesFromFolder(client, f, olderThanDate);
-    //     details.push(r);
-    //     totalDeleted += r.deleted || 0;
-    //   }
-    // }
-
     return { provider: providerKey, ok: true, deleted: totalDeleted, details };
   } catch (err) {
     return {
@@ -2068,119 +2035,6 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
     } catch {}
   }
 }
-
-const tls = require("tls");
-
-/**
- * Exchange/Office365 IMAP XOAUTH2 (two-step, no SASL-IR inline initial response)
- * Returns { ok: true } or throws an Error with details.
- */
-// async function msImapXoauth2TwoStep({
-//   host,
-//   port = 993,
-//   user,
-//   accessToken,
-//   timeoutMs = 120_000,
-// }) {
-//   const xoauth2 = Buffer.from(
-//     `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
-//     "utf8",
-//   ).toString("base64");
-
-//   return await new Promise((resolve, reject) => {
-//     const socket = tls.connect(
-//       {
-//         host,
-//         port,
-//         servername: host, // SNI
-//         minVersion: "TLSv1.2",
-//       },
-//       () => {},
-//     );
-
-//     const cleanup = () => {
-//       try {
-//         socket.end();
-//       } catch {}
-//       try {
-//         socket.destroy();
-//       } catch {}
-//     };
-
-//     socket.setTimeout(timeoutMs, () => {
-//       cleanup();
-//       reject(new Error("IMAP timeout"));
-//     });
-
-//     socket.on("error", (e) => {
-//       cleanup();
-//       reject(e);
-//     });
-
-//     let buf = "";
-//     let stage = 0;
-
-//     // simple line reader
-//     socket.on("data", (chunk) => {
-//       buf += chunk.toString("utf8");
-
-//       // process by lines
-//       while (true) {
-//         const idx = buf.indexOf("\n");
-//         if (idx === -1) break;
-
-//         const line = buf.slice(0, idx).replace(/\r$/, "");
-//         buf = buf.slice(idx + 1);
-
-//         // console.log("[MS IMAP]", line);
-
-//         // Stage 0: wait greeting "* OK ..."
-//         if (stage === 0) {
-//           if (/^\*\s+OK\b/i.test(line)) {
-//             stage = 1;
-//             socket.write("a1 CAPABILITY\r\n");
-//           }
-//           continue;
-//         }
-
-//         // Stage 1: wait for "a1 OK"
-//         if (stage === 1) {
-//           if (/^a1\s+OK\b/i.test(line)) {
-//             stage = 2;
-//             socket.write("a2 AUTHENTICATE XOAUTH2\r\n");
-//           }
-//           continue;
-//         }
-
-//         // Stage 2: wait for continuation "+"
-//         if (stage === 2) {
-//           if (/^\+\s*/.test(line)) {
-//             stage = 3;
-//             socket.write(xoauth2 + "\r\n");
-//           } else if (/^a2\s+BAD\b/i.test(line) || /^a2\s+NO\b/i.test(line)) {
-//             cleanup();
-//             reject(new Error(`AUTHENTICATE rejected: ${line}`));
-//           }
-//           continue;
-//         }
-
-//         // Stage 3: wait auth result "a2 OK" or "a2 NO/BAD"
-//         if (stage === 3) {
-//           if (/^a2\s+OK\b/i.test(line)) {
-//             stage = 4;
-//             socket.write("a3 LOGOUT\r\n");
-//             cleanup();
-//             resolve({ ok: true });
-//           } else if (/^a2\s+(NO|BAD)\b/i.test(line)) {
-//             cleanup();
-//             reject(new Error(`AUTHENTICATE failed: ${line}`));
-//           }
-//           continue;
-//         }
-//       }
-//     });
-//   });
-// }
 
 /**
  * Cleanup ALL configured providers (those present in PROVIDERS and having env creds).
@@ -2309,9 +2163,6 @@ function getDeliverabilityModel(usernameRaw) {
   );
 }
 
-// ─────────────────────────────────────────────
-// Microsoft OAuth helpers (Deliverability)
-// ─────────────────────────────────────────────
 function isMicrosoftProvider(key) {
   return String(key || "") === "microsoft_business";
 }
@@ -2648,18 +2499,6 @@ async function checkSingleMailbox(providerKey, email, subject) {
     } else {
       let foundSpam = false;
       let spamError = null;
-
-      // if (cfg.spamFolder) {
-      //   try {
-      //     foundSpam = await searchSubjectInFolder(
-      //       client,
-      //       cfg.spamFolder,
-      //       subject,
-      //     );
-      //   } catch (e) {
-      //     spamError = e;
-      //   }
-      // }
       const spamFoldersToTry = [];
       if (cfg.spamFolder) spamFoldersToTry.push(cfg.spamFolder);
       if (Array.isArray(cfg.spamFolderAlternates)) {
@@ -2962,10 +2801,6 @@ module.exports = function deliverabilityRouter(deps = {}) {
   const router = express.Router();
   const push = makePusher(deps);
 
-  // ─────────────────────────────────────────────
-  // Microsoft OAuth one-time setup endpoints
-  // ─────────────────────────────────────────────
-
   // GET /api/deliverability/ms/start?key=DELIV_MS_SETUP_KEY
   router.get("/ms/start", async (req, res) => {
     try {
@@ -2979,7 +2814,6 @@ module.exports = function deliverabilityRouter(deps = {}) {
     }
   });
 
-  // GET /api/deliverability/ms/callback?code=...
   // GET /api/deliverability/ms/callback?code=...
   router.get("/ms/callback", async (req, res) => {
     try {
@@ -3611,11 +3445,6 @@ module.exports = function deliverabilityRouter(deps = {}) {
     try {
       const { days, provider } = req.body || {};
       const nDays = Number(days || CLEANUP_DAYS);
-
-      // If you want: restrict this to admin users only (recommended)
-      // const username = getUsernameFromReq(req);
-      // ... check role in User model ...
-
       if (provider) {
         const r = await cleanupProviderMailbox(String(provider), nDays);
         return res.json({ ok: true, mode: "single", ...r });
@@ -3630,363 +3459,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
     }
   });
 
-  // Debug route (optional)
-  // router.post("/test-connection", async (req, res) => {
-  //   const { provider, mode = "imap", to } = req.body;
-
-  //   try {
-  //     if (!provider)
-  //       return res
-  //         .status(400)
-  //         .json({ ok: false, message: "Provider is required." });
-
-  //     const cfg = getProviderConfig(provider);
-  //     if (!cfg) {
-  //       return res.status(400).json({
-  //         ok: false,
-  //         message:
-  //           "Provider not configured. Please check .env email & app password.",
-  //       });
-  //     }
-
-  //     if (provider === "microsoft_business" && mode === "smtp") {
-  //       return res.status(400).json({
-  //         ok: false,
-  //         message: "SMTP debug not supported for Microsoft OAuth mailbox.",
-  //       });
-  //     }
-
-  //     if (mode === "smtp") {
-  //       const transporter = nodemailer.createTransport({
-  //         host: cfg.smtp.host,
-  //         port: cfg.smtp.port,
-  //         secure: cfg.smtp.secure,
-  //         auth: { user: cfg.email, pass: cfg.pass },
-  //       });
-
-  //       const recipient = to || cfg.email;
-  //       const info = await transporter.sendMail({
-  //         from: `"Deliverability Debug" <${cfg.email}>`,
-  //         to: recipient,
-  //         subject: `Deliverability debug ${new Date().toISOString()}`,
-  //         text: "This is a test email from /test-connection SMTP.",
-  //       });
-
-  //       return res.json({
-  //         ok: true,
-  //         mode: "smtp",
-  //         provider,
-  //         from: cfg.email,
-  //         to: recipient,
-  //         messageId: info.messageId,
-  //       });
-  //     }
-
-  //     const auth = await buildImapAuth(provider, cfg);
-  //     const isMs = provider === "microsoft_business";
-
-  //     if (isMs) {
-  //       // buildImapAuth must return something that contains accessToken for MS
-  //       // If your buildImapAuth currently returns { user, pass }, change it to return { user, accessToken } for microsoft_business.
-  //       const accessToken = auth?.accessToken;
-
-  //       if (!accessToken) {
-  //         return res.status(500).json({
-  //           ok: false,
-  //           message: "IMAP connection failed.",
-  //           error: "Missing accessToken for Microsoft OAuth flow",
-  //         });
-  //       }
-
-  //       try {
-  //         await msImapXoauth2TwoStep({
-  //           host: cfg.imap.host,
-  //           port: cfg.imap.port,
-  //           user: cfg.email,
-  //           accessToken,
-  //           timeoutMs: 120_000,
-  //         });
-
-  //         return res.json({
-  //           ok: true,
-  //           mode: "imap",
-  //           provider,
-  //           email: cfg.email,
-  //           note: "IMAP login successful (Microsoft two-step XOAUTH2).",
-  //         });
-  //       } catch (e) {
-  //         return res.status(500).json({
-  //           ok: false,
-  //           message: "IMAP connection failed.",
-  //           error: e?.message || String(e),
-  //         });
-  //       }
-  //     }
-
-  //     // Non-Microsoft providers: keep ImapFlow
-  //     const client = new ImapFlow({
-  //       host: cfg.imap.host,
-  //       port: cfg.imap.port,
-  //       secure: cfg.imap.secure,
-  //       auth,
-  //       logger: false,
-  //       socketTimeout: 60_000,
-  //       greetingTimeout: 30_000,
-  //       tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
-  //     });
-
-  //     try {
-  //       await client.connect();
-  //       const lock = await client.getMailboxLock(cfg.inboxFolder || "INBOX");
-  //       lock.release();
-  //       await client.logout();
-  //       return res.json({
-  //         ok: true,
-  //         mode: "imap",
-  //         provider,
-  //         email: cfg.email,
-  //         note: "IMAP login successful.",
-  //       });
-  //     } catch (imapErr) {
-  //       // IMPORTANT: don't call logout() if not connected
-  //       try {
-  //         client.close();
-  //       } catch {}
-  //       return res.status(500).json({
-  //         ok: false,
-  //         message: "IMAP connection failed.",
-  //         error: imapErr?.message || String(imapErr),
-  //         code: imapErr?.code,
-  //         responseStatus: imapErr?.responseStatus,
-  //         responseText: imapErr?.responseText,
-  //         serverResponse: imapErr?.serverResponse,
-  //       });
-  //     }
-  //   } catch {
-  //     return res
-  //       .status(500)
-  //       .json({ ok: false, message: "Internal server error." });
-  //   }
-  // });
-
-  // ✅ Fix B: Microsoft IMAP XOAUTH2 two-step auth (NO SASL-IR inline blob)
-  // Paste this whole block to REPLACE your current /test-connection handler.
-  // (Keep your existing getProviderConfig(), buildImapAuth(), nodemailer, ImapFlow imports as-is.)
-
-
-  /** Build XOAUTH2 base64 payload */
-  function buildXoauth2B64(user, accessToken) {
-    // format: "user=<email>\x01auth=Bearer <token>\x01\x01"
-    const str = `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`;
-    return Buffer.from(str, "utf8").toString("base64");
-  }
-
-  /**
-   * Very small IMAP line reader over TLS for Microsoft Exchange IMAP.
-   * Does:
-   *  - waits greeting
-   *  - CAPABILITY (optional)
-   *  - AUTHENTICATE XOAUTH2   (no initial response)
-   *  - waits '+' challenge
-   *  - sends base64 on new line
-   *  - expects tagged OK
-   *  - LOGOUT
-   */
-  async function msImapXoauth2TwoStep({
-    host,
-    port = 993,
-    user,
-    accessToken,
-    timeoutMs = 120000,
-  }) {
-    if (!host) throw new Error("msImapXoauth2TwoStep: host is required");
-    if (!user) throw new Error("msImapXoauth2TwoStep: user is required");
-    if (!accessToken)
-      throw new Error("msImapXoauth2TwoStep: accessToken is required");
-
-    const xoauth2B64 = buildXoauth2B64(user, accessToken);
-
-    let socket;
-    let timer;
-
-    const startTimeout = (label) => {
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        try {
-          socket?.destroy(new Error(`IMAP timeout: ${label}`));
-        } catch {}
-      }, timeoutMs);
-    };
-
-    // Buffered line reader (handles \r\n framing)
-    let buf = "";
-    const waiters = [];
-    const pushLine = (line) => {
-      for (let i = 0; i < waiters.length; i++) {
-        const w = waiters[i];
-        if (w.predicate(line)) {
-          waiters.splice(i, 1);
-          w.resolve(line);
-          return;
-        }
-      }
-    };
-    const readLine = () =>
-      new Promise((resolve, reject) => {
-        waiters.push({
-          predicate: () => true,
-          resolve,
-        });
-      });
-
-    const readUntil = (predicate, label) =>
-      new Promise((resolve, reject) => {
-        startTimeout(label);
-        waiters.push({
-          predicate,
-          resolve,
-        });
-      });
-
-    const writeLine = (s) => {
-      socket.write(s + "\r\n");
-    };
-
-    const tag = (() => {
-      let n = 1;
-      return () => `A${String(n++).padStart(3, "0")}`;
-    })();
-
-    const execTagged = async (cmd, label) => {
-      const t = tag();
-      writeLine(`${t} ${cmd}`);
-
-      // Collect until we get tagged completion line
-      while (true) {
-        const line = await readLine(); // any line
-        // tagged OK/NO/BAD lines start with the same tag
-        if (line.startsWith(t + " ")) {
-          if (/^A\d+\s+OK\b/i.test(line)) return { ok: true, line };
-          // include server message in thrown error
-          throw new Error(`IMAP ${label} failed: ${line}`);
-        }
-        // ignore untagged lines here
-      }
-    };
-
-    return new Promise((resolve, reject) => {
-      try {
-        socket = tls.connect(
-          {
-            host,
-            port,
-            servername: host,
-            minVersion: "TLSv1.2",
-            rejectUnauthorized: true,
-          },
-          async () => {
-            try {
-              startTimeout("greeting");
-
-              // Wait greeting "* OK ..."
-              while (true) {
-                const line = await readLine();
-                if (/^\*\s+OK\b/i.test(line)) break;
-                // If server sends something weird, keep reading
-              }
-
-              // CAPABILITY (optional but nice)
-              try {
-                await execTagged("CAPABILITY", "CAPABILITY");
-              } catch {
-                // ignore capability failures; auth might still work
-              }
-
-              // AUTHENTICATE XOAUTH2 (two-step: no initial response)
-              const t = tag();
-              writeLine(`${t} AUTHENTICATE XOAUTH2`);
-
-              // Wait for "+" challenge OR immediate tagged fail
-              while (true) {
-                const line = await readLine();
-
-                // Server requests the response
-                if (line.startsWith("+")) break;
-
-                // Tagged completion without challenge => fail
-                if (line.startsWith(t + " ")) {
-                  throw new Error(`IMAP AUTHENTICATE failed: ${line}`);
-                }
-
-                // continue on untagged
-              }
-
-              // Send the base64 as its own line (no quotes)
-              writeLine(xoauth2B64);
-
-              // Now wait for tagged OK/NO/BAD for that tag
-              while (true) {
-                const line = await readLine();
-                if (line.startsWith(t + " ")) {
-                  if (/^A\d+\s+OK\b/i.test(line)) break;
-                  throw new Error(`IMAP XOAUTH2 rejected: ${line}`);
-                }
-              }
-
-              // Clean logout (best effort)
-              try {
-                await execTagged("LOGOUT", "LOGOUT");
-              } catch {}
-
-              clearTimeout(timer);
-              try {
-                socket.end();
-              } catch {}
-
-              resolve(true);
-            } catch (err) {
-              clearTimeout(timer);
-              try {
-                socket.destroy();
-              } catch {}
-              reject(err);
-            }
-          },
-        );
-
-        socket.setEncoding("utf8");
-
-        socket.on("data", (chunk) => {
-          buf += chunk;
-          while (true) {
-            const idx = buf.indexOf("\n");
-            if (idx === -1) break;
-            let line = buf.slice(0, idx);
-            buf = buf.slice(idx + 1);
-            line = line.replace(/\r$/, "");
-            if (line.length) pushLine(line);
-          }
-        });
-
-        socket.on("error", (e) => {
-          clearTimeout(timer);
-          reject(e);
-        });
-
-        socket.on("end", () => {
-          // If socket ends unexpectedly, any pending waits will hang; reject fast
-          clearTimeout(timer);
-        });
-      } catch (e) {
-        clearTimeout(timer);
-        try {
-          socket?.destroy();
-        } catch {}
-        reject(e);
-      }
-    });
-  }
-
+  // Debug route (clean + consistent)
   router.post("/test-connection", async (req, res) => {
     const { provider, mode = "imap", to } = req.body;
 
@@ -4006,6 +3479,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       }
 
+      // Microsoft SMTP debug not supported
       if (provider === "microsoft_business" && mode === "smtp") {
         return res.status(400).json({
           ok: false,
@@ -4013,7 +3487,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       }
 
-      // ───────────────────────── SMTP test (non-MS + MS non-supported above)
+      // SMTP test (non-MS only)
       if (mode === "smtp") {
         const transporter = nodemailer.createTransport({
           host: cfg.smtp.host,
@@ -4040,56 +3514,22 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       }
 
-      // ───────────────────────── IMAP
+      // IMAP test (ALL providers including Microsoft via ImapFlow)
       const auth = await buildImapAuth(provider, cfg);
       const isMs = provider === "microsoft_business";
 
-      // ✅ Microsoft: use manual two-step XOAUTH2 flow (Fix B)
-      if (isMs) {
-        const accessToken = auth?.accessToken;
-
-        if (!accessToken) {
-          return res.status(500).json({
-            ok: false,
-            message: "IMAP connection failed.",
-            error: "Missing accessToken for Microsoft OAuth flow",
-          });
-        }
-
-        try {
-          await msImapXoauth2TwoStep({
-            host: cfg.imap.host,
-            port: cfg.imap.port || 993,
-            user: cfg.email,
-            accessToken,
-            timeoutMs: 120000,
-          });
-
-          return res.json({
-            ok: true,
-            mode: "imap",
-            provider,
-            email: cfg.email,
-            note: "IMAP login successful (Microsoft XOAUTH2 two-step).",
-          });
-        } catch (e) {
-          return res.status(500).json({
-            ok: false,
-            message: "IMAP connection failed.",
-            error: e?.message || String(e),
-          });
-        }
-      }
-
-      // ───────────────────────── Non-Microsoft providers: keep ImapFlow
       const client = new ImapFlow({
         host: cfg.imap.host,
         port: cfg.imap.port,
         secure: cfg.imap.secure,
         auth,
+        authMethod: isMs ? "XOAUTH2" : undefined,
         logger: false,
-        socketTimeout: 60000,
-        greetingTimeout: 30000,
+
+        // ✅ keep under nginx proxy timeout to avoid 504
+        socketTimeout: isMs ? 55_000 : 60_000,
+        greetingTimeout: isMs ? 55_000 : 30_000,
+
         tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
       });
 
@@ -4107,7 +3547,6 @@ module.exports = function deliverabilityRouter(deps = {}) {
           note: "IMAP login successful.",
         });
       } catch (imapErr) {
-        // IMPORTANT: don't call logout() if not connected
         try {
           client.close();
         } catch {}
