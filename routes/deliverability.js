@@ -6,7 +6,7 @@ const nodemailer = require("nodemailer");
 const User = require("../models/User");
 
 const DELIV_CREDITS_PER_MAILBOX = Number(
-  process.env.DELIV_CREDITS_PER_MAILBOX || 1
+  process.env.DELIV_CREDITS_PER_MAILBOX || 1,
 );
 
 /** ---------------- Providers ---------------- */
@@ -1001,10 +1001,9 @@ module.exports = function deliverabilityRouter(deps = {}) {
   });
 
   // GET /api/deliverability/ms/callback?code=...
+  // GET /api/deliverability/ms/callback?code=...
   router.get("/ms/callback", async (req, res) => {
     try {
-      if (!requireMsSetupKey(req, res)) return;
-
       const code = req.query && req.query.code;
       if (!code) return res.status(400).send("Missing code");
 
@@ -1672,12 +1671,10 @@ module.exports = function deliverabilityRouter(deps = {}) {
       }
 
       if (provider === "microsoft_business" && mode === "smtp") {
-        return res
-          .status(400)
-          .json({
-            ok: false,
-            message: "SMTP debug not supported for Microsoft OAuth mailbox.",
-          });
+        return res.status(400).json({
+          ok: false,
+          message: "SMTP debug not supported for Microsoft OAuth mailbox.",
+        });
       }
 
       if (mode === "smtp") {
