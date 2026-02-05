@@ -1968,6 +1968,17 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
   const auth = await buildImapAuth(providerKey, cfg);
   const isMs = providerKey === "microsoft_business";
 
+  if (isMs) {
+    return {
+      provider: providerKey,
+      ok: false,
+      error:
+        "MS_CLEANUP_SKIPPED (ImapFlow XOAUTH2 inline rejected by Exchange)",
+      deleted: 0,
+      details: [],
+    };
+  }
+
   // ✅ For cleanup we still use ImapFlow, including Microsoft.
   // (The XOAUTH2 problem is mainly with AUTH inline; cleanup uses normal IMAP ops after login.)
   const client = new ImapFlow({
@@ -2670,7 +2681,7 @@ async function msImapXoauth2TwoStep({
   port = 993,
   user,
   accessToken,
-  timeoutMs = 55_000,
+  timeoutMs = 20_000, // keep short so nginx never 504s
 }) {
   if (!accessToken) throw new Error("Missing accessToken");
 
@@ -2685,116 +2696,99 @@ async function msImapXoauth2TwoStep({
       () => {},
     );
 
-    const cleanup = () => {
+    let done = false;
+    const finishOk = () => {
+      if (done) return;
+      done = true;
       try {
         socket.end();
       } catch {}
       try {
         socket.destroy();
       } catch {}
+      resolve(true);
+    };
+    const finishErr = (e) => {
+      if (done) return;
+      done = true;
+      try {
+        socket.end();
+      } catch {}
+      try {
+        socket.destroy();
+      } catch {}
+      reject(e instanceof Error ? e : new Error(String(e)));
     };
 
-    socket.setTimeout(timeoutMs, () => {
-      cleanup();
-      reject(new Error("IMAP timeout"));
-    });
+    const hardTimer = setTimeout(() => {
+      finishErr(new Error("IMAP hard-timeout (two-step XOAUTH2)"));
+    }, timeoutMs + 2000);
 
-    socket.on("error", (e) => {
-      cleanup();
-      reject(e);
-    });
+    socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
+    socket.on("error", (e) => finishErr(e));
 
     let buf = "";
     let tagN = 1;
-
     const send = (line) => socket.write(line + "\r\n");
 
-    const listeners = new Set();
-    const on = (fn) => listeners.add(fn);
-    const off = (fn) => listeners.delete(fn);
-    const emitLine = (line) => {
-      for (const fn of listeners) fn(line);
-    };
-
-    const waitTagged = (tag, onOk, onNoBad) => {
-      const handler = (line) => {
-        if (line.startsWith(tag + " OK")) {
-          off(handler);
-          onOk(line);
-        } else if (
-          line.startsWith(tag + " NO") ||
-          line.startsWith(tag + " BAD")
-        ) {
-          off(handler);
-          onNoBad(line);
-        }
-      };
-      on(handler);
-    };
-
-    let stage = 0;
+    let authTag = null;
+    let stage = 0; // 0 wait greeting, 1 sent capability, 2 sent auth, 3 sent token
 
     socket.on("data", (chunk) => {
       buf += chunk.toString("utf8");
+
       while (true) {
         const idx = buf.indexOf("\n");
         if (idx === -1) break;
+
         const line = buf.slice(0, idx).replace(/\r$/, "");
         buf = buf.slice(idx + 1);
 
-        emitLine(line);
-
         // greeting
-        if (stage === 0) {
-          if (/^\*\s+OK\b/i.test(line)) {
-            stage = 1;
-            const t = "a" + tagN++;
-            send(`${t} CAPABILITY`);
-            waitTagged(
-              t,
-              () => {
-                stage = 2;
-                const t2 = "a" + tagN++;
-                send(`${t2} AUTHENTICATE XOAUTH2`);
-                waitTagged(
-                  t2,
-                  () => {
-                    // will continue with '+' then base64 then OK
-                  },
-                  (bad) => {
-                    cleanup();
-                    reject(new Error(`AUTHENTICATE rejected: ${bad}`));
-                  },
-                );
-              },
-              (bad) => {
-                cleanup();
-                reject(new Error(`CAPABILITY failed: ${bad}`));
-              },
-            );
-          }
+        if (stage === 0 && /^\*\s+OK\b/i.test(line)) {
+          stage = 1;
+          const t = "a" + tagN++;
+          send(`${t} CAPABILITY`);
+          return;
+        }
+
+        // after CAPABILITY OK → send AUTHENTICATE
+        if (stage === 1 && /^a\d+\s+OK\b/i.test(line)) {
+          stage = 2;
+          authTag = "a" + tagN++;
+          send(`${authTag} AUTHENTICATE XOAUTH2`);
           continue;
         }
 
-        // AUTH continuation '+'
-        if (stage === 2) {
-          if (/^\+\s*/.test(line)) {
-            stage = 3;
-            send(xoauth2);
-            continue;
-          }
+        // server asks for initial response with "+"
+        if (stage === 2 && /^\+\s*/.test(line)) {
+          stage = 3;
+          send(xoauth2);
+          continue;
         }
 
-        // Success: tagged OK after auth
-        if (stage === 3) {
-          if (/^a\d+\s+OK\b/i.test(line)) {
-            const tOut = "a" + tagN++;
-            send(`${tOut} LOGOUT`);
-            cleanup();
-            return resolve(true);
+        // tagged response to AUTHENTICATE (OK/NO/BAD)
+        if (authTag && line.startsWith(authTag + " ")) {
+          clearTimeout(hardTimer);
+
+          if (line.includes(" OK")) {
+            // logout best effort
+            try {
+              const tOut = "a" + tagN++;
+              send(`${tOut} LOGOUT`);
+            } catch {}
+            return finishOk();
+          }
+
+          if (line.includes(" NO") || line.includes(" BAD")) {
+            return finishErr(new Error(`AUTHENTICATE failed: ${line}`));
           }
         }
       }
+    });
+
+    socket.on("close", () => {
+      if (!done) finishErr(new Error("Socket closed before auth completed"));
     });
   });
 }
