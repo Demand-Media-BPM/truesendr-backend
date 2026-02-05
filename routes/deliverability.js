@@ -2238,6 +2238,31 @@ async function exchangeMsCodeForTokens(code) {
   return json;
 }
 
+function decodeJwtClaims(token) {
+  try {
+    const parts = String(token || "").split(".");
+    if (parts.length < 2) return null;
+    const payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    const json = Buffer.from(payload, "base64").toString("utf8");
+    const claims = JSON.parse(json);
+
+    // return only safe/small fields (don’t log token)
+    return {
+      aud: claims.aud,
+      scp: claims.scp,
+      roles: claims.roles,
+      tid: claims.tid,
+      upn: claims.upn,
+      preferred_username: claims.preferred_username,
+      exp: claims.exp,
+      iat: claims.iat,
+      appid: claims.appid,
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function fetchMsAccessTokenByRefreshToken() {
   const tenant = process.env.DELIV_MS_TENANT || "common";
   const clientId = process.env.DELIV_MS_CLIENT_ID;
@@ -2313,11 +2338,10 @@ async function buildImapAuth(providerKey, cfg) {
   if (isMicrosoftProvider(providerKey)) {
     const token = await fetchMsAccessTokenByRefreshToken();
 
-    // ✅ ImapFlow expects accessToken for XOAUTH2 (it builds the SASL payload itself)
-    return {
-      user: cfg.email,
-      accessToken: token,
-    };
+    const claims = decodeJwtClaims(token);
+    console.log("[MS] access token claims:", claims);
+
+    return { user: cfg.email, accessToken: token };
   }
 
   return { user: cfg.email, pass: cfg.pass };
@@ -2443,12 +2467,98 @@ async function searchSubjectInFolder(client, folderName, subject) {
   }
 }
 
+function msAuthXoauth2Literal(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let buf = "";
+    let tagN = 900; // avoid colliding with outer tags
+    const tag = "l" + tagN++;
+
+    const cleanup = () => {
+      try {
+        socket.removeListener("data", onData);
+      } catch {}
+    };
+
+    const finishOk = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(true);
+    };
+
+    const finishErr = (err) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const timer = setTimeout(() => {
+      finishErr(
+        new Error("Literal XOAUTH2 timed out waiting for server response"),
+      );
+    }, timeoutMs);
+
+    const sendLine = (line) => socket.write(line + "\r\n");
+
+    // Send literal request: AUTHENTICATE XOAUTH2 {len}
+    const len = Buffer.byteLength(xoauth2, "utf8");
+    sendLine(`${tag} AUTHENTICATE XOAUTH2 {${len}}`);
+
+    let waitingPlus = true;
+
+    const onData = (chunk) => {
+      buf += chunk.toString("utf8");
+
+      while (true) {
+        const idx = buf.indexOf("\n");
+        if (idx === -1) break;
+
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+
+        // If server asks for literal
+        if (waitingPlus && /^\+\s*/.test(line)) {
+          waitingPlus = false;
+          socket.write(xoauth2 + "\r\n");
+          continue;
+        }
+
+        // Tagged OK/NO/BAD
+        const lower = line.toLowerCase();
+        const tagLower = tag.toLowerCase();
+
+        if (lower.startsWith(tagLower + " ok")) {
+          clearTimeout(timer);
+          return finishOk();
+        }
+        if (
+          lower.startsWith(tagLower + " no") ||
+          lower.startsWith(tagLower + " bad")
+        ) {
+          clearTimeout(timer);
+          return finishErr(new Error(`AUTHENTICATE rejected: ${line}`));
+        }
+
+        // Some servers send BYE on failure
+        if (/^\*\s+BYE\b/i.test(line)) {
+          clearTimeout(timer);
+          return finishErr(new Error(`Server BYE: ${line}`));
+        }
+      }
+    };
+
+    socket.on("data", onData);
+  });
+}
+
 async function msImapXoauth2Smart({
   host,
   port = 993,
   user,
   accessToken,
-  timeoutMs = 60_000, // bump for Exchange
+  timeoutMs = 60_000,
 }) {
   if (!accessToken) throw new Error("Missing accessToken");
 
@@ -2509,26 +2619,21 @@ async function msImapXoauth2Smart({
     socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
     socket.on("error", (e) => finishErr(e));
     socket.on("close", () => {
-      // If it closes before success and we haven't finished, treat as error
       if (!finished) finishErr(new Error("IMAP socket closed unexpectedly"));
     });
 
-    // stage:
-    // 0 wait greeting
-    // 1 sent CAPABILITY, wait cap OK
-    // 2 sent AUTHENTICATE {len}, wait '+'
-    // 3 sent payload, wait auth OK/NO/BAD
     let stage = 0;
+    let sawXoauth2InCap = false;
 
     const onLine = (line) => {
       const l = String(line || "");
 
-      // server bye at any point
       if (/^\*\s+BYE\b/i.test(l)) {
+        clearTimeout(hardTimer);
         return finishErr(new Error(`Server BYE: ${l}`));
       }
 
-      // 0) Greeting
+      // Greeting
       if (stage === 0) {
         if (/^\*\s+OK\b/i.test(l)) {
           stage = 1;
@@ -2537,58 +2642,70 @@ async function msImapXoauth2Smart({
         return;
       }
 
-      // 1) CAPABILITY completion
+      // CAPABILITY
       if (stage === 1) {
+        if (/^\*\s+CAPABILITY\b/i.test(l) && /AUTH=XOAUTH2/i.test(l)) {
+          sawXoauth2InCap = true;
+        }
         if (new RegExp("^" + capTag + "\\s+OK\\b", "i").test(l)) {
+          if (!sawXoauth2InCap) {
+            clearTimeout(hardTimer);
+            return finishErr(
+              new Error("Server CAPABILITY did not advertise AUTH=XOAUTH2"),
+            );
+          }
+
+          // Try inline first (Microsoft docs style)
           stage = 2;
-          const len = Buffer.byteLength(xoauth2, "utf8");
-          sendLine(`${authTag} AUTHENTICATE XOAUTH2 {${len}}`);
+          sendLine(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
           return;
         }
+
         if (
           new RegExp("^" + capTag + "\\s+NO\\b", "i").test(l) ||
           new RegExp("^" + capTag + "\\s+BAD\\b", "i").test(l)
         ) {
+          clearTimeout(hardTimer);
           return finishErr(new Error(`CAPABILITY failed: ${l}`));
         }
         return;
       }
 
-      // 2) Wait for continuation '+'
+      // AUTH inline result
       if (stage === 2) {
-        if (/^\+\s*/.test(l)) {
-          stage = 3;
-          // literal payload line (raw base64 then CRLF)
-          socket.write(xoauth2 + "\r\n");
-          return;
-        }
-        // early reject
-        if (
-          new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l) ||
-          new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)
-        ) {
-          return finishErr(new Error(`AUTHENTICATE rejected: ${l}`));
-        }
-        return;
-      }
-
-      // 3) AUTH completion
-      if (stage === 3) {
         if (new RegExp("^" + authTag + "\\s+OK\\b", "i").test(l)) {
           clearTimeout(hardTimer);
-          // best effort logout; don't wait
           try {
             sendLine(`${logoutTag} LOGOUT`);
           } catch {}
           return finishOk();
         }
-        if (
-          new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l) ||
-          new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)
-        ) {
+
+        // If BAD => fallback to literal {len}
+        if (new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)) {
+          stage = 3;
+          return msAuthXoauth2Literal(socket, xoauth2, {
+            timeoutMs: Math.max(15000, timeoutMs - 5000),
+          })
+            .then(() => {
+              clearTimeout(hardTimer);
+              try {
+                sendLine(`${logoutTag} LOGOUT`);
+              } catch {}
+              finishOk();
+            })
+            .catch((e) => {
+              clearTimeout(hardTimer);
+              finishErr(e);
+            });
+        }
+
+        // If NO => token/permission/access issue
+        if (new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l)) {
           clearTimeout(hardTimer);
           return finishErr(new Error(`AUTHENTICATE failed: ${l}`));
         }
+        return;
       }
     };
 
@@ -2631,20 +2748,16 @@ async function msImapSearchSubjectInFolder({
     );
 
     let finished = false;
-    const finishOk = (val) => {
-      if (finished) return;
-      finished = true;
-      cleanup();
-      resolve(val);
-    };
-    const finishErr = (err) => {
-      if (finished) return;
-      finished = true;
-      cleanup();
-      reject(err instanceof Error ? err : new Error(String(err)));
-    };
+    let buf = "";
+    let tagN = 1;
 
     const cleanup = () => {
+      try {
+        socket.removeAllListeners("data");
+        socket.removeAllListeners("error");
+        socket.removeAllListeners("timeout");
+        socket.removeAllListeners("close");
+      } catch {}
       try {
         socket.end();
       } catch {}
@@ -2653,126 +2766,125 @@ async function msImapSearchSubjectInFolder({
       } catch {}
     };
 
+    const finishOk = (val) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve(val);
+    };
+
+    const finishErr = (err) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
     socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
     socket.on("error", (e) => finishErr(e));
     socket.on("close", () => {
       if (!finished) finishErr(new Error("IMAP socket closed unexpectedly"));
     });
 
-    let buf = "";
-    let tagN = 1;
-
     const sendLine = (line) => socket.write(line + "\r\n");
 
-    // Tagged waiter
-    const listeners = new Set();
-    const on = (fn) => listeners.add(fn);
-    const off = (fn) => listeners.delete(fn);
-    const emitLine = (line) => {
-      for (const fn of listeners) fn(line);
-    };
+    // tiny tagged-command waiter
+    const waiters = new Map();
+    function setWaiter(tag, onOk, onNoBad) {
+      waiters.set(tag.toLowerCase(), { onOk, onNoBad });
+    }
 
-    const waitTagged = (tag, onOk, onNoBad) => {
-      const tagLower = String(tag).toLowerCase();
-      const handler = (line) => {
-        const l = String(line || "");
-        const lower = l.toLowerCase();
+    let sawXoauth2InCap = false;
+    let authed = false;
+    let msgIds = [];
+    let found = false;
+    let currentFetchTag = null;
 
-        if (lower.startsWith(tagLower + " ok")) {
-          off(handler);
-          onOk(l);
-        } else if (
-          lower.startsWith(tagLower + " no") ||
-          lower.startsWith(tagLower + " bad")
-        ) {
-          off(handler);
-          onNoBad(l);
-        }
-      };
-      on(handler);
-    };
+    // Steps:
+    // greet -> CAPABILITY -> AUTH (inline, fallback literal) -> SELECT -> SEARCH ALL -> FETCH last 50 subjects
+    const capTag = "c" + tagN++;
+    const authTag = "a" + tagN++;
+    const selTag = "s" + tagN++;
+    const searchTag = "q" + tagN++;
 
-    // Drive flow with one function to avoid duplicate paths
-    const startSelectSearchFetch = () => {
-      const tSel = "a" + tagN++;
-      sendLine(`${tSel} SELECT "${folderName}"`);
-      waitTagged(
-        tSel,
+    function startAuthInline() {
+      sendLine(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
+      setWaiter(
+        authTag,
         () => {
-          const tSearch = "a" + tagN++;
-          sendLine(`${tSearch} SEARCH ALL`);
-          waitTagged(
-            tSearch,
-            () => {
-              msgIds = msgIds.slice(-50);
-              if (msgIds.length === 0) {
-                const tOut = "a" + tagN++;
-                sendLine(`${tOut} LOGOUT`);
-                return finishOk(false);
-              }
-
-              let i = 0;
-              const fetchNext = () => {
-                if (i >= msgIds.length) {
-                  const tOut2 = "a" + tagN++;
-                  sendLine(`${tOut2} LOGOUT`);
-                  return finishOk(found);
-                }
-
-                const id = msgIds[i++];
-                const tF = "a" + tagN++;
-                let headerBuf = [];
-
-                const headerListener = (l) => {
-                  if (/^Subject:/i.test(l)) headerBuf.push(l);
-                };
-                on(headerListener);
-
-                sendLine(
-                  `${tF} FETCH ${id} (BODY.PEEK[HEADER.FIELDS (SUBJECT)])`,
-                );
-                waitTagged(
-                  tF,
-                  () => {
-                    off(headerListener);
-                    const subjLine = headerBuf.join(" ");
-                    if (subjLine.toLowerCase().includes(searchTerm)) {
-                      found = true;
-                      const tOut3 = "a" + tagN++;
-                      sendLine(`${tOut3} LOGOUT`);
-                      return finishOk(true);
-                    }
-                    fetchNext();
-                  },
-                  () => {
-                    off(headerListener);
-                    fetchNext();
-                  },
-                );
-              };
-
-              fetchNext();
-            },
-            (bad) => finishErr(new Error(`SEARCH failed: ${bad}`)),
-          );
+          authed = true;
+          sendLine(`${selTag} SELECT "${folderName}"`);
         },
-        () => {
-          const tOut = "a" + tagN++;
-          sendLine(`${tOut} LOGOUT`);
-          return finishOk(false);
+        async (line) => {
+          // If BAD => fallback literal
+          if (/\bBAD\b/i.test(line)) {
+            try {
+              await msAuthXoauth2Literal(socket, xoauth2, {
+                timeoutMs: 30_000,
+              });
+              authed = true;
+              sendLine(`${selTag} SELECT "${folderName}"`);
+            } catch (e) {
+              finishErr(e);
+            }
+          } else {
+            finishErr(new Error(`AUTHENTICATE failed: ${line}`));
+          }
         },
       );
-    };
+    }
 
-    // stages:
-    // 0 greet
-    // 1 CAPABILITY tagged ok
-    // 2 AUTHENTICATE literal header sent, waiting '+'
-    // 3 sent literal payload, waiting AUTH ok
-    let stage = 0;
-    let found = false;
-    let msgIds = [];
-    let authTag = null;
+    function startSearchAll() {
+      sendLine(`${searchTag} SEARCH ALL`);
+      setWaiter(
+        searchTag,
+        () => {
+          // after SEARCH ok, fetch last 50 IDs
+          const last = msgIds.slice(-50);
+          if (last.length === 0) return finishOk(false);
+
+          // iterate fetch one-by-one
+          let i = 0;
+          const fetchNext = () => {
+            if (i >= last.length) return finishOk(found);
+            const id = last[i++];
+
+            const fTag = "f" + tagN++;
+            currentFetchTag = fTag;
+            let subjectLines = [];
+
+            setWaiter(
+              fTag,
+              () => {
+                const subj = subjectLines.join(" ").toLowerCase();
+                if (subj.includes(searchTerm)) return finishOk(true);
+                fetchNext();
+              },
+              () => fetchNext(),
+            );
+
+            sendLine(
+              `${fTag} FETCH ${id} (BODY.PEEK[HEADER.FIELDS (SUBJECT)])`,
+            );
+
+            // We’ll parse Subject lines from untagged output while this fetch is active
+            socket.___collectSubjectLines = (line) => {
+              if (currentFetchTag !== fTag) return;
+              if (/^Subject:/i.test(line)) subjectLines.push(line);
+            };
+          };
+
+          fetchNext();
+        },
+        (line) => finishErr(new Error(`SEARCH failed: ${line}`)),
+      );
+    }
+
+    setWaiter(
+      selTag,
+      () => startSearchAll(),
+      (line) => finishErr(new Error(`SELECT failed: ${line}`)),
+    );
 
     socket.on("data", (chunk) => {
       buf += chunk.toString("utf8");
@@ -2784,13 +2896,34 @@ async function msImapSearchSubjectInFolder({
         const line = buf.slice(0, idx).replace(/\r$/, "");
         buf = buf.slice(idx + 1);
 
-        emitLine(line);
-
+        // BYE always fatal
         if (/^\*\s+BYE\b/i.test(line)) {
           return finishErr(new Error(`Server BYE: ${line}`));
         }
 
-        // collect SEARCH ids whenever they appear
+        // Greeting triggers CAPABILITY
+        if (!authed && /^\*\s+OK\b/i.test(line)) {
+          sendLine(`${capTag} CAPABILITY`);
+          setWaiter(
+            capTag,
+            () => {
+              if (!sawXoauth2InCap) {
+                return finishErr(
+                  new Error("Server did not advertise AUTH=XOAUTH2"),
+                );
+              }
+              startAuthInline();
+            },
+            (bad) => finishErr(new Error(`CAPABILITY failed: ${bad}`)),
+          );
+        }
+
+        // CAPABILITY untagged
+        if (/^\*\s+CAPABILITY\b/i.test(line) && /AUTH=XOAUTH2/i.test(line)) {
+          sawXoauth2InCap = true;
+        }
+
+        // SEARCH ids untagged: "* SEARCH 1 2 3"
         const m = line.match(/^\*\s+SEARCH\s*(.*)$/i);
         if (m) {
           const ids = m[1]
@@ -2802,48 +2935,25 @@ async function msImapSearchSubjectInFolder({
           msgIds.push(...ids);
         }
 
-        // greet
-        if (stage === 0) {
-          if (/^\*\s+OK\b/i.test(line)) {
-            stage = 1;
-            const tCap = "a" + tagN++;
-            sendLine(`${tCap} CAPABILITY`);
-            waitTagged(
-              tCap,
-              () => {
-                // AUTH literal
-                stage = 2;
-                authTag = "a" + tagN++;
-                const len = Buffer.byteLength(xoauth2, "utf8");
-                sendLine(`${authTag} AUTHENTICATE XOAUTH2 {${len}}`);
-
-                waitTagged(
-                  authTag,
-                  () => {
-                    // AUTH complete
-                    stage = 4;
-                    startSelectSearchFetch();
-                  },
-                  (bad) =>
-                    finishErr(new Error(`AUTHENTICATE rejected: ${bad}`)),
-                );
-              },
-              (bad) => finishErr(new Error(`CAPABILITY failed: ${bad}`)),
-            );
-          }
-          continue;
+        // Collect subject lines for current fetch
+        if (socket.___collectSubjectLines) {
+          try {
+            socket.___collectSubjectLines(line);
+          } catch {}
         }
 
-        // waiting '+' for literal data
-        if (stage === 2) {
-          if (/^\+\s*/.test(line)) {
-            stage = 3;
-            socket.write(xoauth2 + "\r\n");
+        // tagged OK/NO/BAD routing
+        const tagMatch = line.match(/^([A-Za-z0-9]+)\s+(OK|NO|BAD)\b/i);
+        if (tagMatch) {
+          const tag = tagMatch[1].toLowerCase();
+          const status = tagMatch[2].toUpperCase();
+          const w = waiters.get(tag);
+          if (w) {
+            waiters.delete(tag);
+            if (status === "OK") w.onOk(line);
+            else w.onNoBad(line);
           }
-          continue;
         }
-
-        // stage 3: waitTagged(authTag) will handle OK/NO/BAD
       }
     });
   });
