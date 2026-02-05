@@ -2443,97 +2443,150 @@ async function searchSubjectInFolder(client, folderName, subject) {
   }
 }
 
-function msAuthXoauth2Literal(socket, xoauth2B64, { timeoutMs = 20000 } = {}) {
-  return new Promise((resolve, reject) => {
+async function msImapXoauth2Smart({
+  host,
+  port = 993,
+  user,
+  accessToken,
+  timeoutMs = 60_000, // bump for Exchange
+}) {
+  if (!accessToken) throw new Error("Missing accessToken");
+
+  const xoauth2 = Buffer.from(
+    `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
+    "utf8",
+  ).toString("base64");
+
+  return await new Promise((resolve, reject) => {
+    const socket = tls.connect(
+      { host, port, servername: host, minVersion: "TLSv1.2" },
+      () => {},
+    );
+
+    let finished = false;
     let buf = "";
-    let done = false;
     let tagN = 1;
 
-    const tag = "a" + tagN++;
-    const sendLine = (line) => socket.write(line + "\r\n");
+    const capTag = "c" + tagN++;
+    const authTag = "a" + tagN++;
+    const logoutTag = "z" + tagN++;
+
+    const cleanup = () => {
+      try {
+        socket.removeAllListeners("data");
+        socket.removeAllListeners("error");
+        socket.removeAllListeners("timeout");
+        socket.removeAllListeners("close");
+      } catch {}
+      try {
+        socket.end();
+      } catch {}
+      try {
+        socket.destroy();
+      } catch {}
+    };
 
     const finishOk = () => {
-      if (done) return;
-      done = true;
+      if (finished) return;
+      finished = true;
       cleanup();
       resolve(true);
     };
-    const finishErr = (e) => {
-      if (done) return;
-      done = true;
+
+    const finishErr = (err) => {
+      if (finished) return;
+      finished = true;
       cleanup();
-      reject(e instanceof Error ? e : new Error(String(e)));
+      reject(err instanceof Error ? err : new Error(String(err)));
     };
+
+    const sendLine = (line) => socket.write(line + "\r\n");
 
     const hardTimer = setTimeout(() => {
-      finishErr(new Error("IMAP hard-timeout (XOAUTH2 literal)"));
+      finishErr(new Error("IMAP hard-timeout (MS XOAUTH2)"));
     }, timeoutMs + 2000);
 
-    const cleanup = () => {
-      clearTimeout(hardTimer);
-      try {
-        socket.removeAllListeners("data");
-      } catch {}
-      try {
-        socket.removeAllListeners("error");
-      } catch {}
-    };
+    socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
+    socket.on("error", (e) => finishErr(e));
+    socket.on("close", () => {
+      // If it closes before success and we haven't finished, treat as error
+      if (!finished) finishErr(new Error("IMAP socket closed unexpectedly"));
+    });
 
-    // Stages:
-    // 0 wait greeting (* OK)
-    // 1 sent AUTHENTICATE ... {len}, waiting for '+'
-    // 2 sent literal payload, waiting for tagged OK/NO/BAD
+    // stage:
+    // 0 wait greeting
+    // 1 sent CAPABILITY, wait cap OK
+    // 2 sent AUTHENTICATE {len}, wait '+'
+    // 3 sent payload, wait auth OK/NO/BAD
     let stage = 0;
 
     const onLine = (line) => {
       const l = String(line || "");
 
+      // server bye at any point
       if (/^\*\s+BYE\b/i.test(l)) {
-        return finishErr(new Error(`Server BYE during auth: ${l}`));
+        return finishErr(new Error(`Server BYE: ${l}`));
       }
 
       // 0) Greeting
       if (stage === 0) {
         if (/^\*\s+OK\b/i.test(l)) {
           stage = 1;
-
-          // Send AUTHENTICATE XOAUTH2 as a literal so it's not limited by line length
-          const len = Buffer.byteLength(xoauth2B64, "utf8");
-          sendLine(`${tag} AUTHENTICATE XOAUTH2 {${len}}`);
-          return;
+          sendLine(`${capTag} CAPABILITY`);
         }
         return;
       }
 
-      // 1) Server asks for literal content with '+'
+      // 1) CAPABILITY completion
       if (stage === 1) {
-        if (/^\+\s*/.test(l)) {
+        if (new RegExp("^" + capTag + "\\s+OK\\b", "i").test(l)) {
           stage = 2;
-
-          // IMPORTANT: literal content is sent raw, then CRLF
-          socket.write(xoauth2B64 + "\r\n");
+          const len = Buffer.byteLength(xoauth2, "utf8");
+          sendLine(`${authTag} AUTHENTICATE XOAUTH2 {${len}}`);
           return;
         }
-
-        // Some servers may reject before '+'
         if (
-          new RegExp("^" + tag + "\\s+NO\\b", "i").test(l) ||
-          new RegExp("^" + tag + "\\s+BAD\\b", "i").test(l)
+          new RegExp("^" + capTag + "\\s+NO\\b", "i").test(l) ||
+          new RegExp("^" + capTag + "\\s+BAD\\b", "i").test(l)
+        ) {
+          return finishErr(new Error(`CAPABILITY failed: ${l}`));
+        }
+        return;
+      }
+
+      // 2) Wait for continuation '+'
+      if (stage === 2) {
+        if (/^\+\s*/.test(l)) {
+          stage = 3;
+          // literal payload line (raw base64 then CRLF)
+          socket.write(xoauth2 + "\r\n");
+          return;
+        }
+        // early reject
+        if (
+          new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l) ||
+          new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)
         ) {
           return finishErr(new Error(`AUTHENTICATE rejected: ${l}`));
         }
         return;
       }
 
-      // 2) Tagged completion
-      if (stage === 2) {
-        if (new RegExp("^" + tag + "\\s+OK\\b", "i").test(l)) {
+      // 3) AUTH completion
+      if (stage === 3) {
+        if (new RegExp("^" + authTag + "\\s+OK\\b", "i").test(l)) {
+          clearTimeout(hardTimer);
+          // best effort logout; don't wait
+          try {
+            sendLine(`${logoutTag} LOGOUT`);
+          } catch {}
           return finishOk();
         }
         if (
-          new RegExp("^" + tag + "\\s+NO\\b", "i").test(l) ||
-          new RegExp("^" + tag + "\\s+BAD\\b", "i").test(l)
+          new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l) ||
+          new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)
         ) {
+          clearTimeout(hardTimer);
           return finishErr(new Error(`AUTHENTICATE failed: ${l}`));
         }
       }
@@ -2549,110 +2602,6 @@ function msAuthXoauth2Literal(socket, xoauth2B64, { timeoutMs = 20000 } = {}) {
         onLine(line);
       }
     });
-
-    socket.on("error", (e) => finishErr(e));
-  });
-}
-
-async function msImapXoauth2Smart({
-  host,
-  port = 993,
-  user,
-  accessToken,
-  timeoutMs = 20_000,
-}) {
-  if (!accessToken) throw new Error("Missing accessToken");
-
-  const xoauth2 = Buffer.from(
-    `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
-    "utf8",
-  ).toString("base64");
-
-  return await new Promise((resolve, reject) => {
-    const socket = tls.connect(
-      { host, port, servername: host, minVersion: "TLSv1.2" },
-      () => {},
-    );
-
-    const safeClose = () => {
-      try {
-        socket.end();
-      } catch {}
-      try {
-        socket.destroy();
-      } catch {}
-    };
-
-    socket.setTimeout(timeoutMs, () => {
-      safeClose();
-      reject(new Error("IMAP timeout"));
-    });
-
-    socket.on("error", (e) => {
-      safeClose();
-      reject(e);
-    });
-
-    // Run CAPABILITY first (helps Exchange tenants)
-    (async () => {
-      try {
-        await new Promise((resCap, rejCap) => {
-          let buf = "";
-          let tagN = 1;
-          const tCap = "c" + tagN++;
-
-          const sendLine = (line) => socket.write(line + "\r\n");
-
-          const cleanup = () => {
-            try {
-              socket.removeAllListeners("data");
-            } catch {}
-          };
-
-          socket.on("data", (chunk) => {
-            buf += chunk.toString("utf8");
-            while (true) {
-              const idx = buf.indexOf("\n");
-              if (idx === -1) break;
-
-              const line = buf.slice(0, idx).replace(/\r$/, "");
-              buf = buf.slice(idx + 1);
-
-              if (/^\*\s+OK\b/i.test(line)) {
-                sendLine(`${tCap} CAPABILITY`);
-              }
-
-              if (new RegExp("^" + tCap + "\\s+OK\\b", "i").test(line)) {
-                cleanup();
-                return resCap(true);
-              }
-
-              if (
-                new RegExp("^" + tCap + "\\s+NO\\b", "i").test(line) ||
-                new RegExp("^" + tCap + "\\s+BAD\\b", "i").test(line)
-              ) {
-                cleanup();
-                return rejCap(new Error(`CAPABILITY failed: ${line}`));
-              }
-            }
-          });
-
-          // if greeting already happened super fast, CAPABILITY will still be triggered once we see * OK
-        });
-
-        await msAuthXoauth2Literal(socket, xoauth2, { timeoutMs });
-
-        // best-effort logout
-        try {
-          socket.write("z1 LOGOUT\r\n");
-        } catch {}
-        safeClose();
-        resolve(true);
-      } catch (e) {
-        safeClose();
-        reject(e);
-      }
-    })();
   });
 }
 
@@ -2787,8 +2736,12 @@ async function msImapSearchSubjectInFolder({
                   () => {
                     off(headerListener);
                     const subjLine = headerBuf.join(" ");
-                    if (subjLine.toLowerCase().includes(searchTerm))
+                    if (subjLine.toLowerCase().includes(searchTerm)) {
                       found = true;
+                      const tOut3 = "a" + tagN++;
+                      sendLine(`${tOut3} LOGOUT`);
+                      return finishOk(true);
+                    }
                     fetchNext();
                   },
                   () => {
@@ -3068,11 +3021,11 @@ async function checkSingleMailbox(providerKey, email, subject) {
     result.error = err?.message || String(err);
     result.lastCheckedAt = new Date();
   } finally {
-    // try {
-    //   client.logout().catch(() => {});
-    // } catch {}
     try {
-      await client.logout();
+      if (client && client.usable) await client.logout();
+    } catch {}
+    try {
+      if (client) client.close();
     } catch {}
   }
 
@@ -4058,7 +4011,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
             port: cfg.imap.port,
             user: cfg.email,
             accessToken: auth?.accessToken,
-            timeoutMs: 20_000,
+            timeoutMs: 60_000,
           });
 
           return res.json({
