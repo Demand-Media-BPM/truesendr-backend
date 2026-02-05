@@ -2489,6 +2489,86 @@ async function searchSubjectInFolder(client, folderName, subject) {
   }
 }
 
+function msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let done = false;
+    let buf = "";
+    let tagN = 900;
+    const tag = "l" + tagN++; // keep your tag style
+
+    const cleanup = () => {
+      try {
+        socket.removeListener("data", onData);
+      } catch {}
+      try {
+        clearTimeout(timer);
+      } catch {}
+    };
+
+    const finishOk = () => {
+      if (done) return;
+      done = true;
+      cleanup();
+      resolve(true);
+    };
+
+    const finishErr = (err) => {
+      if (done) return;
+      done = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    const timer = setTimeout(() => {
+      finishErr(new Error("XOAUTH2 timed out waiting for server response"));
+    }, timeoutMs);
+
+    const sendLine = (line) => socket.write(line + "\r\n");
+
+    // ✅ Two-step: send command WITHOUT token first
+    sendLine(`${tag} AUTHENTICATE XOAUTH2`);
+
+    let sentToken = false;
+
+    function onData(chunk) {
+      buf += chunk.toString("utf8");
+
+      while (true) {
+        const idx = buf.indexOf("\n");
+        if (idx === -1) break;
+
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+
+        const lower = line.toLowerCase();
+        const tagLower = tag.toLowerCase();
+
+        // Server asks for continuation → send token now
+        if (/^\+\s*/.test(line) && !sentToken) {
+          sentToken = true;
+          sendLine(xoauth2);
+          continue;
+        }
+
+        if (lower.startsWith(tagLower + " ok")) return finishOk();
+
+        if (
+          lower.startsWith(tagLower + " no") ||
+          lower.startsWith(tagLower + " bad")
+        ) {
+          return finishErr(new Error(`AUTHENTICATE rejected: ${line}`));
+        }
+
+        if (/^\*\s+bye\b/i.test(line)) {
+          return finishErr(new Error(`Server BYE: ${line}`));
+        }
+      }
+    }
+
+    socket.on("data", onData);
+  });
+}
+
 function msAuthXoauth2InlineFirst(
   socket,
   xoauth2,
@@ -2691,7 +2771,7 @@ async function msImapXoauth2Smart({
           }
           // ✅ Microsoft: prefer literal XOAUTH2 immediately (some tenants close socket otherwise)
           stage = 3;
-          return msAuthXoauth2InlineFirst(socket, xoauth2, {
+          return msAuthXoauth2TwoStep(socket, xoauth2, {
             timeoutMs: Math.max(15000, timeoutMs - 5000),
           })
             .then(() => {
@@ -2870,8 +2950,7 @@ async function msImapSearchSubjectInFolder({
 
     async function startAuthInline() {
       try {
-        // ✅ Literal XOAUTH2 first for Exchange reliability
-        await msAuthXoauth2InlineFirst(socket, xoauth2, { timeoutMs: 30_000 });
+        await msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs: 30_000 });
         authed = true;
         sendLine(`${selTag} SELECT "${folderName}"`);
       } catch (e) {
@@ -4222,7 +4301,10 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       } catch (imapErr) {
         try {
-          await client.close();
+          if (client?.usable) await client.logout();
+        } catch {}
+        try {
+          if (client?.usable) await client.close();
         } catch {}
 
         return res.status(500).json({
