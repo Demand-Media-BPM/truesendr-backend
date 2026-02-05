@@ -2049,7 +2049,7 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
       if (client && client.usable) await client.logout();
     } catch {}
     try {
-      if (client) client.close();
+      if (client) await client.close();
     } catch {}
   }
 }
@@ -2669,7 +2669,7 @@ async function msImapXoauth2Smart({
           }
           stage = 2;
           // try inline first
-          sendLine(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
+          sendLine(`${authTag} AUTHENTICATE XOAUTH2`);
           return;
         }
         if (
@@ -2837,7 +2837,7 @@ async function msImapSearchSubjectInFolder({
       let sentCont = false;
 
       // send inline first
-      sendLine(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
+      sendLine(`${authTag} AUTHENTICATE XOAUTH2`);
 
       // if server sends "+" continuation, we must send payload again
       const plusListener = (line) => {
@@ -3195,7 +3195,7 @@ async function checkSingleMailbox(providerKey, email, subject) {
       if (client && client.usable) await client.logout();
     } catch {}
     try {
-      if (client) client.close();
+      if (client) await client.close();
     } catch {}
   }
 
