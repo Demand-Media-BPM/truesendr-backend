@@ -2503,7 +2503,7 @@ function msAuthXoauth2Literal(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
     const sendLine = (line) => socket.write(line + "\r\n");
 
     // Send literal request: AUTHENTICATE XOAUTH2 {len}
-    const len = Buffer.byteLength(xoauth2, "utf8");
+    const len = Buffer.byteLength(xoauth2, "ascii");
     sendLine(`${tag} AUTHENTICATE XOAUTH2 {${len}}`);
 
     let waitingPlus = true;
@@ -2567,6 +2567,9 @@ async function msImapXoauth2Smart({
     "utf8",
   ).toString("base64");
 
+  const DEBUG =
+    String(process.env.DELIV_MS_IMAP_DEBUG || "").toLowerCase() === "true";
+
   return await new Promise((resolve, reject) => {
     const socket = tls.connect(
       { host, port, servername: host, minVersion: "TLSv1.2" },
@@ -2610,7 +2613,10 @@ async function msImapXoauth2Smart({
       reject(err instanceof Error ? err : new Error(String(err)));
     };
 
-    const sendLine = (line) => socket.write(line + "\r\n");
+    const sendLine = (line) => {
+      if (DEBUG) console.log("[MS-IMAP][C]", line);
+      socket.write(line + "\r\n");
+    };
 
     const hardTimer = setTimeout(() => {
       finishErr(new Error("IMAP hard-timeout (MS XOAUTH2)"));
@@ -2622,11 +2628,18 @@ async function msImapXoauth2Smart({
       if (!finished) finishErr(new Error("IMAP socket closed unexpectedly"));
     });
 
+    // stage:
+    // 0 wait greeting
+    // 1 CAPABILITY
+    // 2 AUTH inline sent -> waiting OK/NO/BAD or '+' continuation
+    // 3 fallback literal (handled by msAuthXoauth2Literal)
     let stage = 0;
     let sawXoauth2InCap = false;
+    let sentContinuationPayload = false;
 
     const onLine = (line) => {
       const l = String(line || "");
+      if (DEBUG) console.log("[MS-IMAP][S]", l);
 
       if (/^\*\s+BYE\b/i.test(l)) {
         clearTimeout(hardTimer);
@@ -2654,13 +2667,11 @@ async function msImapXoauth2Smart({
               new Error("Server CAPABILITY did not advertise AUTH=XOAUTH2"),
             );
           }
-
-          // Try inline first (Microsoft docs style)
           stage = 2;
+          // try inline first
           sendLine(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
           return;
         }
-
         if (
           new RegExp("^" + capTag + "\\s+NO\\b", "i").test(l) ||
           new RegExp("^" + capTag + "\\s+BAD\\b", "i").test(l)
@@ -2671,8 +2682,16 @@ async function msImapXoauth2Smart({
         return;
       }
 
-      // AUTH inline result
+      // AUTH result
       if (stage === 2) {
+        // ✅ IMPORTANT: handle continuation prompt
+        if (/^\+\s*/.test(l) && !sentContinuationPayload) {
+          sentContinuationPayload = true;
+          // server wants the base64 on the next line
+          sendLine(xoauth2);
+          return;
+        }
+
         if (new RegExp("^" + authTag + "\\s+OK\\b", "i").test(l)) {
           clearTimeout(hardTimer);
           try {
@@ -2681,7 +2700,6 @@ async function msImapXoauth2Smart({
           return finishOk();
         }
 
-        // If BAD => fallback to literal {len}
         if (new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)) {
           stage = 3;
           return msAuthXoauth2Literal(socket, xoauth2, {
@@ -2700,7 +2718,6 @@ async function msImapXoauth2Smart({
             });
         }
 
-        // If NO => token/permission/access issue
         if (new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l)) {
           clearTimeout(hardTimer);
           return finishErr(new Error(`AUTHENTICATE failed: ${l}`));
@@ -2715,6 +2732,15 @@ async function msImapXoauth2Smart({
         const idx = buf.indexOf("\n");
         if (idx === -1) break;
         const line = buf.slice(0, idx).replace(/\r$/, "");
+        // call raw hooks (for detecting "+")
+        if (socket.___rawLineHooks) {
+          for (const h of socket.___rawLineHooks) {
+            try {
+              h(line);
+            } catch {}
+          }
+        }
+
         buf = buf.slice(idx + 1);
         onLine(line);
       }
@@ -2808,14 +2834,39 @@ async function msImapSearchSubjectInFolder({
     const searchTag = "q" + tagN++;
 
     function startAuthInline() {
+      let sentCont = false;
+
+      // send inline first
       sendLine(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
+
+      // if server sends "+" continuation, we must send payload again
+      const plusListener = (line) => {
+        if (!sentCont && /^\+\s*/.test(line)) {
+          sentCont = true;
+          sendLine(xoauth2);
+        }
+      };
+
+      // add a temporary raw line hook
+      const rawHook = (l) => plusListener(l);
+      socket.___rawLineHooks = socket.___rawLineHooks || [];
+      socket.___rawLineHooks.push(rawHook);
+
       setWaiter(
         authTag,
         () => {
+          // remove hook
+          socket.___rawLineHooks = (socket.___rawLineHooks || []).filter(
+            (h) => h !== rawHook,
+          );
           authed = true;
           sendLine(`${selTag} SELECT "${folderName}"`);
         },
         async (line) => {
+          socket.___rawLineHooks = (socket.___rawLineHooks || []).filter(
+            (h) => h !== rawHook,
+          );
+
           // If BAD => fallback literal
           if (/\bBAD\b/i.test(line)) {
             try {
@@ -2894,6 +2945,15 @@ async function msImapSearchSubjectInFolder({
         if (idx === -1) break;
 
         const line = buf.slice(0, idx).replace(/\r$/, "");
+        // call raw hooks (for detecting "+")
+        if (socket.___rawLineHooks) {
+          for (const h of socket.___rawLineHooks) {
+            try {
+              h(line);
+            } catch {}
+          }
+        }
+
         buf = buf.slice(idx + 1);
 
         // BYE always fatal
