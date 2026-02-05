@@ -1813,7 +1813,6 @@
 //   return router;
 // };
 
-
 // routes/deliverability.js
 const express = require("express");
 const mongoose = require("mongoose");
@@ -1906,7 +1905,7 @@ const PROVIDERS = {
   microsoft_business: {
     label: "Microsoft Business",
     emailEnv: "DELIV_MS_EMAIL",
-    passEnv: null, 
+    passEnv: null,
     imap: { host: "outlook.office365.com", port: 993, secure: true },
     smtp: { host: "smtp.office365.com", port: 587, secure: false }, // optional
     inboxFolder: "INBOX",
@@ -2047,10 +2046,11 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
     };
   } finally {
     try {
-      if (client && client.usable) await client.logout();
+      if (client?.usable) await client.logout();
     } catch {}
     try {
-      if (client) await client.close();
+      // only close if it was ever connected/usable OR if library created a socket
+      if (client?.usable) await client.close();
     } catch {}
   }
 }
@@ -2489,7 +2489,11 @@ async function searchSubjectInFolder(client, folderName, subject) {
   }
 }
 
-function msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
+function msAuthXoauth2InlineFirst(
+  socket,
+  xoauth2,
+  { timeoutMs = 30_000 } = {},
+) {
   return new Promise((resolve, reject) => {
     let done = false;
     let buf = "";
@@ -2499,6 +2503,9 @@ function msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
     const cleanup = () => {
       try {
         socket.removeListener("data", onData);
+      } catch {}
+      try {
+        clearTimeout(timer);
       } catch {}
     };
 
@@ -2522,10 +2529,12 @@ function msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
 
     const sendLine = (line) => socket.write(line + "\r\n");
 
-    // ✅ Exchange-friendly form (no literal length)
-    sendLine(`${tag} AUTHENTICATE XOAUTH2`);
+    // ✅ Microsoft Learn shows IMAP uses inline initial response:
+    // AUTHENTICATE XOAUTH2 <base64>  :contentReference[oaicite:1]{index=1}
+    sendLine(`${tag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
 
-    let waitingPlus = true;
+    // If server *still* asks continuation, we can send token again
+    let resentOnPlus = false;
 
     function onData(chunk) {
       buf += chunk.toString("utf8");
@@ -2537,32 +2546,26 @@ function msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
         const line = buf.slice(0, idx).replace(/\r$/, "");
         buf = buf.slice(idx + 1);
 
-        // Continuation prompt → send token
-        if (waitingPlus && /^\+\s*/.test(line)) {
-          waitingPlus = false;
+        const lower = line.toLowerCase();
+        const tagLower = tag.toLowerCase();
+
+        // Some servers may reply with continuation even after SASL-IR; handle it.
+        if (/^\+\s*/.test(line) && !resentOnPlus) {
+          resentOnPlus = true;
           sendLine(xoauth2);
           continue;
         }
 
-        // Tagged OK/NO/BAD
-        const lower = line.toLowerCase();
-        const tagLower = tag.toLowerCase();
-
-        if (lower.startsWith(tagLower + " ok")) {
-          clearTimeout(timer);
-          return finishOk();
-        }
+        if (lower.startsWith(tagLower + " ok")) return finishOk();
 
         if (
           lower.startsWith(tagLower + " no") ||
           lower.startsWith(tagLower + " bad")
         ) {
-          clearTimeout(timer);
           return finishErr(new Error(`AUTHENTICATE rejected: ${line}`));
         }
 
-        if (/^\*\s+BYE\b/i.test(line)) {
-          clearTimeout(timer);
+        if (/^\*\s+bye\b/i.test(line)) {
           return finishErr(new Error(`Server BYE: ${line}`));
         }
       }
@@ -2571,7 +2574,6 @@ function msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
     socket.on("data", onData);
   });
 }
-
 
 async function msImapXoauth2Smart({
   host,
@@ -2689,9 +2691,9 @@ async function msImapXoauth2Smart({
           }
           // ✅ Microsoft: prefer literal XOAUTH2 immediately (some tenants close socket otherwise)
           stage = 3;
-          return msAuthXoauth2TwoStep(socket, xoauth2, {
-  timeoutMs: Math.max(15000, timeoutMs - 5000),
-})
+          return msAuthXoauth2InlineFirst(socket, xoauth2, {
+            timeoutMs: Math.max(15000, timeoutMs - 5000),
+          })
             .then(() => {
               clearTimeout(hardTimer);
               try {
@@ -2734,22 +2736,21 @@ async function msImapXoauth2Smart({
 
         if (new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)) {
           // ✅ Microsoft: prefer two-step AUTHENTICATE (no literal)
-stage = 3;
-return msAuthXoauth2TwoStep(socket, xoauth2, {
-  timeoutMs: Math.max(15000, timeoutMs - 5000),
-})
-  .then(() => {
-    clearTimeout(hardTimer);
-    try {
-      sendLine(`${logoutTag} LOGOUT`);
-    } catch {}
-    finishOk();
-  })
-  .catch((e) => {
-    clearTimeout(hardTimer);
-    finishErr(e);
-  });
-
+          stage = 3;
+          return msAuthXoauth2TwoStep(socket, xoauth2, {
+            timeoutMs: Math.max(15000, timeoutMs - 5000),
+          })
+            .then(() => {
+              clearTimeout(hardTimer);
+              try {
+                sendLine(`${logoutTag} LOGOUT`);
+              } catch {}
+              finishOk();
+            })
+            .catch((e) => {
+              clearTimeout(hardTimer);
+              finishErr(e);
+            });
         }
 
         if (new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l)) {
@@ -2870,7 +2871,7 @@ async function msImapSearchSubjectInFolder({
     async function startAuthInline() {
       try {
         // ✅ Literal XOAUTH2 first for Exchange reliability
-        await msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs: 30_000 });
+        await msAuthXoauth2InlineFirst(socket, xoauth2, { timeoutMs: 30_000 });
         authed = true;
         sendLine(`${selTag} SELECT "${folderName}"`);
       } catch (e) {
@@ -3185,10 +3186,11 @@ async function checkSingleMailbox(providerKey, email, subject) {
     result.lastCheckedAt = new Date();
   } finally {
     try {
-      if (client && client.usable) await client.logout();
+      if (client?.usable) await client.logout();
     } catch {}
     try {
-      if (client) await client.close();
+      // only close if it was ever connected/usable OR if library created a socket
+      if (client?.usable) await client.close();
     } catch {}
   }
 
