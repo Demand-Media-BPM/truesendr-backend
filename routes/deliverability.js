@@ -1972,8 +1972,7 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
     return {
       provider: providerKey,
       ok: false,
-      error:
-        "MS_CLEANUP_SKIPPED (ImapFlow XOAUTH2 inline rejected by Exchange)",
+      error: "MS_CLEANUP_SKIPPED",
       deleted: 0,
       details: [],
     };
@@ -2676,12 +2675,12 @@ async function msImapSearchSubjectInFolder({
   });
 }
 
-async function msImapXoauth2TwoStep({
+async function msImapXoauth2Smart({
   host,
   port = 993,
   user,
   accessToken,
-  timeoutMs = 20_000, // keep short so nginx never 504s
+  timeoutMs = 20_000,
 }) {
   if (!accessToken) throw new Error("Missing accessToken");
 
@@ -2721,18 +2720,23 @@ async function msImapXoauth2TwoStep({
     };
 
     const hardTimer = setTimeout(() => {
-      finishErr(new Error("IMAP hard-timeout (two-step XOAUTH2)"));
+      finishErr(new Error("IMAP hard-timeout (XOAUTH2)"));
     }, timeoutMs + 2000);
 
     socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
     socket.on("error", (e) => finishErr(e));
+    socket.on("close", () => {
+      if (!done) finishErr(new Error("Socket closed before auth complete"));
+    });
 
     let buf = "";
     let tagN = 1;
+
     const send = (line) => socket.write(line + "\r\n");
 
     let authTag = null;
-    let stage = 0; // 0 wait greeting, 1 sent capability, 2 sent auth, 3 sent token
+    let sentAuth = false;
+    let sentTokenOnPlus = false;
 
     socket.on("data", (chunk) => {
       buf += chunk.toString("utf8");
@@ -2744,34 +2748,28 @@ async function msImapXoauth2TwoStep({
         const line = buf.slice(0, idx).replace(/\r$/, "");
         buf = buf.slice(idx + 1);
 
-        // greeting
-        if (stage === 0 && /^\*\s+OK\b/i.test(line)) {
-          stage = 1;
-          const t = "a" + tagN++;
-          send(`${t} CAPABILITY`);
-          return;
-        }
-
-        // after CAPABILITY OK → send AUTHENTICATE
-        if (stage === 1 && /^a\d+\s+OK\b/i.test(line)) {
-          stage = 2;
+        // 1) Wait greeting
+        if (!sentAuth && /^\*\s+OK\b/i.test(line)) {
           authTag = "a" + tagN++;
-          send(`${authTag} AUTHENTICATE XOAUTH2`);
+          sentAuth = true;
+
+          // ✅ SASL-IR first: token on same line (NO quotes)
+          send(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
           continue;
         }
 
-        // server asks for initial response with "+"
-        if (stage === 2 && /^\+\s*/.test(line)) {
-          stage = 3;
+        // 2) Some servers still do continuation even if you send initial response
+        if (authTag && /^\+\s*/.test(line) && !sentTokenOnPlus) {
+          sentTokenOnPlus = true;
           send(xoauth2);
           continue;
         }
 
-        // tagged response to AUTHENTICATE (OK/NO/BAD)
+        // 3) Tagged result
         if (authTag && line.startsWith(authTag + " ")) {
           clearTimeout(hardTimer);
 
-          if (line.includes(" OK")) {
+          if (/\sOK\b/i.test(line)) {
             // logout best effort
             try {
               const tOut = "a" + tagN++;
@@ -2780,15 +2778,17 @@ async function msImapXoauth2TwoStep({
             return finishOk();
           }
 
-          if (line.includes(" NO") || line.includes(" BAD")) {
+          if (/\sNO\b/i.test(line) || /\sBAD\b/i.test(line)) {
             return finishErr(new Error(`AUTHENTICATE failed: ${line}`));
           }
         }
-      }
-    });
 
-    socket.on("close", () => {
-      if (!done) finishErr(new Error("Socket closed before auth completed"));
+        // 4) Some servers send BYE immediately on failure
+        if (/^\*\s+BYE\b/i.test(line)) {
+          // let 'close' handler finalize, but also fail fast
+          return finishErr(new Error(`Server BYE during auth: ${line}`));
+        }
+      }
     });
   });
 }
@@ -3276,22 +3276,23 @@ module.exports = function deliverabilityRouter(deps = {}) {
   // Auto cleanup runner (runs in same node process)
   if (CLEANUP_ENABLED && !global.__DELIV_CLEANUP_STARTED__) {
     global.__DELIV_CLEANUP_STARTED__ = true;
+    global.__DELIV_CLEANUP_RUNNING__ = false;
 
     const intervalMs = Math.max(10, CLEANUP_INTERVAL_MIN) * 60 * 1000;
 
-    // 🔥 run once immediately on server start
-    (async () => {
+    const runCleanupSafe = async () => {
+      if (global.__DELIV_CLEANUP_RUNNING__) return;
+      global.__DELIV_CLEANUP_RUNNING__ = true;
       try {
         await cleanupAllProviders(CLEANUP_DAYS);
-      } catch {}
-    })();
+      } catch {
+      } finally {
+        global.__DELIV_CLEANUP_RUNNING__ = false;
+      }
+    };
 
-    // ⏱ then keep running on interval
-    setInterval(async () => {
-      try {
-        await cleanupAllProviders(CLEANUP_DAYS);
-      } catch {}
-    }, intervalMs);
+    runCleanupSafe();
+    setInterval(runCleanupSafe, intervalMs);
   }
 
   // POST /api/deliverability/tests
@@ -3968,12 +3969,12 @@ module.exports = function deliverabilityRouter(deps = {}) {
       if (isMs) {
         // ✅ Exchange hates ImapFlow's inline XOAUTH2; use two-step AUTHENTICATE
         try {
-          await msImapXoauth2TwoStep({
+          await msImapXoauth2Smart({
             host: cfg.imap.host,
             port: cfg.imap.port,
             user: cfg.email,
             accessToken: auth?.accessToken,
-            timeoutMs: 55_000, // keep below nginx timeouts
+            timeoutMs: 20_000,
           });
 
           return res.json({
