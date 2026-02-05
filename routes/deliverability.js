@@ -2484,20 +2484,22 @@ async function msImapSearchSubjectInFolder({
     const send = (line) => socket.write(line + "\r\n");
 
     const waitTagged = (tag, onOk, onNoBad) => {
-      const handler = (line) => {
-        if (line.startsWith(tag + " OK")) {
-          off(handler);
-          onOk(line);
-        } else if (
-          line.startsWith(tag + " NO") ||
-          line.startsWith(tag + " BAD")
-        ) {
-          off(handler);
-          onNoBad(line);
-        }
-      };
-      on(handler);
-    };
+  const tagLower = String(tag).toLowerCase();
+  const handler = (line) => {
+    const l = String(line || "");
+    const lower = l.toLowerCase();
+
+    if (lower.startsWith(tagLower + " ok")) {
+      off(handler);
+      onOk(l);
+    } else if (lower.startsWith(tagLower + " no") || lower.startsWith(tagLower + " bad")) {
+      off(handler);
+      onNoBad(l);
+    }
+  };
+  on(handler);
+};
+
 
     const listeners = new Set();
     const on = (fn) => listeners.add(fn);
@@ -2574,7 +2576,7 @@ async function msImapSearchSubjectInFolder({
         if (stage === 3) {
           // When auth finishes, server will send tagged OK for AUTHENTICATE
           // We start SELECT after we see any "OK" tagged for AUTH (Imap servers vary).
-          if (/^a\d+\s+OK\b/i.test(line)) {
+          if (/^[A-Za-z0-9]+\s+OK\b/i.test(line)) {
             stage = 4;
             const t3 = "a" + tagN++;
             send(`${t3} SELECT "${folderName}"`);
@@ -2696,26 +2698,29 @@ async function msImapXoauth2Smart({
     );
 
     let done = false;
+
+    const safeEnd = () => {
+      try {
+        socket.end();
+      } catch {}
+      try {
+        socket.destroy();
+      } catch {}
+    };
+
     const finishOk = () => {
       if (done) return;
       done = true;
-      try {
-        socket.end();
-      } catch {}
-      try {
-        socket.destroy();
-      } catch {}
+      clearTimeout(hardTimer);
+      safeEnd();
       resolve(true);
     };
+
     const finishErr = (e) => {
       if (done) return;
       done = true;
-      try {
-        socket.end();
-      } catch {}
-      try {
-        socket.destroy();
-      } catch {}
+      clearTimeout(hardTimer);
+      safeEnd();
       reject(e instanceof Error ? e : new Error(String(e)));
     };
 
@@ -2738,6 +2743,12 @@ async function msImapXoauth2Smart({
     let sentAuth = false;
     let sentTokenOnPlus = false;
 
+    // helper: tag line match in a case-insensitive way
+    const isTaggedLineFor = (tag, line) => {
+      if (!tag || !line) return false;
+      return line.toLowerCase().startsWith(tag.toLowerCase() + " ");
+    };
+
     socket.on("data", (chunk) => {
       buf += chunk.toString("utf8");
 
@@ -2753,24 +2764,22 @@ async function msImapXoauth2Smart({
           authTag = "a" + tagN++;
           sentAuth = true;
 
-          // ✅ SASL-IR first: token on same line (NO quotes)
+          // Try SASL-IR first (token on same line)
           send(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
           continue;
         }
 
-        // 2) Some servers still do continuation even if you send initial response
+        // 2) If server asks for continuation even after SASL-IR, send token again
         if (authTag && /^\+\s*/.test(line) && !sentTokenOnPlus) {
           sentTokenOnPlus = true;
           send(xoauth2);
           continue;
         }
 
-        // 3) Tagged result
-        if (authTag && line.startsWith(authTag + " ")) {
-          clearTimeout(hardTimer);
-
+        // 3) Tagged result (OK / NO / BAD) — case-insensitive
+        if (authTag && isTaggedLineFor(authTag, line)) {
           if (/\sOK\b/i.test(line)) {
-            // logout best effort
+            // Best-effort logout (optional)
             try {
               const tOut = "a" + tagN++;
               send(`${tOut} LOGOUT`);
@@ -2783,15 +2792,15 @@ async function msImapXoauth2Smart({
           }
         }
 
-        // 4) Some servers send BYE immediately on failure
+        // 4) Some servers send BYE on failures
         if (/^\*\s+BYE\b/i.test(line)) {
-          // let 'close' handler finalize, but also fail fast
           return finishErr(new Error(`Server BYE during auth: ${line}`));
         }
       }
     });
   });
 }
+
 
 async function checkSingleMailbox(providerKey, email, subject) {
   const cfg = getProviderConfig(providerKey);
