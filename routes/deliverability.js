@@ -2335,15 +2335,36 @@ function msAuthorizeUrl() {
 }
 
 async function buildImapAuth(providerKey, cfg) {
+  // Microsoft Business: OAuth2
   if (isMicrosoftProvider(providerKey)) {
     const token = await fetchMsAccessTokenByRefreshToken();
 
-    const claims = decodeJwtClaims(token);
-    console.log("[MS] access token claims:", claims);
+    // Build XOAUTH2 base64 (works for IMAP AUTHENTICATE XOAUTH2)
+    const xoauth2 = Buffer.from(
+      `user=${cfg.email}\x01auth=Bearer ${token}\x01\x01`,
+      "utf8",
+    ).toString("base64");
 
-    return { user: cfg.email, accessToken: token };
+    // Log claims only if debug is enabled (avoid noisy prod logs)
+    const DEBUG =
+      String(process.env.DELIV_MS_IMAP_DEBUG || "").toLowerCase() === "true";
+
+    if (DEBUG) {
+      const claims = decodeJwtClaims(token);
+      console.log("[MS] access token claims:", claims);
+    }
+
+    // Return BOTH:
+    // - accessToken for your custom tls XOAUTH2 flow (msImapSearchSubjectInFolder / msImapXoauth2Smart)
+    // - pass as xoauth2 for ImapFlow compatibility if you ever use it
+    return {
+      user: cfg.email,
+      accessToken: token,
+      pass: xoauth2, // optional compatibility for ImapFlow XOAUTH2
+    };
   }
 
+  // Other providers: app password
   return { user: cfg.email, pass: cfg.pass };
 }
 
@@ -2667,10 +2688,22 @@ async function msImapXoauth2Smart({
               new Error("Server CAPABILITY did not advertise AUTH=XOAUTH2"),
             );
           }
-          stage = 2;
-          // try inline first
-          sendLine(`${authTag} AUTHENTICATE XOAUTH2`);
-          return;
+          // ✅ Microsoft: prefer literal XOAUTH2 immediately (some tenants close socket otherwise)
+          stage = 3;
+          return msAuthXoauth2Literal(socket, xoauth2, {
+            timeoutMs: Math.max(15000, timeoutMs - 5000),
+          })
+            .then(() => {
+              clearTimeout(hardTimer);
+              try {
+                sendLine(`${logoutTag} LOGOUT`);
+              } catch {}
+              finishOk();
+            })
+            .catch((e) => {
+              clearTimeout(hardTimer);
+              finishErr(e);
+            });
         }
         if (
           new RegExp("^" + capTag + "\\s+NO\\b", "i").test(l) ||
@@ -2833,56 +2866,15 @@ async function msImapSearchSubjectInFolder({
     const selTag = "s" + tagN++;
     const searchTag = "q" + tagN++;
 
-    function startAuthInline() {
-      let sentCont = false;
-
-      // send inline first
-      sendLine(`${authTag} AUTHENTICATE XOAUTH2`);
-
-      // if server sends "+" continuation, we must send payload again
-      const plusListener = (line) => {
-        if (!sentCont && /^\+\s*/.test(line)) {
-          sentCont = true;
-          sendLine(xoauth2);
-        }
-      };
-
-      // add a temporary raw line hook
-      const rawHook = (l) => plusListener(l);
-      socket.___rawLineHooks = socket.___rawLineHooks || [];
-      socket.___rawLineHooks.push(rawHook);
-
-      setWaiter(
-        authTag,
-        () => {
-          // remove hook
-          socket.___rawLineHooks = (socket.___rawLineHooks || []).filter(
-            (h) => h !== rawHook,
-          );
-          authed = true;
-          sendLine(`${selTag} SELECT "${folderName}"`);
-        },
-        async (line) => {
-          socket.___rawLineHooks = (socket.___rawLineHooks || []).filter(
-            (h) => h !== rawHook,
-          );
-
-          // If BAD => fallback literal
-          if (/\bBAD\b/i.test(line)) {
-            try {
-              await msAuthXoauth2Literal(socket, xoauth2, {
-                timeoutMs: 30_000,
-              });
-              authed = true;
-              sendLine(`${selTag} SELECT "${folderName}"`);
-            } catch (e) {
-              finishErr(e);
-            }
-          } else {
-            finishErr(new Error(`AUTHENTICATE failed: ${line}`));
-          }
-        },
-      );
+    async function startAuthInline() {
+      try {
+        // ✅ Literal XOAUTH2 first for Exchange reliability
+        await msAuthXoauth2Literal(socket, xoauth2, { timeoutMs: 30_000 });
+        authed = true;
+        sendLine(`${selTag} SELECT "${folderName}"`);
+      } catch (e) {
+        finishErr(e);
+      }
     }
 
     function startSearchAll() {
@@ -4227,7 +4219,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
         });
       } catch (imapErr) {
         try {
-          client.close();
+          await client.close();
         } catch {}
 
         return res.status(500).json({
