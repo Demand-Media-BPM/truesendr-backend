@@ -1813,6 +1813,7 @@
 //   return router;
 // };
 
+
 // routes/deliverability.js
 const express = require("express");
 const mongoose = require("mongoose");
@@ -1905,7 +1906,7 @@ const PROVIDERS = {
   microsoft_business: {
     label: "Microsoft Business",
     emailEnv: "DELIV_MS_EMAIL",
-    passEnv: null, // OAuth2, not password
+    passEnv: null, 
     imap: { host: "outlook.office365.com", port: 993, secure: true },
     smtp: { host: "smtp.office365.com", port: 587, secure: false }, // optional
     inboxFolder: "INBOX",
@@ -2488,12 +2489,12 @@ async function searchSubjectInFolder(client, folderName, subject) {
   }
 }
 
-function msAuthXoauth2Literal(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
+function msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
   return new Promise((resolve, reject) => {
     let done = false;
     let buf = "";
-    let tagN = 900; // avoid colliding with outer tags
-    const tag = "l" + tagN++;
+    let tagN = 900;
+    const tag = "l" + tagN++; // keep your tag style
 
     const cleanup = () => {
       try {
@@ -2516,20 +2517,17 @@ function msAuthXoauth2Literal(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
     };
 
     const timer = setTimeout(() => {
-      finishErr(
-        new Error("Literal XOAUTH2 timed out waiting for server response"),
-      );
+      finishErr(new Error("XOAUTH2 timed out waiting for server response"));
     }, timeoutMs);
 
     const sendLine = (line) => socket.write(line + "\r\n");
 
-    // Send literal request: AUTHENTICATE XOAUTH2 {len}
-    const len = Buffer.byteLength(xoauth2, "ascii");
-    sendLine(`${tag} AUTHENTICATE XOAUTH2 {${len}}`);
+    // ✅ Exchange-friendly form (no literal length)
+    sendLine(`${tag} AUTHENTICATE XOAUTH2`);
 
     let waitingPlus = true;
 
-    const onData = (chunk) => {
+    function onData(chunk) {
       buf += chunk.toString("utf8");
 
       while (true) {
@@ -2539,10 +2537,10 @@ function msAuthXoauth2Literal(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
         const line = buf.slice(0, idx).replace(/\r$/, "");
         buf = buf.slice(idx + 1);
 
-        // If server asks for literal
+        // Continuation prompt → send token
         if (waitingPlus && /^\+\s*/.test(line)) {
           waitingPlus = false;
-          socket.write(xoauth2 + "\r\n");
+          sendLine(xoauth2);
           continue;
         }
 
@@ -2554,6 +2552,7 @@ function msAuthXoauth2Literal(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
           clearTimeout(timer);
           return finishOk();
         }
+
         if (
           lower.startsWith(tagLower + " no") ||
           lower.startsWith(tagLower + " bad")
@@ -2562,17 +2561,17 @@ function msAuthXoauth2Literal(socket, xoauth2, { timeoutMs = 30_000 } = {}) {
           return finishErr(new Error(`AUTHENTICATE rejected: ${line}`));
         }
 
-        // Some servers send BYE on failure
         if (/^\*\s+BYE\b/i.test(line)) {
           clearTimeout(timer);
           return finishErr(new Error(`Server BYE: ${line}`));
         }
       }
-    };
+    }
 
     socket.on("data", onData);
   });
 }
+
 
 async function msImapXoauth2Smart({
   host,
@@ -2690,9 +2689,9 @@ async function msImapXoauth2Smart({
           }
           // ✅ Microsoft: prefer literal XOAUTH2 immediately (some tenants close socket otherwise)
           stage = 3;
-          return msAuthXoauth2Literal(socket, xoauth2, {
-            timeoutMs: Math.max(15000, timeoutMs - 5000),
-          })
+          return msAuthXoauth2TwoStep(socket, xoauth2, {
+  timeoutMs: Math.max(15000, timeoutMs - 5000),
+})
             .then(() => {
               clearTimeout(hardTimer);
               try {
@@ -2734,21 +2733,23 @@ async function msImapXoauth2Smart({
         }
 
         if (new RegExp("^" + authTag + "\\s+BAD\\b", "i").test(l)) {
-          stage = 3;
-          return msAuthXoauth2Literal(socket, xoauth2, {
-            timeoutMs: Math.max(15000, timeoutMs - 5000),
-          })
-            .then(() => {
-              clearTimeout(hardTimer);
-              try {
-                sendLine(`${logoutTag} LOGOUT`);
-              } catch {}
-              finishOk();
-            })
-            .catch((e) => {
-              clearTimeout(hardTimer);
-              finishErr(e);
-            });
+          // ✅ Microsoft: prefer two-step AUTHENTICATE (no literal)
+stage = 3;
+return msAuthXoauth2TwoStep(socket, xoauth2, {
+  timeoutMs: Math.max(15000, timeoutMs - 5000),
+})
+  .then(() => {
+    clearTimeout(hardTimer);
+    try {
+      sendLine(`${logoutTag} LOGOUT`);
+    } catch {}
+    finishOk();
+  })
+  .catch((e) => {
+    clearTimeout(hardTimer);
+    finishErr(e);
+  });
+
         }
 
         if (new RegExp("^" + authTag + "\\s+NO\\b", "i").test(l)) {
@@ -2869,7 +2870,7 @@ async function msImapSearchSubjectInFolder({
     async function startAuthInline() {
       try {
         // ✅ Literal XOAUTH2 first for Exchange reliability
-        await msAuthXoauth2Literal(socket, xoauth2, { timeoutMs: 30_000 });
+        await msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs: 30_000 });
         authed = true;
         sendLine(`${selTag} SELECT "${folderName}"`);
       } catch (e) {
