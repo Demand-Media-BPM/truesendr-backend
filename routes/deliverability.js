@@ -1965,7 +1965,6 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
 
   const olderThanDate = daysAgoDate(days);
 
-  const auth = await buildImapAuth(providerKey, cfg);
   const isMs = providerKey === "microsoft_business";
 
   if (isMs) {
@@ -1977,6 +1976,8 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
       details: [],
     };
   }
+
+  const auth = await buildImapAuth(providerKey, cfg);
 
   // ✅ For cleanup we still use ImapFlow, including Microsoft.
   // (The XOAUTH2 problem is mainly with AUTH inline; cleanup uses normal IMAP ops after login.)
@@ -2439,6 +2440,108 @@ async function searchSubjectInFolder(client, folderName, subject) {
   }
 }
 
+function msAuthXoauth2Chunked(socket, xoauth2B64, { timeoutMs = 20000 } = {}) {
+  return new Promise((resolve, reject) => {
+    let buf = "";
+    let tagN = 1;
+    let done = false;
+
+    const authTag = "a" + tagN++;
+    const send = (line) => socket.write(line + "\r\n");
+
+    const finishOk = () => {
+      if (done) return;
+      done = true;
+      resolve(true);
+    };
+    const finishErr = (e) => {
+      if (done) return;
+      done = true;
+      reject(e instanceof Error ? e : new Error(String(e)));
+    };
+
+    const hardTimer = setTimeout(() => {
+      finishErr(new Error("IMAP hard-timeout (XOAUTH2 chunked)"));
+    }, timeoutMs + 2000);
+
+    const cleanupTimers = () => clearTimeout(hardTimer);
+
+    // We will send: AUTHENTICATE XOAUTH2
+    // Then on each '+' continuation we send next base64 chunk.
+    let started = false;
+    let chunkPos = 0;
+    const CHUNK = 700; // safe under 1000-char IMAP line limits
+
+    const sendNextChunk = () => {
+      if (chunkPos >= xoauth2B64.length) {
+        // ✅ end-of-auth marker (blank line)
+        send("");
+        return;
+      }
+
+      const part = xoauth2B64.slice(chunkPos, chunkPos + CHUNK);
+      chunkPos += CHUNK;
+      send(part);
+
+      // ✅ if this was the last part, immediately send terminating blank line
+      if (chunkPos >= xoauth2B64.length) {
+        send("");
+      }
+    };
+
+    const onLine = (line) => {
+      const l = String(line || "");
+      const lower = l.toLowerCase();
+
+      // Greeting -> start AUTH
+      if (!started && /^\*\s+OK\b/i.test(l)) {
+        started = true;
+        send(`${authTag} AUTHENTICATE XOAUTH2`);
+        return;
+      }
+
+      // Continuation request
+      if (/^\+\s*/.test(l)) {
+        // Send first/next chunk
+        sendNextChunk();
+        return;
+      }
+
+      // Tagged completion for our AUTH
+      if (started && lower.startsWith(authTag.toLowerCase() + " ")) {
+        cleanupTimers();
+
+        if (/\sOK\b/i.test(l)) return finishOk();
+        if (/\sNO\b/i.test(l) || /\sBAD\b/i.test(l)) {
+          return finishErr(new Error(`AUTHENTICATE failed: ${l}`));
+        }
+      }
+
+      // BYE is also a hard failure
+      if (/^\*\s+BYE\b/i.test(l)) {
+        cleanupTimers();
+        return finishErr(new Error(`Server BYE during auth: ${l}`));
+      }
+    };
+
+    socket.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+      while (true) {
+        const idx = buf.indexOf("\n");
+        if (idx === -1) break;
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+        onLine(line);
+      }
+    });
+
+    socket.on("error", (e) => {
+      cleanupTimers();
+      finishErr(e);
+    });
+  });
+}
+
 async function msImapSearchSubjectInFolder({
   host,
   port = 993,
@@ -2459,6 +2562,8 @@ async function msImapSearchSubjectInFolder({
       () => {},
     );
 
+    let finished = false;
+
     const cleanup = () => {
       try {
         socket.end();
@@ -2468,14 +2573,24 @@ async function msImapSearchSubjectInFolder({
       } catch {}
     };
 
-    socket.setTimeout(timeoutMs, () => {
+    const finishOk = (val) => {
+      if (finished) return;
+      finished = true;
       cleanup();
-      reject(new Error("IMAP timeout"));
-    });
+      resolve(val);
+    };
 
-    socket.on("error", (e) => {
+    const finishErr = (err) => {
+      if (finished) return;
+      finished = true;
       cleanup();
-      reject(e);
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
+    socket.on("error", (e) => finishErr(e));
+    socket.on("close", () => {
+      if (!finished) finishErr(new Error("IMAP socket closed unexpectedly"));
     });
 
     let buf = "";
@@ -2483,53 +2598,150 @@ async function msImapSearchSubjectInFolder({
 
     const send = (line) => socket.write(line + "\r\n");
 
-    const waitTagged = (tag, onOk, onNoBad) => {
-  const tagLower = String(tag).toLowerCase();
-  const handler = (line) => {
-    const l = String(line || "");
-    const lower = l.toLowerCase();
-
-    if (lower.startsWith(tagLower + " ok")) {
-      off(handler);
-      onOk(l);
-    } else if (lower.startsWith(tagLower + " no") || lower.startsWith(tagLower + " bad")) {
-      off(handler);
-      onNoBad(l);
-    }
-  };
-  on(handler);
-};
-
-
+    // line listeners
     const listeners = new Set();
     const on = (fn) => listeners.add(fn);
     const off = (fn) => listeners.delete(fn);
-
     const emitLine = (line) => {
       for (const fn of listeners) fn(line);
+    };
+
+    // tagged response waiter
+    const waitTagged = (tag, onOk, onNoBad) => {
+      const tagLower = String(tag).toLowerCase();
+      const handler = (line) => {
+        const l = String(line || "");
+        const lower = l.toLowerCase();
+
+        if (lower.startsWith(tagLower + " ok")) {
+          off(handler);
+          onOk(l);
+        } else if (
+          lower.startsWith(tagLower + " no") ||
+          lower.startsWith(tagLower + " bad")
+        ) {
+          off(handler);
+          onNoBad(l);
+        }
+      };
+      on(handler);
     };
 
     const searchTerm = String(subject || "")
       .trim()
       .toLowerCase();
-    if (!searchTerm) {
-      cleanup();
-      return resolve(false);
-    }
+    if (!searchTerm) return finishOk(false);
 
-    let stage = 0;
+    // AUTH payload in chunks
+    const sendXoauth2Chunked = (b64, chunkSize = 500) => {
+      for (let i = 0; i < b64.length; i += chunkSize) {
+        send(b64.slice(i, i + chunkSize));
+      }
+      // end-of-auth marker
+      send("");
+    };
+
+    let stage = 0; // 0 greet, 1 capability, 2 wait '+', 3 auth sent, 4+ driven by waitTagged callbacks
     let found = false;
     let msgIds = [];
 
+    // One canonical “start mailbox scanning” flow (prevents race/duplication)
+    const startSelectSearchFetch = () => {
+      const t3 = "a" + tagN++;
+      send(`${t3} SELECT "${folderName}"`);
+      waitTagged(
+        t3,
+        () => {
+          const t4 = "a" + tagN++;
+          send(`${t4} SEARCH ALL`);
+          waitTagged(
+            t4,
+            () => {
+              // we may have been collecting * SEARCH lines already
+              msgIds = msgIds.slice(-50);
+
+              if (msgIds.length === 0) {
+                const tOut = "a" + tagN++;
+                send(`${tOut} LOGOUT`);
+                return finishOk(false);
+              }
+
+              let i = 0;
+              const fetchNext = () => {
+                if (i >= msgIds.length) {
+                  const tOut2 = "a" + tagN++;
+                  send(`${tOut2} LOGOUT`);
+                  return finishOk(found);
+                }
+
+                const id = msgIds[i++];
+                const tF = "a" + tagN++;
+                let headerBuf = [];
+
+                const headerListener = (l) => {
+                  if (/^Subject:/i.test(l)) headerBuf.push(l);
+                };
+                on(headerListener);
+
+                send(`${tF} FETCH ${id} (BODY.PEEK[HEADER.FIELDS (SUBJECT)])`);
+                waitTagged(
+                  tF,
+                  () => {
+                    off(headerListener);
+                    const subjLine = headerBuf.join(" ");
+                    if (subjLine.toLowerCase().includes(searchTerm))
+                      found = true;
+                    fetchNext();
+                  },
+                  () => {
+                    off(headerListener);
+                    fetchNext(); // ignore per-message fetch failure
+                  },
+                );
+              };
+
+              fetchNext();
+            },
+            (bad) => finishErr(new Error(`SEARCH failed: ${bad}`)),
+          );
+        },
+        () => {
+          // folder missing is common
+          const tOut = "a" + tagN++;
+          send(`${tOut} LOGOUT`);
+          return finishOk(false);
+        },
+      );
+    };
+
     socket.on("data", (chunk) => {
       buf += chunk.toString("utf8");
+
       while (true) {
         const idx = buf.indexOf("\n");
         if (idx === -1) break;
+
         const line = buf.slice(0, idx).replace(/\r$/, "");
         buf = buf.slice(idx + 1);
 
         emitLine(line);
+
+        // hard fail on BYE
+        if (/^\*\s+BYE\b/i.test(line)) {
+          return finishErr(new Error(`Server BYE: ${line}`));
+        }
+
+        // Always collect SEARCH ids whenever they show up
+        const m = line.match(/^\*\s+SEARCH\s*(.*)$/i);
+        if (m) {
+          const ids = m[1]
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean)
+            .map((x) => parseInt(x, 10))
+            .filter((n) => Number.isFinite(n));
+          if (ids.length) msgIds.push(...ids);
+        }
 
         // greeting
         if (stage === 0) {
@@ -2543,135 +2755,36 @@ async function msImapSearchSubjectInFolder({
                 stage = 2;
                 const t2 = "a" + tagN++;
                 send(`${t2} AUTHENTICATE XOAUTH2`);
+
+                // ✅ Only place we react to AUTH completion
                 waitTagged(
                   t2,
                   () => {
-                    // authenticated
+                    // auth complete (either immediately OK, or after '+')
+                    if (stage < 4) stage = 4;
+                    startSelectSearchFetch();
                   },
-                  (bad) => {
-                    cleanup();
-                    reject(new Error(`AUTHENTICATE rejected: ${bad}`));
-                  },
+                  (bad) =>
+                    finishErr(new Error(`AUTHENTICATE rejected: ${bad}`)),
                 );
               },
-              (bad) => {
-                cleanup();
-                reject(new Error(`CAPABILITY failed: ${bad}`));
-              },
+              (bad) => finishErr(new Error(`CAPABILITY failed: ${bad}`)),
             );
           }
           continue;
         }
 
-        // AUTH continuation '+'
+        // waiting for '+' continuation for AUTH
         if (stage === 2) {
           if (/^\+\s*/.test(line)) {
             stage = 3;
-            send(xoauth2);
-            continue;
+            sendXoauth2Chunked(xoauth2, 500);
           }
-        }
-
-        // After AUTH OK, do SELECT
-        if (stage === 3) {
-          // When auth finishes, server will send tagged OK for AUTHENTICATE
-          // We start SELECT after we see any "OK" tagged for AUTH (Imap servers vary).
-          if (/^[A-Za-z0-9]+\s+OK\b/i.test(line)) {
-            stage = 4;
-            const t3 = "a" + tagN++;
-            send(`${t3} SELECT "${folderName}"`);
-            waitTagged(
-              t3,
-              () => {
-                stage = 5;
-                const t4 = "a" + tagN++;
-                send(`${t4} SEARCH ALL`);
-                waitTagged(
-                  t4,
-                  () => {
-                    stage = 6;
-
-                    // last 50 ids
-                    msgIds = msgIds.slice(-50);
-
-                    if (msgIds.length === 0) {
-                      const tOut = "a" + tagN++;
-                      send(`${tOut} LOGOUT`);
-                      cleanup();
-                      return resolve(false);
-                    }
-
-                    let i = 0;
-                    const fetchNext = () => {
-                      if (i >= msgIds.length) {
-                        const tOut2 = "a" + tagN++;
-                        send(`${tOut2} LOGOUT`);
-                        cleanup();
-                        return resolve(found);
-                      }
-
-                      const id = msgIds[i++];
-                      const tF = "a" + tagN++;
-                      let headerBuf = [];
-
-                      const headerListener = (l) => {
-                        if (/^Subject:/i.test(l)) headerBuf.push(l);
-                      };
-                      on(headerListener);
-
-                      send(
-                        `${tF} FETCH ${id} (BODY.PEEK[HEADER.FIELDS (SUBJECT)])`,
-                      );
-                      waitTagged(
-                        tF,
-                        () => {
-                          off(headerListener);
-                          const subjLine = headerBuf.join(" ");
-                          if (subjLine.toLowerCase().includes(searchTerm)) {
-                            found = true;
-                          }
-                          fetchNext();
-                        },
-                        (bad) => {
-                          off(headerListener);
-                          // ignore this message, continue
-                          fetchNext();
-                        },
-                      );
-                    };
-
-                    fetchNext();
-                  },
-                  (bad) => {
-                    cleanup();
-                    reject(new Error(`SEARCH failed: ${bad}`));
-                  },
-                );
-              },
-              (bad) => {
-                // folder missing is common, treat as "not found"
-                cleanup();
-                resolve(false);
-              },
-            );
-          }
-
           continue;
         }
 
-        // collect SEARCH ids
-        if (stage >= 5) {
-          const m = line.match(/^\*\s+SEARCH\s*(.*)$/i);
-          if (m) {
-            const ids = m[1]
-              .trim()
-              .split(/\s+/)
-              .filter(Boolean)
-              .map((x) => parseInt(x, 10))
-              .filter((n) => Number.isFinite(n));
-            msgIds.push(...ids);
-          }
-        }
+        // stage 3: we've sent xoauth2 payload; waitTagged(t2) will catch the OK/NO/BAD
+        // Nothing needed here.
       }
     });
   });
@@ -2694,12 +2807,12 @@ async function msImapXoauth2Smart({
   return await new Promise((resolve, reject) => {
     const socket = tls.connect(
       { host, port, servername: host, minVersion: "TLSv1.2" },
-      () => {},
+      async () => {
+        // do nothing here; we wait for greeting in the helper
+      },
     );
 
-    let done = false;
-
-    const safeEnd = () => {
+    const safeClose = () => {
       try {
         socket.end();
       } catch {}
@@ -2708,99 +2821,31 @@ async function msImapXoauth2Smart({
       } catch {}
     };
 
-    const finishOk = () => {
-      if (done) return;
-      done = true;
-      clearTimeout(hardTimer);
-      safeEnd();
-      resolve(true);
-    };
-
-    const finishErr = (e) => {
-      if (done) return;
-      done = true;
-      clearTimeout(hardTimer);
-      safeEnd();
-      reject(e instanceof Error ? e : new Error(String(e)));
-    };
-
-    const hardTimer = setTimeout(() => {
-      finishErr(new Error("IMAP hard-timeout (XOAUTH2)"));
-    }, timeoutMs + 2000);
-
-    socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
-    socket.on("error", (e) => finishErr(e));
-    socket.on("close", () => {
-      if (!done) finishErr(new Error("Socket closed before auth complete"));
+    socket.setTimeout(timeoutMs, () => {
+      safeClose();
+      reject(new Error("IMAP timeout"));
     });
 
-    let buf = "";
-    let tagN = 1;
-
-    const send = (line) => socket.write(line + "\r\n");
-
-    let authTag = null;
-    let sentAuth = false;
-    let sentTokenOnPlus = false;
-
-    // helper: tag line match in a case-insensitive way
-    const isTaggedLineFor = (tag, line) => {
-      if (!tag || !line) return false;
-      return line.toLowerCase().startsWith(tag.toLowerCase() + " ");
-    };
-
-    socket.on("data", (chunk) => {
-      buf += chunk.toString("utf8");
-
-      while (true) {
-        const idx = buf.indexOf("\n");
-        if (idx === -1) break;
-
-        const line = buf.slice(0, idx).replace(/\r$/, "");
-        buf = buf.slice(idx + 1);
-
-        // 1) Wait greeting
-        if (!sentAuth && /^\*\s+OK\b/i.test(line)) {
-          authTag = "a" + tagN++;
-          sentAuth = true;
-
-          // Try SASL-IR first (token on same line)
-          send(`${authTag} AUTHENTICATE XOAUTH2 ${xoauth2}`);
-          continue;
-        }
-
-        // 2) If server asks for continuation even after SASL-IR, send token again
-        if (authTag && /^\+\s*/.test(line) && !sentTokenOnPlus) {
-          sentTokenOnPlus = true;
-          send(xoauth2);
-          continue;
-        }
-
-        // 3) Tagged result (OK / NO / BAD) — case-insensitive
-        if (authTag && isTaggedLineFor(authTag, line)) {
-          if (/\sOK\b/i.test(line)) {
-            // Best-effort logout (optional)
-            try {
-              const tOut = "a" + tagN++;
-              send(`${tOut} LOGOUT`);
-            } catch {}
-            return finishOk();
-          }
-
-          if (/\sNO\b/i.test(line) || /\sBAD\b/i.test(line)) {
-            return finishErr(new Error(`AUTHENTICATE failed: ${line}`));
-          }
-        }
-
-        // 4) Some servers send BYE on failures
-        if (/^\*\s+BYE\b/i.test(line)) {
-          return finishErr(new Error(`Server BYE during auth: ${line}`));
-        }
-      }
+    socket.on("error", (e) => {
+      safeClose();
+      reject(e);
     });
+
+    msAuthXoauth2Chunked(socket, xoauth2, { timeoutMs })
+      .then(() => {
+        // Best-effort logout (optional)
+        try {
+          socket.write("z1 LOGOUT\r\n");
+        } catch {}
+        safeClose();
+        resolve(true);
+      })
+      .catch((e) => {
+        safeClose();
+        reject(e);
+      });
   });
 }
-
 
 async function checkSingleMailbox(providerKey, email, subject) {
   const cfg = getProviderConfig(providerKey);
@@ -3952,25 +3997,6 @@ module.exports = function deliverabilityRouter(deps = {}) {
           messageId: info.messageId,
         });
       }
-
-      // IMAP test (ALL providers including Microsoft via ImapFlow)
-      // const auth = await buildImapAuth(provider, cfg);
-      // const isMs = provider === "microsoft_business";
-
-      // const client = new ImapFlow({
-      //   host: cfg.imap.host,
-      //   port: cfg.imap.port,
-      //   secure: cfg.imap.secure,
-      //   auth,
-      //   logger: false,
-
-      //   // ✅ keep under nginx proxy timeout to avoid 504
-      //   socketTimeout: isMs ? 55_000 : 60_000,
-      //   greetingTimeout: isMs ? 55_000 : 30_000,
-
-      //   tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
-      // });
-
       // IMAP test
       const auth = await buildImapAuth(provider, cfg);
       const isMs = provider === "microsoft_business";
