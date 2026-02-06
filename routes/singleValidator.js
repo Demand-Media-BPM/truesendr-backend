@@ -15,31 +15,25 @@ const TrainingSample = require("../models/TrainingSample");
 
 module.exports = function singleValidatorRouter(deps) {
   const {
-    // libs / models
     mongoose,
     EmailLog,
     RegionStat,
     DomainReputation,
     User,
     SinglePending,
-    // utils
     categoryFromStatus,
     normEmail,
     buildReasonAndMessage,
     getFreshestFromDBs,
     replaceLatest,
     bumpUpdatedAt,
-    // runtime config / state
     FRESH_DB_MS,
     stableCache,
     inflight,
-    // validators
     validateSMTP,
     validateSMTPStable,
-    // credits / idempotency
     debitOneCreditIfNeeded,
     idempoGet,
-    // ws helpers
     sendLogToFrontend,
     sendStatusToFrontend,
   } = deps;

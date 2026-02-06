@@ -1991,10 +1991,10 @@ async function cleanupProviderMailbox(providerKey, days = CLEANUP_DAYS) {
     auth,
     authMethod: isMs ? "XOAUTH2" : undefined, // ✅ needed for MS in ImapFlow
     logger: {
-      debug: (obj) => console.log("[IMAP][debug]", obj),
-      info: (obj) => console.log("[IMAP][info]", obj),
-      warn: (obj) => console.log("[IMAP][warn]", obj),
-      error: (obj) => console.log("[IMAP][error]", obj),
+      // debug: (obj) => console.log("[IMAP][debug]", obj),
+      // info: (obj) => console.log("[IMAP][info]", obj),
+      // warn: (obj) => console.log("[IMAP][warn]", obj),
+      // error: (obj) => console.log("[IMAP][error]", obj),
     },
     socketTimeout: isMs ? 120_000 : 60_000,
     greetingTimeout: isMs ? 120_000 : 30_000,
@@ -2282,8 +2282,8 @@ async function fetchMsAccessTokenByRefreshToken() {
 
   const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
 
-  console.log("[MS] tenant:", tenant);
-  console.log("[MS] has refresh token:", !!refreshToken);
+  // console.log("[MS] tenant:", tenant);
+  // console.log("[MS] has refresh token:", !!refreshToken);
 
   const body = new URLSearchParams();
   body.set("client_id", clientId);
@@ -2355,7 +2355,7 @@ async function buildImapAuth(providerKey, cfg) {
 
     if (DEBUG) {
       const claims = decodeJwtClaims(token);
-      console.log("[MS] access token claims:", claims);
+      // console.log("[MS] access token claims:", claims);
     }
 
     // Return BOTH:
