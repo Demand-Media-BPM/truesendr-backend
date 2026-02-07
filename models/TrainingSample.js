@@ -13,6 +13,7 @@ const TrainingSampleSchema = new mongoose.Schema(
     domain: {
       type: String,
       required: true,
+      index: true,
       lowercase: true,
       trim: true,
     },

@@ -750,6 +750,9 @@ const FileCleanerRouter = require("./routes/fileCleaner");
 
 // 🆕 NEW: Training / dataset routes (Bouncer import, domain stats)
 const TrainingRouter = require("./routes/training")(routeDeps);
+const SendGridWebhookRouter = require("./routes/sendgridWebhook")(routeDeps);
+app.use("/api/sendgrid", SendGridWebhookRouter);
+
 
 app.use("/api/single", singleValidatorRouter);
 app.use("/api/bulk", bulkValidatorRouter);

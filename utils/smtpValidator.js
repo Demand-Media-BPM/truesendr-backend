@@ -1,4 +1,11 @@
 
+// smtpValidator.js
+// ============================================================================
+// TRUE SENDR – SMTP VALIDATOR ENGINE
+// Provider-aware structure: Gmail / Google Workspace, Outlook / M365, Yahoo,
+// Zoho, Other providers, and Enterprise Gateways (Proofpoint, Mimecast, etc.).
+// ============================================================================
+
 const net = require('net');
 const tls = require('tls');
 const dns = require('dns').promises;

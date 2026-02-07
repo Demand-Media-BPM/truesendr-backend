@@ -20,7 +20,6 @@ function normalizeStatus(status, categoryHint) {
   return { status: "Unknown", category: "unknown" };
 }
 
-
 function normEmail(email) {
   return String(email || "").trim().toLowerCase();
 }
