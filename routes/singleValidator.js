@@ -1262,6 +1262,1624 @@
 
 // .................................................................. old code is above .................................................................................
 
+// // routes/singleValidator.js
+// const express = require("express");
+// const router = express.Router();
+
+// // Pull mergeSMTPWithHistory + extractDomain from utils
+// const {
+//   mergeSMTPWithHistory,
+//   extractDomain,
+//   categoryFromStatus: catFromStatus,
+//   normalizeStatus,
+// } = require("../utils/validator");
+
+// // Training samples model
+// const TrainingSample = require("../models/TrainingSample");
+
+// // 🆕 SendGrid integration (Yash logic)
+// const {
+//   verifySendGrid,
+//   isProofpointDomain,
+//   toTrueSendrFormat,
+// } = require("../utils/sendgridVerifier");
+// const SendGridLog = require("../models/SendGridLog");
+
+// // 🆕 Bank/Healthcare domain classifier (Yash logic)
+// const { classifyDomain, getDomainCategory } = require("../utils/domainClassifier");
+
+// module.exports = function singleValidatorRouter(deps) {
+//   const {
+//     mongoose,
+//     EmailLog,
+//     RegionStat,
+//     DomainReputation,
+//     User,
+//     SinglePending,
+//     categoryFromStatus,
+//     normEmail,
+//     buildReasonAndMessage,
+//     getFreshestFromDBs,
+//     replaceLatest,
+//     bumpUpdatedAt,
+//     FRESH_DB_MS,
+//     stableCache,
+//     inflight,
+//     validateSMTP,
+//     validateSMTPStable,
+//     debitOneCreditIfNeeded,
+//     idempoGet,
+//     sendLogToFrontend,
+//     sendStatusToFrontend,
+//   } = deps;
+
+//   // ────────────────────────────────────────────────────────────
+//   // Terminal + Frontend logger (keeps your existing WS logs, adds terminal logs)
+//   // ────────────────────────────────────────────────────────────
+//   function mkLogger(sessionId, E, username) {
+//     return (step, message, level = "info") => {
+//       try {
+//         const ts = new Date().toISOString();
+//         // terminal log (what you wanted)
+//         console.log(`[${ts}][single][${level}][${username || "na"}][${sessionId || "na"}][${E}] ${step}: ${message}`);
+//       } catch (e) {
+//         // ignore
+//       }
+//       // existing frontend log
+//       try {
+//         sendLogToFrontend(sessionId, E, message, step, level, username);
+//       } catch (e) {
+//         // ignore
+//       }
+//     };
+//   }
+
+//   // ────────────────────────────────────────────────────────────
+//   // Pending job helpers – one row per (username, email) job
+//   // ────────────────────────────────────────────────────────────
+//   async function upsertPendingJob({ username, email, idemKey, sessionId }) {
+//     if (!username || !email) return;
+//     await SinglePending.findOneAndUpdate(
+//       { username, email },
+//       {
+//         $setOnInsert: { username, email },
+//         $set: {
+//           idemKey: idemKey || "",
+//           sessionId: sessionId || null,
+//           status: "in_progress",
+//         },
+//       },
+//       { upsert: true, new: true }
+//     );
+//   }
+
+//   async function markPendingDone(username, email) {
+//     if (!username || !email) return;
+//     await SinglePending.updateOne(
+//       { username, email },
+//       { $set: { status: "done" } }
+//     );
+//   }
+
+//   // ────────────────────────────────────────────────────────────
+//   // Helper: build domain/provider + training history
+//   // ────────────────────────────────────────────────────────────
+//   async function buildHistoryForEmail(emailNorm) {
+//     const E = normEmail(emailNorm);
+//     const domain = extractDomain(E);
+
+//     const domainPromise =
+//       domain && domain !== "N/A"
+//         ? DomainReputation.findOne({ domain }).lean()
+//         : Promise.resolve(null);
+
+//     const trainingPromise = TrainingSample.findOne({ email: E }).lean();
+
+//     const [stats, ts] = await Promise.all([domainPromise, trainingPromise]);
+
+//     const history = {};
+
+//     // ----- domain / provider invalid-rate -----
+//     if (stats && stats.sent && stats.sent > 0) {
+//       const domainSamples = stats.sent;
+//       const domainInvalidRate =
+//         typeof stats.invalid === "number" && stats.sent > 0
+//           ? stats.invalid / stats.sent
+//           : null;
+
+//       if (domainInvalidRate !== null) {
+//         history.domainInvalidRate = domainInvalidRate;
+//         history.domainSamples = domainSamples;
+
+//         // Mirror to provider for now
+//         history.providerInvalidRate = domainInvalidRate;
+//         history.providerSamples = domainSamples;
+//       }
+//     }
+
+//     // ----- TrainingSample: lastLabel + counts -----
+//     if (ts) {
+//       const rawCounts = ts.labelCounts || {};
+//       const trainingCounts = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
+
+//       for (const [label, value] of rawCounts.entries
+//         ? rawCounts.entries()
+//         : Object.entries(rawCounts)) {
+//         const l = String(label || "").toLowerCase();
+//         const v = typeof value === "number" ? value : 0;
+//         if (!v) continue;
+
+//         if (l === "valid") trainingCounts.valid += v;
+//         else if (l === "invalid") trainingCounts.invalid += v;
+//         else if (l === "risky") trainingCounts.risky += v;
+//         else trainingCounts.unknown += v;
+//       }
+
+//       history.trainingLastLabel = ts.lastLabel || null;
+//       history.trainingLabel = ts.lastLabel || null; // alias for merge helper
+//       history.trainingCounts = trainingCounts;
+
+//       const totalFromCounts =
+//         trainingCounts.valid +
+//         trainingCounts.invalid +
+//         trainingCounts.risky +
+//         trainingCounts.unknown;
+
+//       history.trainingSamples =
+//         typeof ts.totalSamples === "number" ? ts.totalSamples : totalFromCounts;
+//     }
+
+//     return history;
+//   }
+
+//   // ────────────────────────────────────────────────────────────
+//   // Helper: build payload + send + cache + debit
+//   // ────────────────────────────────────────────────────────────
+//   async function finalizeAndRespond({
+//     E,
+//     rawResult,
+//     history,
+//     idemKey,
+//     username,
+//     sessionId,
+//     EmailLogModel,
+//     UserEmailLogModel,
+//     via,
+//     cached,
+//     res,
+//     shouldCache = true,
+//   }) {
+//     const merged = mergeSMTPWithHistory(rawResult, history || {}, {
+//       domain: rawResult.domain || extractDomain(E),
+//       provider: rawResult.provider || rawResult.domainProvider || "Unavailable",
+//     });
+
+//     const subStatus = merged.sub_status || merged.subStatus || null;
+//     const rawStatus = merged.status || rawResult.status || "Unknown";
+//     const rawCategory = merged.category || categoryFromStatus(rawStatus || "");
+//     const { status, category } = normalizeStatus(rawStatus, rawCategory);
+
+//     const confidence =
+//       typeof merged.confidence === "number"
+//         ? merged.confidence
+//         : typeof rawResult.confidence === "number"
+//         ? rawResult.confidence
+//         : null;
+
+//     const built = buildReasonAndMessage(status, subStatus, {
+//       isDisposable: !!merged.isDisposable,
+//       isRoleBased: !!merged.isRoleBased,
+//       isFree: !!merged.isFree,
+//     });
+
+//     const domain = merged.domain || extractDomain(E);
+//     const provider =
+//       merged.provider ||
+//       merged.domainProvider ||
+//       rawResult.domainProvider ||
+//       "Unavailable";
+
+//     const payload = {
+//       email: E,
+//       status,
+//       subStatus,
+//       confidence,
+//       category,
+//       reason: merged.reason || built.reasonLabel,
+//       message: merged.message || built.message,
+//       domain,
+//       domainProvider: provider,
+//       isDisposable: !!merged.isDisposable,
+//       isFree: !!merged.isFree,
+//       isRoleBased: !!merged.isRoleBased,
+//       score:
+//         typeof merged.score === "number" ? merged.score : rawResult.score ?? 0,
+//       timestamp:
+//         rawResult.timestamp instanceof Date ? rawResult.timestamp : new Date(),
+//       section: "single",
+//     };
+
+//     // persist in both global and user DBs
+//     await replaceLatest(EmailLogModel, E, payload);
+//     await replaceLatest(UserEmailLogModel, E, payload);
+
+//     // in-memory cache if needed
+//     if (shouldCache) {
+//       stableCache.set(E, {
+//         until: Date.now() + deps.CACHE_TTL_MS,
+//         result: payload,
+//       });
+//     }
+
+//     const credits = await debitOneCreditIfNeeded(
+//       username,
+//       payload.status,
+//       E,
+//       idemKey,
+//       "single"
+//     );
+
+//     // push to WS
+//     sendStatusToFrontend(
+//       E,
+//       payload.status,
+//       payload.timestamp,
+//       {
+//         domain: payload.domain,
+//         provider: payload.domainProvider,
+//         isDisposable: payload.isDisposable,
+//         isFree: payload.isFree,
+//         isRoleBased: payload.isRoleBased,
+//         score: payload.score,
+//         subStatus: payload.subStatus,
+//         confidence: payload.confidence,
+//         category: payload.category,
+//         message: payload.message,
+//         reason: payload.reason,
+//       },
+//       sessionId,
+//       true,
+//       username
+//     );
+
+//     return res.json({
+//       ...payload,
+//       via,
+//       cached,
+//       credits,
+//     });
+//   }
+
+//   // ────────────────────────────────────────────────────────────
+//   // 🧠 Yash logic (in your flow):
+//   // 1) Bank/Healthcare or Proofpoint -> SendGrid direct
+//   // 2) SMTP Unknown -> SendGrid fallback
+//   // ────────────────────────────────────────────────────────────
+//   async function maybeSendgridDirectOrNull({
+//     E,
+//     username,
+//     sessionId,
+//     idemKey,
+//     res,
+//   }) {
+//     const domain = extractDomain(E);
+
+//     const domainClassification = classifyDomain(domain);
+//     const isBankOrHealthcare =
+//       !!domainClassification?.isBank || !!domainClassification?.isHealthcare;
+
+//     const isProofpoint = await isProofpointDomain(domain);
+
+//     if (!isBankOrHealthcare && !isProofpoint) return null;
+
+//     const domainCategory = isBankOrHealthcare
+//       ? getDomainCategory(domain)
+//       : "Proofpoint Email Protection";
+
+//     const logger = mkLogger(sessionId, E, username);
+
+//     // Always resolve user DB model safely (prevents undefined UserEmailLog)
+//     const { EmailLog: UserEmailLog2 } = deps.getUserDb(
+//       mongoose,
+//       EmailLog,
+//       RegionStat,
+//       DomainReputation,
+//       username
+//     );
+
+//     // Bank/Healthcare: optional domain reputation short-circuit
+//     if (isBankOrHealthcare) {
+//       const domainStats = await DomainReputation.findOne({ domain }).lean();
+//       if (domainStats && domainStats.sent >= 5) {
+//         const bounceRate =
+//           domainStats.sent > 0 ? domainStats.invalid / domainStats.sent : 0;
+
+//         // If high bounce rate -> risky without SendGrid
+//         if (bounceRate >= 0.6) {
+//           logger(
+//             "high_risk_domain",
+//             `${domainCategory} domain with high bounce rate (${(bounceRate * 100).toFixed(
+//               1
+//             )}%) → Marked as risky`,
+//             "warn"
+//           );
+
+//           const riskyPayload = {
+//             email: E,
+//             status: "⚠️ Risky (High Bounce Domain)",
+//             subStatus: "high_bounce_bank_healthcare",
+//             confidence: 0.85,
+//             category: "risky",
+//             reason: "High Bounce Domain",
+//             message: `This ${domainCategory} domain has a high bounce rate (${(
+//               bounceRate * 100
+//             ).toFixed(1)}%). Sending to this address is risky.`,
+//             domain,
+//             domainProvider: domainCategory,
+//             isDisposable: false,
+//             isFree: false,
+//             isRoleBased: false,
+//             score: 20,
+//             timestamp: new Date(),
+//             section: "single",
+//           };
+
+//           await replaceLatest(EmailLog, E, riskyPayload);
+//           await replaceLatest(UserEmailLog2, E, riskyPayload);
+
+//           sendStatusToFrontend(
+//             E,
+//             riskyPayload.status,
+//             riskyPayload.timestamp,
+//             {
+//               domain: riskyPayload.domain,
+//               provider: riskyPayload.domainProvider,
+//               isDisposable: riskyPayload.isDisposable,
+//               isFree: riskyPayload.isFree,
+//               isRoleBased: riskyPayload.isRoleBased,
+//               score: riskyPayload.score,
+//               subStatus: riskyPayload.subStatus,
+//               confidence: riskyPayload.confidence,
+//               category: riskyPayload.category,
+//               message: riskyPayload.message,
+//               reason: riskyPayload.reason,
+//             },
+//             sessionId,
+//             true,
+//             username
+//           );
+
+//           const userCredits = await debitOneCreditIfNeeded(
+//             username,
+//             riskyPayload.status,
+//             E,
+//             idemKey,
+//             "single"
+//           );
+
+//           stableCache.set(E, {
+//             until: Date.now() + deps.CACHE_TTL_MS,
+//             result: riskyPayload,
+//           });
+
+//           return res.json({
+//             ...riskyPayload,
+//             via: "domain-reputation",
+//             cached: false,
+//             inProgress: false,
+//             credits: userCredits,
+//           });
+//         }
+//       }
+//     }
+
+//     // SendGrid direct
+//     logger(
+//       isBankOrHealthcare && isProofpoint
+//         ? "bank_healthcare_proofpoint"
+//         : isBankOrHealthcare
+//         ? "bank_healthcare"
+//         : "proofpoint",
+//       `${domainCategory} domain detected → Using SendGrid verification`,
+//       "info"
+//     );
+
+//     const sgResult = await verifySendGrid(E, { logger });
+
+//     // Convert to TrueSendr format
+//     const meta = {
+//       domain,
+//       flags: { disposable: false, free: false, role: false },
+//     };
+//     const result = toTrueSendrFormat(sgResult, meta);
+
+//     // Log to SendGridLog (best-effort)
+//     try {
+//       await SendGridLog.create({
+//         email: E,
+//         domain,
+//         status: sgResult.status,
+//         sub_status: sgResult.sub_status,
+//         category: sgResult.category,
+//         confidence: sgResult.confidence || 0.5,
+//         score: result.score || 50,
+//         reason: sgResult.reason,
+//         messageId: sgResult.messageId,
+//         statusCode: sgResult.statusCode,
+//         method: sgResult.method || "web_api",
+//         isProofpoint: !!isProofpoint,
+//         isFallback: false,
+//         provider: `${domainCategory} (via SendGrid)`,
+//         elapsed_ms: sgResult.elapsed_ms,
+//         error: sgResult.error,
+//         username,
+//         sessionId,
+//         isDisposable: result.isDisposable,
+//         isFree: result.isFree,
+//         isRoleBased: result.isRoleBased,
+//         rawResponse: sgResult,
+//       });
+//     } catch (e) {
+//       // don't fail the flow if logging fails
+//       console.warn("SendGridLog create failed:", e.message);
+//     }
+
+//     const history = await buildHistoryForEmail(E);
+
+//     const viaLabel =
+//       isBankOrHealthcare && isProofpoint
+//         ? "sendgrid-bank-healthcare-proofpoint"
+//         : isBankOrHealthcare
+//         ? "sendgrid-bank-healthcare"
+//         : "sendgrid-proofpoint";
+
+//     return finalizeAndRespond({
+//       E,
+//       rawResult: result,
+//       history,
+//       idemKey,
+//       username,
+//       sessionId,
+//       EmailLogModel: EmailLog,
+//       UserEmailLogModel: UserEmailLog2,
+//       via: viaLabel,
+//       cached: false,
+//       res,
+//       shouldCache: true,
+//     });
+//   }
+
+//   async function maybeSendgridFallbackOnUnknown({
+//     E,
+//     username,
+//     sessionId,
+//     smtpRaw,
+//   }) {
+//     // Only when SMTP category is unknown
+//     if (!smtpRaw) return null;
+//     const cat = smtpRaw.category || categoryFromStatus(smtpRaw.status || "");
+//     if (String(cat).toLowerCase() !== "unknown") return null;
+
+//     const logger = mkLogger(sessionId, E, username);
+
+//     logger(
+//       "sendgrid_fallback",
+//       "SMTP returned unknown → Using SendGrid fallback verification",
+//       "info"
+//     );
+
+//     const domain = extractDomain(E);
+
+//     try {
+//       const sgResult = await verifySendGrid(E, { logger });
+//       const meta = {
+//         domain,
+//         flags: { disposable: false, free: false, role: false },
+//       };
+//       const sgTrueSendrResult = toTrueSendrFormat(sgResult, meta);
+
+//       // Make provider label explicit for UI/merge
+//       if (!sgTrueSendrResult.provider && !sgTrueSendrResult.domainProvider) {
+//         sgTrueSendrResult.provider = "SendGrid (fallback)";
+//         sgTrueSendrResult.domainProvider = "SendGrid (fallback)";
+//       }
+
+//       // Log fallback (best-effort)
+//       try {
+//         await SendGridLog.create({
+//           email: E,
+//           domain,
+//           status: sgResult.status,
+//           sub_status: sgResult.sub_status,
+//           category: sgResult.category,
+//           confidence: sgResult.confidence || 0.5,
+//           score: sgTrueSendrResult.score || 50,
+//           reason: sgResult.reason,
+//           messageId: sgResult.messageId,
+//           statusCode: sgResult.statusCode,
+//           method: sgResult.method || "web_api",
+//           isProofpoint: false,
+//           isFallback: true,
+//           smtpCategory: smtpRaw.category,
+//           smtpSubStatus: smtpRaw.sub_status,
+//           provider: smtpRaw.provider || "Unknown (SMTP fallback)",
+//           elapsed_ms: sgResult.elapsed_ms,
+//           error: sgResult.error,
+//           username,
+//           sessionId,
+//           isDisposable: sgTrueSendrResult.isDisposable,
+//           isFree: sgTrueSendrResult.isFree,
+//           isRoleBased: sgTrueSendrResult.isRoleBased,
+//           rawResponse: sgResult,
+//         });
+//       } catch (e) {
+//         console.warn("SendGridLog fallback create failed:", e.message);
+//       }
+
+//       // Return the SendGrid result to caller
+//       return { sgTrueSendrResult, via: "sendgrid-fallback" };
+//     } catch (e) {
+//       logger(
+//         "sendgrid_fallback_error",
+//         `SendGrid fallback failed: ${e.message} - using SMTP result`,
+//         "warn"
+//       );
+//       return null;
+//     }
+//   }
+
+//   // POST /api/single/validate
+//   router.post("/validate", async (req, res) => {
+//     const idemKey =
+//       req.headers["x-idempotency-key"] ||
+//       (req.body && req.body.idempotencyKey) ||
+//       null;
+
+//     try {
+//       const { email, sessionId, username } =
+//         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+//       if (!email) return res.status(400).json({ error: "Email is required" });
+//       if (!username)
+//         return res.status(400).json({ error: "Username is required" });
+
+//       const E = normEmail(email);
+//       const logger = mkLogger(sessionId, E, username);
+
+//       // credits must exist (still won't charge for Unknown)
+//       const user = await User.findOne({ username });
+//       if (!user) return res.status(404).json({ error: "User not found" });
+//       if (user.credits <= 0) {
+//         const alreadyPaid = idemKey && idempoGet(username, E, idemKey);
+//         if (!alreadyPaid)
+//           return res.status(400).json({ error: "You don't have credits" });
+//       }
+
+//       // Freshest cache (global + user)
+//       const { best: cachedDb, UserEmailLog } = await getFreshestFromDBs(
+//         mongoose,
+//         EmailLog,
+//         RegionStat,
+//         DomainReputation,
+//         EmailLog,
+//         username,
+//         E
+//       );
+
+//       if (cachedDb) {
+//         const fresh =
+//           Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <=
+//           FRESH_DB_MS;
+
+//         if (fresh) {
+//           await bumpUpdatedAt(EmailLog, E, "single");
+
+//           const history = await buildHistoryForEmail(E);
+//           const merged = mergeSMTPWithHistory(
+//             {
+//               status: cachedDb.status,
+//               subStatus: cachedDb.subStatus,
+//               category: cachedDb.category,
+//               score: cachedDb.score,
+//               domain: cachedDb.domain,
+//               provider: cachedDb.domainProvider || cachedDb.provider,
+//               isDisposable: cachedDb.isDisposable,
+//               isFree: cachedDb.isFree,
+//               isRoleBased: cachedDb.isRoleBased,
+//               confidence: cachedDb.confidence,
+//               timestamp:
+//                 cachedDb.timestamp || cachedDb.updatedAt || cachedDb.createdAt,
+//             },
+//             history,
+//             {
+//               domain: cachedDb.domain || extractDomain(E),
+//               provider:
+//                 cachedDb.domainProvider || cachedDb.provider || "Unavailable",
+//             }
+//           );
+
+//           const subStatus = merged.sub_status || merged.subStatus || null;
+//           const rawStatus = merged.status || cachedDb.status || "Unknown";
+//           const rawCategory =
+//             merged.category || categoryFromStatus(rawStatus || "");
+//           const { status, category } = normalizeStatus(rawStatus, rawCategory);
+
+//           const confidence =
+//             typeof merged.confidence === "number"
+//               ? merged.confidence
+//               : typeof cachedDb.confidence === "number"
+//               ? cachedDb.confidence
+//               : null;
+
+//           const builtCached = buildReasonAndMessage(status, subStatus, {
+//             isDisposable: !!merged.isDisposable,
+//             isRoleBased: !!merged.isRoleBased,
+//             isFree: !!merged.isFree,
+//           });
+
+//           const domain = merged.domain || cachedDb.domain || extractDomain(E);
+//           const provider =
+//             merged.provider ||
+//             cachedDb.domainProvider ||
+//             cachedDb.provider ||
+//             "Unavailable";
+
+//           const payload = {
+//             email: E,
+//             status,
+//             subStatus,
+//             confidence,
+//             category,
+//             reason: merged.reason || builtCached.reasonLabel,
+//             message: merged.message || builtCached.message,
+//             domain,
+//             domainProvider: provider,
+//             isDisposable: !!merged.isDisposable,
+//             isFree: !!merged.isFree,
+//             isRoleBased: !!merged.isRoleBased,
+//             score:
+//               typeof merged.score === "number"
+//                 ? merged.score
+//                 : cachedDb.score ?? 0,
+//             timestamp: cachedDb.timestamp || new Date(),
+//             section: "single",
+//           };
+
+//           await replaceLatest(EmailLog, E, payload);
+//           await replaceLatest(UserEmailLog, E, payload);
+
+//           stableCache.set(E, {
+//             until: Date.now() + deps.CACHE_TTL_MS,
+//             result: payload,
+//           });
+
+//           const credits = await debitOneCreditIfNeeded(
+//             username,
+//             payload.status,
+//             E,
+//             idemKey,
+//             "single"
+//           );
+
+//           sendStatusToFrontend(
+//             E,
+//             payload.status,
+//             payload.timestamp,
+//             {
+//               domain: payload.domain,
+//               provider: payload.domainProvider,
+//               isDisposable: payload.isDisposable,
+//               isFree: payload.isFree,
+//               isRoleBased: payload.isRoleBased,
+//               score: payload.score,
+//               subStatus: payload.subStatus,
+//               confidence: payload.confidence,
+//               category: payload.category,
+//               message: payload.message,
+//               reason: payload.reason,
+//             },
+//             sessionId,
+//             false,
+//             username
+//           );
+
+//           logger("db_cache", `Cache hit (fresh) → returning cached result`, "info");
+
+//           return res.json({
+//             ...payload,
+//             via: "db-cache",
+//             cached: true,
+//             credits,
+//           });
+//         }
+//       }
+
+//       // ✅ Yash logic: bank/healthcare OR proofpoint => SendGrid direct
+//       const direct = await maybeSendgridDirectOrNull({
+//         E,
+//         username,
+//         sessionId,
+//         idemKey,
+//         res,
+//       });
+//       if (direct) return direct;
+
+//       // in-flight guard (per user+email)
+//       const inflightKey = username ? `${username}:${E}` : E;
+
+//       if (inflight.has(inflightKey)) {
+//         logger(
+//           "attach",
+//           "Another validation is already running; skipping duplicate",
+//           "info"
+//         );
+//         return res.json({
+//           email: E,
+//           status: "⏳ In progress",
+//           category: "unknown",
+//           via: "smtp",
+//           inProgress: true,
+//         });
+//       }
+
+//       let resolveInflight;
+//       const p = new Promise((r) => (resolveInflight = r));
+//       inflight.set(inflightKey, p);
+
+//       try {
+//         // SMTP
+//         logger("start", "Running SMTP validation", "info");
+//         const smtpResult = await deps.validateSMTP(E, { logger });
+
+//         // ✅ Yash logic: if SMTP unknown => SendGrid fallback (and prefer SG result)
+//         const fb = await maybeSendgridFallbackOnUnknown({
+//           E,
+//           username,
+//           sessionId,
+//           smtpRaw: smtpResult,
+//         });
+
+//         const rawToUse = fb?.sgTrueSendrResult || smtpResult;
+//         const viaLabel = fb?.via || "smtp";
+
+//         const history = await buildHistoryForEmail(E);
+
+//         const { EmailLog: UserEmailLog2 } = deps.getUserDb(
+//           mongoose,
+//           EmailLog,
+//           RegionStat,
+//           DomainReputation,
+//           username
+//         );
+
+//         return await finalizeAndRespond({
+//           E,
+//           rawResult: rawToUse,
+//           history,
+//           idemKey,
+//           username,
+//           sessionId,
+//           EmailLogModel: EmailLog,
+//           UserEmailLogModel: UserEmailLog2,
+//           via: viaLabel,
+//           cached: false,
+//           res,
+//           shouldCache: true,
+//         });
+//       } finally {
+//         inflight.delete(inflightKey);
+//         resolveInflight();
+//       }
+//     } catch (err) {
+//       console.error("❌ /api/single/validate:", err.message);
+//       res.status(500).json({ error: err.message });
+//     }
+//   });
+
+//   // POST /api/single/verify-smart
+//   router.post("/verify-smart", async (req, res) => {
+//     try {
+//       const idemKey =
+//         req.headers["x-idempotency-key"] ||
+//         (req.body && req.body.idempotencyKey) ||
+//         null;
+
+//       const { email, sessionId, username } =
+//         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+//       if (!email) return res.status(400).json({ error: "Email is required" });
+//       if (!username)
+//         return res.status(400).json({ error: "Username is required" });
+
+//       const E = normEmail(email);
+//       const logger = mkLogger(sessionId, E, username);
+
+//       const user = await User.findOne({ username });
+//       if (!user) return res.status(404).json({ error: "User not found" });
+//       if (user.credits <= 0) {
+//         const alreadyPaid = idemKey && deps.idempoGet(username, E, idemKey);
+//         if (!alreadyPaid)
+//           return res.status(400).json({ error: "You don't have credits" });
+//       }
+
+//       await upsertPendingJob({ username, email: E, idemKey, sessionId });
+
+//       // in-flight guard (per user+email) — set inflight EARLY to prevent double prelim runs
+//       const inflightKey = username ? `${username}:${E}` : E;
+
+//       if (inflight.has(inflightKey)) {
+//         logger(
+//           "attach",
+//           "Another verification is already running; attaching via WS",
+//           "info"
+//         );
+//         return res.json({
+//           email: E,
+//           status: "⏳ In progress",
+//           category: "unknown",
+//           via: "smtp",
+//           inProgress: true,
+//         });
+//       }
+
+//       let resolveInflight;
+//       const p = new Promise((r) => (resolveInflight = r));
+//       inflight.set(inflightKey, p);
+
+//       // helper to cleanup inflight when we return early (cache/direct/final)
+//       const clearInflight = () => {
+//         try {
+//           inflight.delete(inflightKey);
+//         } catch (e) {}
+//         try {
+//           resolveInflight && resolveInflight();
+//         } catch (e) {}
+//       };
+
+//       // freshest (global + user)
+//       const { best: cachedDb, UserEmailLog } = await getFreshestFromDBs(
+//         mongoose,
+//         EmailLog,
+//         RegionStat,
+//         DomainReputation,
+//         EmailLog,
+//         username,
+//         E
+//       );
+
+//       if (cachedDb) {
+//         const fresh =
+//           Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <=
+//           FRESH_DB_MS;
+
+//         if (fresh) {
+//           await bumpUpdatedAt(EmailLog, E, "single");
+
+//           const history = await buildHistoryForEmail(E);
+//           const merged = mergeSMTPWithHistory(
+//             {
+//               status: cachedDb.status,
+//               subStatus: cachedDb.subStatus,
+//               category: cachedDb.category,
+//               score: cachedDb.score,
+//               domain: cachedDb.domain,
+//               provider: cachedDb.domainProvider || cachedDb.provider,
+//               isDisposable: cachedDb.isDisposable,
+//               isFree: cachedDb.isFree,
+//               isRoleBased: cachedDb.isRoleBased,
+//               confidence: cachedDb.confidence,
+//               timestamp:
+//                 cachedDb.timestamp || cachedDb.updatedAt || cachedDb.createdAt,
+//             },
+//             history,
+//             {
+//               domain: cachedDb.domain || extractDomain(E),
+//               provider:
+//                 cachedDb.domainProvider || cachedDb.provider || "Unavailable",
+//             }
+//           );
+
+//           const subStatus = merged.sub_status || merged.subStatus || null;
+//           const rawStatus = merged.status || cachedDb.status || "Unknown";
+//           const rawCategory =
+//             merged.category || categoryFromStatus(rawStatus || "");
+//           const { status, category } = normalizeStatus(rawStatus, rawCategory);
+
+//           const confidence =
+//             typeof merged.confidence === "number"
+//               ? merged.confidence
+//               : typeof cachedDb.confidence === "number"
+//               ? cachedDb.confidence
+//               : null;
+
+//           const builtCached = buildReasonAndMessage(status, subStatus, {
+//             isDisposable: !!merged.isDisposable,
+//             isRoleBased: !!merged.isRoleBased,
+//             isFree: !!merged.isFree,
+//           });
+
+//           const domain = merged.domain || cachedDb.domain || extractDomain(E);
+//           const provider =
+//             merged.provider ||
+//             cachedDb.domainProvider ||
+//             cachedDb.provider ||
+//             "Unavailable";
+
+//           const payload = {
+//             email: E,
+//             status,
+//             subStatus,
+//             confidence,
+//             category,
+//             reason: merged.reason || builtCached.reasonLabel,
+//             message: merged.message || builtCached.message,
+//             domain,
+//             domainProvider: provider,
+//             isDisposable: !!merged.isDisposable,
+//             isFree: !!merged.isFree,
+//             isRoleBased: !!merged.isRoleBased,
+//             score:
+//               typeof merged.score === "number"
+//                 ? merged.score
+//                 : cachedDb.score ?? 0,
+//             timestamp: cachedDb.timestamp || new Date(),
+//             section: "single",
+//           };
+
+//           await replaceLatest(EmailLog, E, payload);
+//           await replaceLatest(UserEmailLog, E, payload);
+
+//           stableCache.set(E, {
+//             until: Date.now() + deps.CACHE_TTL_MS,
+//             result: payload,
+//           });
+
+//           const credits = await debitOneCreditIfNeeded(
+//             username,
+//             payload.status,
+//             E,
+//             idemKey,
+//             "single"
+//           );
+
+//           sendStatusToFrontend(
+//             E,
+//             payload.status,
+//             payload.timestamp,
+//             {
+//               domain: payload.domain,
+//               provider: payload.domainProvider,
+//               isDisposable: payload.isDisposable,
+//               isFree: payload.isFree,
+//               isRoleBased: payload.isRoleBased,
+//               score: payload.score,
+//               subStatus: payload.subStatus,
+//               confidence: payload.confidence,
+//               category: payload.category,
+//               message: payload.message,
+//               reason: payload.reason,
+//             },
+//             sessionId,
+//             false,
+//             username
+//           );
+
+//           await markPendingDone(username, E);
+
+//           const pending = await SinglePending.findOne({
+//             username,
+//             email: E,
+//             status: "in_progress",
+//           }).lean();
+
+//           const isUnknown = categoryFromStatus(payload.status) === "unknown";
+//           const inProgressFlag = !!(pending && isUnknown);
+
+//           logger("db_cache", `Cache hit (fresh) → returning cached result`, "info");
+
+//           clearInflight();
+//           return res.json({
+//             ...payload,
+//             via: "db-cache",
+//             cached: true,
+//             inProgress: inProgressFlag,
+//             credits,
+//           });
+//         }
+//       }
+
+//       // short cache?
+//       const hit = stableCache.get(E);
+//       if (hit && hit.until > Date.now()) {
+//         const { EmailLog: UserEmailLog2 } = deps.getUserDb(
+//           mongoose,
+//           EmailLog,
+//           RegionStat,
+//           DomainReputation,
+//           username
+//         );
+
+//         const historyHit = await buildHistoryForEmail(E);
+//         const mergedHit = mergeSMTPWithHistory(hit.result, historyHit, {
+//           domain: hit.result.domain || extractDomain(E),
+//           provider:
+//             hit.result.provider || hit.result.domainProvider || "Unavailable",
+//         });
+
+//         const subStatusH = mergedHit.sub_status || mergedHit.subStatus || null;
+//         const rawStatusH = mergedHit.status || hit.result.status || "Unknown";
+//         const rawCategoryH =
+//           mergedHit.category || categoryFromStatus(rawStatusH || "");
+//         const { status: statusH, category: categoryH } = normalizeStatus(
+//           rawStatusH,
+//           rawCategoryH
+//         );
+
+//         const confidenceH =
+//           typeof mergedHit.confidence === "number"
+//             ? mergedHit.confidence
+//             : typeof hit.result.confidence === "number"
+//             ? hit.result.confidence
+//             : null;
+
+//         const builtHit = buildReasonAndMessage(statusH, subStatusH, {
+//           isDisposable: !!mergedHit.isDisposable,
+//           isRoleBased: !!mergedHit.isRoleBased,
+//           isFree: !!mergedHit.isFree,
+//         });
+
+//         const domainH =
+//           mergedHit.domain || hit.result.domain || extractDomain(E);
+//         const providerH =
+//           mergedHit.provider ||
+//           hit.result.provider ||
+//           hit.result.domainProvider ||
+//           "Unavailable";
+
+//         await UserEmailLog2.findOneAndUpdate(
+//           { email: E },
+//           {
+//             $set: {
+//               email: E,
+//               status: statusH,
+//               subStatus: subStatusH || null,
+//               confidence: confidenceH,
+//               category: categoryH,
+//               reason: mergedHit.reason || builtHit.reasonLabel,
+//               message: mergedHit.message || builtHit.message,
+//               domain: domainH,
+//               domainProvider: providerH,
+//               isDisposable: !!mergedHit.isDisposable,
+//               isFree: !!mergedHit.isFree,
+//               isRoleBased: !!mergedHit.isRoleBased,
+//               score:
+//                 typeof mergedHit.score === "number"
+//                   ? mergedHit.score
+//                   : hit.result.score ?? 0,
+//               timestamp: hit.result.timestamp || new Date(),
+//               section: "single",
+//             },
+//             $currentDate: { updatedAt: true },
+//           },
+//           { upsert: true, new: true }
+//         );
+
+//         stableCache.set(E, {
+//           until: hit.until,
+//           result: {
+//             ...hit.result,
+//             status: statusH,
+//             subStatus: subStatusH,
+//             category: categoryH,
+//             confidence: confidenceH,
+//             domain: domainH,
+//             domainProvider: providerH,
+//             isDisposable: !!mergedHit.isDisposable,
+//             isFree: !!mergedHit.isFree,
+//             isRoleBased: !!mergedHit.isRoleBased,
+//           },
+//         });
+
+//         const credits = await debitOneCreditIfNeeded(
+//           username,
+//           statusH,
+//           E,
+//           idemKey,
+//           "single"
+//         );
+
+//         sendStatusToFrontend(
+//           E,
+//           statusH,
+//           Date.now(),
+//           {
+//             domain: domainH,
+//             provider: providerH,
+//             isDisposable: !!mergedHit.isDisposable,
+//             isFree: !!mergedHit.isFree,
+//             isRoleBased: !!mergedHit.isRoleBased,
+//             score:
+//               typeof mergedHit.score === "number"
+//                 ? mergedHit.score
+//                 : hit.result.score ?? 0,
+//             subStatus: subStatusH,
+//             confidence: confidenceH,
+//             category: categoryH,
+//             message: mergedHit.message || builtHit.message,
+//             reason: mergedHit.reason || builtHit.reasonLabel,
+//           },
+//           sessionId,
+//           false,
+//           username
+//         );
+
+//         await markPendingDone(username, E);
+
+//         const pending = await SinglePending.findOne({
+//           username,
+//           email: E,
+//           status: "in_progress",
+//         }).lean();
+
+//         const inProgressFlag = !!(pending && categoryH === "unknown");
+
+//         logger("stable_cache", `StableCache hit → returning cached result`, "info");
+
+//         clearInflight();
+//         return res.json({
+//           email: E,
+//           status: statusH,
+//           subStatus: subStatusH,
+//           confidence: confidenceH,
+//           category: categoryH,
+//           domain: domainH,
+//           domainProvider: providerH,
+//           isDisposable: !!mergedHit.isDisposable,
+//           isFree: !!mergedHit.isFree,
+//           isRoleBased: !!mergedHit.isRoleBased,
+//           score:
+//             typeof mergedHit.score === "number"
+//               ? mergedHit.score
+//               : hit.result.score ?? 0,
+//           timestamp: hit.result.timestamp || new Date(),
+//           section: "single",
+//           via: "smtp-stable",
+//           cached: true,
+//           inProgress: inProgressFlag,
+//           credits,
+//         });
+//       }
+
+//       // ✅ Yash logic: bank/healthcare OR proofpoint => SendGrid direct (verify-smart too)
+//       const direct = await maybeSendgridDirectOrNull({
+//         E,
+//         username,
+//         sessionId,
+//         idemKey,
+//         res,
+//       });
+//       if (direct) {
+//         await markPendingDone(username, E);
+//         clearInflight();
+//         return direct;
+//       }
+
+//       // 1) PRELIM SMTP
+//       logger("start", "verify-smart: running prelim SMTP validation", "info");
+//       const prelimRawSmtp = await validateSMTP(E, { logger });
+
+//       // ✅ Yash logic: if prelim unknown => SendGrid fallback; if SG gives confident status, prefer it
+//       const fb = await maybeSendgridFallbackOnUnknown({
+//         E,
+//         username,
+//         sessionId,
+//         smtpRaw: prelimRawSmtp,
+//       });
+
+//       const prelimRaw = fb?.sgTrueSendrResult || prelimRawSmtp;
+//       const prelimVia = fb?.via || "smtp";
+
+//       const history = await buildHistoryForEmail(E);
+//       const prelim = mergeSMTPWithHistory(prelimRaw, history, {
+//         domain: prelimRaw.domain || extractDomain(E),
+//         provider:
+//           prelimRaw.provider ||
+//           prelimRaw.domainProvider ||
+//           (fb ? "SendGrid (fallback)" : "Unavailable"),
+//       });
+
+//       const subStatusP = prelim.sub_status || prelim.subStatus || null;
+//       const rawStatusP = prelim.status || prelimRaw.status || "Unknown";
+//       const rawCategoryP =
+//         prelim.category || categoryFromStatus(rawStatusP || "");
+//       const { status: statusP, category: categoryP } = normalizeStatus(
+//         rawStatusP,
+//         rawCategoryP
+//       );
+
+//       const confidenceP =
+//         typeof prelim.confidence === "number"
+//           ? prelim.confidence
+//           : typeof prelimRaw.confidence === "number"
+//           ? prelimRaw.confidence
+//           : null;
+
+//       const builtPrelim = buildReasonAndMessage(statusP, subStatusP, {
+//         isDisposable: !!prelim.isDisposable,
+//         isRoleBased: !!prelim.isRoleBased,
+//         isFree: !!prelim.isFree,
+//       });
+
+//       const prelimPayload = {
+//         email: E,
+//         status: statusP,
+//         subStatus: subStatusP,
+//         confidence: confidenceP,
+//         category: categoryP,
+//         reason: prelim.reason || builtPrelim.reasonLabel,
+//         message: prelim.message || builtPrelim.message,
+//         domain: prelim.domain || extractDomain(E),
+//         domainProvider:
+//           prelim.provider ||
+//           prelim.domainProvider ||
+//           (fb ? "SendGrid (fallback)" : "Unavailable"),
+//         isDisposable: !!prelim.isDisposable,
+//         isFree: !!prelim.isFree,
+//         isRoleBased: !!prelim.isRoleBased,
+//         score:
+//           typeof prelim.score === "number"
+//             ? prelim.score
+//             : prelimRaw.score ?? 0,
+//         timestamp: new Date(),
+//         section: "single",
+//       };
+
+//       await replaceLatest(EmailLog, E, prelimPayload);
+//       await replaceLatest(UserEmailLog, E, prelimPayload);
+
+//       sendStatusToFrontend(
+//         E,
+//         prelimPayload.status,
+//         prelimPayload.timestamp,
+//         {
+//           domain: prelimPayload.domain,
+//           provider: prelimPayload.domainProvider,
+//           isDisposable: prelimPayload.isDisposable,
+//           isFree: prelimPayload.isFree,
+//           isRoleBased: prelimPayload.isRoleBased,
+//           score: prelimPayload.score,
+//           subStatus: prelimPayload.subStatus,
+//           confidence: prelimPayload.confidence,
+//           category: prelimPayload.category,
+//           message: prelimPayload.message,
+//           reason: prelimPayload.reason,
+//         },
+//         sessionId,
+//         true,
+//         username
+//       );
+
+//       const credits = await debitOneCreditIfNeeded(
+//         username,
+//         prelimPayload.status,
+//         E,
+//         idemKey,
+//         "single"
+//       );
+
+//       const prelimCat = categoryFromStatus(prelimPayload.status);
+//       if (["valid", "invalid", "risky"].includes(prelimCat)) {
+//         stableCache.set(E, {
+//           until: Date.now() + deps.CACHE_TTL_MS,
+//           result: prelimPayload,
+//         });
+
+//         await markPendingDone(username, E);
+
+//         logger("final", `verify-smart resolved at prelim stage (${prelimCat})`, "info");
+
+//         clearInflight();
+//         return res.json({
+//           ...prelimPayload,
+//           via: prelimVia,
+//           inProgress: false,
+//           credits,
+//         });
+//       }
+
+//       // Unknown → background stabilization
+//       await SinglePending.findOneAndUpdate(
+//         { username, email: E },
+//         { username, email: E, idemKey, sessionId, status: "in_progress" },
+//         { upsert: true, new: true }
+//       );
+
+//       // respond immediately (existing behavior)
+//       res.json({
+//         ...prelimPayload,
+//         via: prelimVia,
+//         inProgress: true,
+//         credits,
+//       });
+
+//       // keep inflight until background finishes (so later calls attach instead of starting new runs)
+//       (async () => {
+//         try {
+//           // 2) FINAL SMTP-STABLE
+//           logger("stabilize_start", "Running SMTP-stable (background)", "info");
+//           const finalRaw = await validateSMTPStable(E, { logger });
+//           const historyFinal = await buildHistoryForEmail(E);
+//           const final = mergeSMTPWithHistory(finalRaw, historyFinal, {
+//             domain: finalRaw.domain || extractDomain(E),
+//             provider: finalRaw.provider || "Unavailable",
+//           });
+
+//           const subStatusF = final.sub_status || final.subStatus || null;
+//           const rawStatusF = final.status || finalRaw.status || "Unknown";
+//           const rawCategoryF =
+//             final.category || categoryFromStatus(rawStatusF || "");
+//           const { status: statusF, category: categoryF } = normalizeStatus(
+//             rawStatusF,
+//             rawCategoryF
+//           );
+
+//           const confidenceF =
+//             typeof final.confidence === "number"
+//               ? final.confidence
+//               : typeof finalRaw.confidence === "number"
+//               ? finalRaw.confidence
+//               : null;
+
+//           const builtFinal = buildReasonAndMessage(statusF, subStatusF, {
+//             isDisposable: !!final.isDisposable,
+//             isRoleBased: !!final.isRoleBased,
+//             isFree: !!final.isFree,
+//           });
+
+//           const finalPayload = {
+//             email: E,
+//             status: statusF,
+//             subStatus: subStatusF,
+//             confidence: confidenceF,
+//             category: categoryF,
+//             reason: final.reason || builtFinal.reasonLabel,
+//             message: final.message || builtFinal.message,
+//             domain: final.domain || prelimPayload.domain,
+//             domainProvider:
+//               final.provider || prelimPayload.domainProvider || "Unavailable",
+//             isDisposable: !!final.isDisposable,
+//             isFree: !!final.isFree,
+//             isRoleBased: !!final.isRoleBased,
+//             score:
+//               typeof final.score === "number"
+//                 ? final.score
+//                 : prelimPayload.score ?? 0,
+//             timestamp: new Date(),
+//             section: "single",
+//           };
+
+//           await replaceLatest(EmailLog, E, finalPayload);
+//           await replaceLatest(UserEmailLog, E, finalPayload);
+
+//           if (/Valid|Invalid|Risky/i.test(finalPayload.status)) {
+//             stableCache.set(E, {
+//               until: Date.now() + deps.CACHE_TTL_MS,
+//               result: finalPayload,
+//             });
+//           }
+
+//           sendStatusToFrontend(
+//             E,
+//             finalPayload.status,
+//             finalPayload.timestamp,
+//             {
+//               domain: finalPayload.domain,
+//               provider: finalPayload.domainProvider,
+//               isDisposable: finalPayload.isDisposable,
+//               isFree: finalPayload.isFree,
+//               isRoleBased: finalPayload.isRoleBased,
+//               score: finalPayload.score,
+//               subStatus: finalPayload.subStatus,
+//               confidence: finalPayload.confidence,
+//               category: finalPayload.category,
+//               message: finalPayload.message,
+//               reason: finalPayload.reason,
+//             },
+//             sessionId,
+//             true,
+//             username
+//           );
+
+//           logger("stabilize_done", `SMTP-stable finished → ${finalPayload.status}`, "info");
+//         } catch (e) {
+//           logger("stabilize_error", `SMTP-stable failed: ${e.message}`, "warn");
+//         } finally {
+//           await markPendingDone(username, E);
+//           clearInflight();
+//         }
+//       })();
+//     } catch (err) {
+//       console.error("❌ /api/single/verify-smart:", err.message);
+//       return res.status(500).json({ error: err.message });
+//     }
+//   });
+
+//   // POST /api/single/clear-history
+//   router.post("/clear-history", async (req, res) => {
+//     try {
+//       const { username } =
+//         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+//       if (!username)
+//         return res
+//           .status(400)
+//           .json({ success: false, error: "Username required" });
+
+//       const now = new Date();
+//       const updatedUser = await User.findOneAndUpdate(
+//         { username },
+//         { singleTimestamp: now },
+//         { new: true }
+//       );
+//       if (!updatedUser)
+//         return res
+//           .status(404)
+//           .json({ success: false, error: "User not found" });
+
+//       res.json({
+//         success: true,
+//         message: "Single validation history cleared",
+//         singleTimestamp: updatedUser.singleTimestamp,
+//       });
+//     } catch (err) {
+//       console.error("❌ /api/single/clear-history:", err.message);
+//       res.status(500).json({ success: false, error: err.message });
+//     }
+//   });
+
+//   // POST /api/single/pending
+//   router.post("/pending", async (req, res) => {
+//     try {
+//       const { username } =
+//         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+//       if (!username)
+//         return res
+//           .status(400)
+//           .json({ ok: false, error: "Username is required" });
+
+//       const pendings = await SinglePending.find({
+//         username,
+//         status: "in_progress",
+//       })
+//         .sort({ createdAt: -1 })
+//         .lean();
+
+//       res.json({ ok: true, pendings });
+//     } catch (err) {
+//       console.error("❌ /api/single/pending:", err.message);
+//       res.status(500).json({ ok: false, error: err.message });
+//     }
+//   });
+
+//   // POST /api/single/history
+//   router.post("/history", async (req, res) => {
+//     try {
+//       const {
+//         username,
+//         limit: rawLimit = 50,
+//         pageSize,
+//       } = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+//       if (!username)
+//         return res
+//           .status(400)
+//           .json({ success: false, error: "Username is required" });
+
+//       const user = await User.findOne({ username });
+//       if (!user)
+//         return res
+//           .status(404)
+//           .json({ success: false, error: "User not found" });
+
+//       const limit = rawLimit || pageSize || 50;
+
+//       const { EmailLog: UserEmailLog } = deps.getUserDb(
+//         mongoose,
+//         EmailLog,
+//         RegionStat,
+//         DomainReputation,
+//         username
+//       );
+
+//       const query = { section: "single" };
+//       if (user.singleTimestamp) {
+//         query.$or = [
+//           { updatedAt: { $gt: new Date(user.singleTimestamp) } },
+//           {
+//             $and: [
+//               { updatedAt: { $exists: false } },
+//               { createdAt: { $gt: new Date(user.singleTimestamp) } },
+//             ],
+//           },
+//         ];
+//       }
+
+//       let validations = await UserEmailLog.find(query)
+//         .sort({ updatedAt: -1, createdAt: -1 })
+//         .limit(limit * 2);
+
+//       const pendings = await SinglePending.find({
+//         username,
+//         status: "in_progress",
+//       })
+//         .select("email")
+//         .lean();
+
+//       const inProgressSet = new Set(
+//         pendings
+//           .map((p) => (p && p.email ? normEmail(p.email) : null))
+//           .filter(Boolean)
+//       );
+
+//       validations = validations.filter((v) => {
+//         const e = normEmail(v.email);
+//         return !inProgressSet.has(e);
+//       });
+
+//       validations = validations.filter((v) => {
+//         const cat = catFromStatus(v.status || "");
+//         if (cat === "unknown") return false;
+//         const s = String(v.status || "");
+//         if (/in\s*progress/i.test(s)) return false;
+//         return true;
+//       });
+
+//       const formatted = validations.slice(0, limit).map((v) => {
+//         const built = buildReasonAndMessage(
+//           v.status || "",
+//           v.subStatus || null,
+//           {
+//             isDisposable: !!v.isDisposable,
+//             isRoleBased: !!v.isRoleBased,
+//             isFree: !!v.isFree,
+//           }
+//         );
+//         return {
+//           id: v._id,
+//           email: v.email,
+//           status: v.status || "❔ Unknown",
+//           subStatus: v.subStatus || null,
+//           confidence: typeof v.confidence === "number" ? v.confidence : null,
+//           category: v.category || categoryFromStatus(v.status || ""),
+//           domain: v.domain || "N/A",
+//           provider: v.domainProvider || v.provider || "Unavailable",
+//           isDisposable: !!v.isDisposable,
+//           isFree: !!v.isFree,
+//           isRoleBased: !!v.isRoleBased,
+//           score: v.score != null ? v.score : 0,
+//           timestamp: (
+//             v.updatedAt ||
+//             v.createdAt ||
+//             v.timestamp ||
+//             null
+//           )?.toISOString(),
+//           message: v.message || built.message,
+//         };
+//       });
+
+//       res.json({ success: true, count: formatted.length, data: formatted });
+//     } catch (err) {
+//       console.error("❌ /api/single/history:", err.message);
+//       res.status(500).json({ success: false, error: err.message });
+//     }
+//   });
+
+//   return router;
+// };
+
+
+// .......................................................................................................
+
 // routes/singleValidator.js
 const express = require("express");
 const router = express.Router();
@@ -1290,25 +2908,40 @@ const { classifyDomain, getDomainCategory } = require("../utils/domainClassifier
 
 module.exports = function singleValidatorRouter(deps) {
   const {
+    // models / db
     mongoose,
     EmailLog,
     RegionStat,
     DomainReputation,
     User,
+
+    // OPTIONAL (kept for your frontend UX; NOT used to affect validation logic)
     SinglePending,
+
+    // helpers / utils
     categoryFromStatus,
     normEmail,
     buildReasonAndMessage,
     getFreshestFromDBs,
     replaceLatest,
     bumpUpdatedAt,
+    getUserDb, // ✅ must exist in deps (you already use deps.getUserDb in your code)
+
+    // config / state
     FRESH_DB_MS,
     stableCache,
     inflight,
+    CACHE_TTL_MS,
+
+    // validators
     validateSMTP,
     validateSMTPStable,
+
+    // credits / idempotency
     debitOneCreditIfNeeded,
     idempoGet,
+
+    // WS logging / updates
     sendLogToFrontend,
     sendStatusToFrontend,
   } = deps;
@@ -1320,24 +2953,22 @@ module.exports = function singleValidatorRouter(deps) {
     return (step, message, level = "info") => {
       try {
         const ts = new Date().toISOString();
-        // terminal log (what you wanted)
-        console.log(`[${ts}][single][${level}][${username || "na"}][${sessionId || "na"}][${E}] ${step}: ${message}`);
-      } catch (e) {
-        // ignore
-      }
-      // existing frontend log
+        console.log(
+          `[${ts}][single][${level}][${username || "na"}][${sessionId || "na"}][${E}] ${step}: ${message}`,
+        );
+      } catch (e) {}
       try {
         sendLogToFrontend(sessionId, E, message, step, level, username);
-      } catch (e) {
-        // ignore
-      }
+      } catch (e) {}
     };
   }
 
   // ────────────────────────────────────────────────────────────
-  // Pending job helpers – one row per (username, email) job
+  // SinglePending helpers (OPTIONAL)
+  // IMPORTANT: These do NOT change validation logic; only for UI tracking.
   // ────────────────────────────────────────────────────────────
   async function upsertPendingJob({ username, email, idemKey, sessionId }) {
+    if (!SinglePending) return;
     if (!username || !email) return;
     await SinglePending.findOneAndUpdate(
       { username, email },
@@ -1349,16 +2980,14 @@ module.exports = function singleValidatorRouter(deps) {
           status: "in_progress",
         },
       },
-      { upsert: true, new: true }
+      { upsert: true, new: true },
     );
   }
 
   async function markPendingDone(username, email) {
+    if (!SinglePending) return;
     if (!username || !email) return;
-    await SinglePending.updateOne(
-      { username, email },
-      { $set: { status: "done" } }
-    );
+    await SinglePending.updateOne({ username, email }, { $set: { status: "done" } });
   }
 
   // ────────────────────────────────────────────────────────────
@@ -1379,7 +3008,7 @@ module.exports = function singleValidatorRouter(deps) {
 
     const history = {};
 
-    // ----- domain / provider invalid-rate -----
+    // domain invalid-rate
     if (stats && stats.sent && stats.sent > 0) {
       const domainSamples = stats.sent;
       const domainInvalidRate =
@@ -1391,13 +3020,13 @@ module.exports = function singleValidatorRouter(deps) {
         history.domainInvalidRate = domainInvalidRate;
         history.domainSamples = domainSamples;
 
-        // Mirror to provider for now
+        // mirror to provider (your existing merge expects provider-like fields)
         history.providerInvalidRate = domainInvalidRate;
         history.providerSamples = domainSamples;
       }
     }
 
-    // ----- TrainingSample: lastLabel + counts -----
+    // TrainingSample counts
     if (ts) {
       const rawCounts = ts.labelCounts || {};
       const trainingCounts = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
@@ -1416,7 +3045,7 @@ module.exports = function singleValidatorRouter(deps) {
       }
 
       history.trainingLastLabel = ts.lastLabel || null;
-      history.trainingLabel = ts.lastLabel || null; // alias for merge helper
+      history.trainingLabel = ts.lastLabel || null; // alias used by merge helper
       history.trainingCounts = trainingCounts;
 
       const totalFromCounts =
@@ -1433,7 +3062,7 @@ module.exports = function singleValidatorRouter(deps) {
   }
 
   // ────────────────────────────────────────────────────────────
-  // Helper: build payload + send + cache + debit
+  // Helper: finalize payload + save + cache + debit + WS + respond
   // ────────────────────────────────────────────────────────────
   async function finalizeAndRespond({
     E,
@@ -1463,8 +3092,8 @@ module.exports = function singleValidatorRouter(deps) {
       typeof merged.confidence === "number"
         ? merged.confidence
         : typeof rawResult.confidence === "number"
-        ? rawResult.confidence
-        : null;
+          ? rawResult.confidence
+          : null;
 
     const built = buildReasonAndMessage(status, subStatus, {
       isDisposable: !!merged.isDisposable,
@@ -1474,10 +3103,7 @@ module.exports = function singleValidatorRouter(deps) {
 
     const domain = merged.domain || extractDomain(E);
     const provider =
-      merged.provider ||
-      merged.domainProvider ||
-      rawResult.domainProvider ||
-      "Unavailable";
+      merged.provider || merged.domainProvider || rawResult.domainProvider || "Unavailable";
 
     const payload = {
       email: E,
@@ -1492,23 +3118,18 @@ module.exports = function singleValidatorRouter(deps) {
       isDisposable: !!merged.isDisposable,
       isFree: !!merged.isFree,
       isRoleBased: !!merged.isRoleBased,
-      score:
-        typeof merged.score === "number" ? merged.score : rawResult.score ?? 0,
-      timestamp:
-        rawResult.timestamp instanceof Date ? rawResult.timestamp : new Date(),
+      score: typeof merged.score === "number" ? merged.score : rawResult.score ?? 0,
+      timestamp: rawResult.timestamp instanceof Date ? rawResult.timestamp : new Date(),
       section: "single",
     };
 
-    // persist in both global and user DBs
+    // persist in both global + user DB
     await replaceLatest(EmailLogModel, E, payload);
     await replaceLatest(UserEmailLogModel, E, payload);
 
-    // in-memory cache if needed
-    if (shouldCache) {
-      stableCache.set(E, {
-        until: Date.now() + deps.CACHE_TTL_MS,
-        result: payload,
-      });
+    // memory cache
+    if (shouldCache && stableCache) {
+      stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
     }
 
     const credits = await debitOneCreditIfNeeded(
@@ -1516,10 +3137,10 @@ module.exports = function singleValidatorRouter(deps) {
       payload.status,
       E,
       idemKey,
-      "single"
+      "single",
     );
 
-    // push to WS
+    // WS push
     sendStatusToFrontend(
       E,
       payload.status,
@@ -1539,29 +3160,18 @@ module.exports = function singleValidatorRouter(deps) {
       },
       sessionId,
       true,
-      username
+      username,
     );
 
-    return res.json({
-      ...payload,
-      via,
-      cached,
-      credits,
-    });
+    return res.json({ ...payload, via, cached, credits });
   }
 
   // ────────────────────────────────────────────────────────────
-  // 🧠 Yash logic (in your flow):
-  // 1) Bank/Healthcare or Proofpoint -> SendGrid direct
-  // 2) SMTP Unknown -> SendGrid fallback
+  // ✅ Yash validation logic helpers:
+  // 1) Bank/Healthcare OR Proofpoint => SendGrid direct
+  // 2) SMTP Unknown => SendGrid fallback
   // ────────────────────────────────────────────────────────────
-  async function maybeSendgridDirectOrNull({
-    E,
-    username,
-    sessionId,
-    idemKey,
-    res,
-  }) {
+  async function maybeSendgridDirectOrNull({ E, username, sessionId, idemKey, res }) {
     const domain = extractDomain(E);
 
     const domainClassification = classifyDomain(domain);
@@ -1578,30 +3188,26 @@ module.exports = function singleValidatorRouter(deps) {
 
     const logger = mkLogger(sessionId, E, username);
 
-    // Always resolve user DB model safely (prevents undefined UserEmailLog)
-    const { EmailLog: UserEmailLog2 } = deps.getUserDb(
+    // Resolve user DB model
+    const { EmailLog: UserEmailLog2 } = getUserDb(
       mongoose,
       EmailLog,
       RegionStat,
       DomainReputation,
-      username
+      username,
     );
 
     // Bank/Healthcare: optional domain reputation short-circuit
     if (isBankOrHealthcare) {
       const domainStats = await DomainReputation.findOne({ domain }).lean();
       if (domainStats && domainStats.sent >= 5) {
-        const bounceRate =
-          domainStats.sent > 0 ? domainStats.invalid / domainStats.sent : 0;
+        const bounceRate = domainStats.sent > 0 ? domainStats.invalid / domainStats.sent : 0;
 
-        // If high bounce rate -> risky without SendGrid
         if (bounceRate >= 0.6) {
           logger(
             "high_risk_domain",
-            `${domainCategory} domain with high bounce rate (${(bounceRate * 100).toFixed(
-              1
-            )}%) → Marked as risky`,
-            "warn"
+            `${domainCategory} domain high bounce (${(bounceRate * 100).toFixed(1)}%) → Risky`,
+            "warn",
           );
 
           const riskyPayload = {
@@ -1613,7 +3219,7 @@ module.exports = function singleValidatorRouter(deps) {
             reason: "High Bounce Domain",
             message: `This ${domainCategory} domain has a high bounce rate (${(
               bounceRate * 100
-            ).toFixed(1)}%). Sending to this address is risky.`,
+            ).toFixed(1)}%). Sending is risky.`,
             domain,
             domainProvider: domainCategory,
             isDisposable: false,
@@ -1646,7 +3252,7 @@ module.exports = function singleValidatorRouter(deps) {
             },
             sessionId,
             true,
-            username
+            username,
           );
 
           const userCredits = await debitOneCreditIfNeeded(
@@ -1654,13 +3260,15 @@ module.exports = function singleValidatorRouter(deps) {
             riskyPayload.status,
             E,
             idemKey,
-            "single"
+            "single",
           );
 
-          stableCache.set(E, {
-            until: Date.now() + deps.CACHE_TTL_MS,
-            result: riskyPayload,
-          });
+          if (stableCache) {
+            stableCache.set(E, {
+              until: Date.now() + (CACHE_TTL_MS || 0),
+              result: riskyPayload,
+            });
+          }
 
           return res.json({
             ...riskyPayload,
@@ -1673,27 +3281,22 @@ module.exports = function singleValidatorRouter(deps) {
       }
     }
 
-    // SendGrid direct
     logger(
       isBankOrHealthcare && isProofpoint
         ? "bank_healthcare_proofpoint"
         : isBankOrHealthcare
-        ? "bank_healthcare"
-        : "proofpoint",
-      `${domainCategory} domain detected → Using SendGrid verification`,
-      "info"
+          ? "bank_healthcare"
+          : "proofpoint",
+      `${domainCategory} domain detected → SendGrid direct verification`,
+      "info",
     );
 
     const sgResult = await verifySendGrid(E, { logger });
 
-    // Convert to TrueSendr format
-    const meta = {
-      domain,
-      flags: { disposable: false, free: false, role: false },
-    };
+    const meta = { domain, flags: { disposable: false, free: false, role: false } };
     const result = toTrueSendrFormat(sgResult, meta);
 
-    // Log to SendGridLog (best-effort)
+    // best-effort SendGridLog
     try {
       await SendGridLog.create({
         email: E,
@@ -1720,7 +3323,6 @@ module.exports = function singleValidatorRouter(deps) {
         rawResponse: sgResult,
       });
     } catch (e) {
-      // don't fail the flow if logging fails
       console.warn("SendGridLog create failed:", e.message);
     }
 
@@ -1730,8 +3332,8 @@ module.exports = function singleValidatorRouter(deps) {
       isBankOrHealthcare && isProofpoint
         ? "sendgrid-bank-healthcare-proofpoint"
         : isBankOrHealthcare
-        ? "sendgrid-bank-healthcare"
-        : "sendgrid-proofpoint";
+          ? "sendgrid-bank-healthcare"
+          : "sendgrid-proofpoint";
 
     return finalizeAndRespond({
       E,
@@ -1749,42 +3351,29 @@ module.exports = function singleValidatorRouter(deps) {
     });
   }
 
-  async function maybeSendgridFallbackOnUnknown({
-    E,
-    username,
-    sessionId,
-    smtpRaw,
-  }) {
-    // Only when SMTP category is unknown
+  async function maybeSendgridFallbackOnUnknown({ E, username, sessionId, smtpRaw }) {
     if (!smtpRaw) return null;
+
     const cat = smtpRaw.category || categoryFromStatus(smtpRaw.status || "");
     if (String(cat).toLowerCase() !== "unknown") return null;
 
     const logger = mkLogger(sessionId, E, username);
 
-    logger(
-      "sendgrid_fallback",
-      "SMTP returned unknown → Using SendGrid fallback verification",
-      "info"
-    );
+    logger("sendgrid_fallback", "SMTP returned unknown → SendGrid fallback", "info");
 
     const domain = extractDomain(E);
 
     try {
       const sgResult = await verifySendGrid(E, { logger });
-      const meta = {
-        domain,
-        flags: { disposable: false, free: false, role: false },
-      };
+      const meta = { domain, flags: { disposable: false, free: false, role: false } };
       const sgTrueSendrResult = toTrueSendrFormat(sgResult, meta);
 
-      // Make provider label explicit for UI/merge
       if (!sgTrueSendrResult.provider && !sgTrueSendrResult.domainProvider) {
         sgTrueSendrResult.provider = "SendGrid (fallback)";
         sgTrueSendrResult.domainProvider = "SendGrid (fallback)";
       }
 
-      // Log fallback (best-effort)
+      // best-effort fallback log
       try {
         await SendGridLog.create({
           email: E,
@@ -1816,19 +3405,17 @@ module.exports = function singleValidatorRouter(deps) {
         console.warn("SendGridLog fallback create failed:", e.message);
       }
 
-      // Return the SendGrid result to caller
       return { sgTrueSendrResult, via: "sendgrid-fallback" };
     } catch (e) {
-      logger(
-        "sendgrid_fallback_error",
-        `SendGrid fallback failed: ${e.message} - using SMTP result`,
-        "warn"
-      );
+      logger("sendgrid_fallback_error", `SendGrid fallback failed: ${e.message}`, "warn");
       return null;
     }
   }
 
+  // ────────────────────────────────────────────────────────────
   // POST /api/single/validate
+  // (sync-style: does a single live SMTP pass; applies Yash SendGrid rules)
+  // ────────────────────────────────────────────────────────────
   router.post("/validate", async (req, res) => {
     const idemKey =
       req.headers["x-idempotency-key"] ||
@@ -1840,19 +3427,17 @@ module.exports = function singleValidatorRouter(deps) {
         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
       if (!email) return res.status(400).json({ error: "Email is required" });
-      if (!username)
-        return res.status(400).json({ error: "Username is required" });
+      if (!username) return res.status(400).json({ error: "Username is required" });
 
       const E = normEmail(email);
       const logger = mkLogger(sessionId, E, username);
 
-      // credits must exist (still won't charge for Unknown)
+      // credits check (still respects idempotency)
       const user = await User.findOne({ username });
       if (!user) return res.status(404).json({ error: "User not found" });
       if (user.credits <= 0) {
         const alreadyPaid = idemKey && idempoGet(username, E, idemKey);
-        if (!alreadyPaid)
-          return res.status(400).json({ error: "You don't have credits" });
+        if (!alreadyPaid) return res.status(400).json({ error: "You don't have credits" });
       }
 
       // Freshest cache (global + user)
@@ -1863,13 +3448,12 @@ module.exports = function singleValidatorRouter(deps) {
         DomainReputation,
         EmailLog,
         username,
-        E
+        E,
       );
 
       if (cachedDb) {
         const fresh =
-          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <=
-          FRESH_DB_MS;
+          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= FRESH_DB_MS;
 
         if (fresh) {
           await bumpUpdatedAt(EmailLog, E, "single");
@@ -1887,29 +3471,26 @@ module.exports = function singleValidatorRouter(deps) {
               isFree: cachedDb.isFree,
               isRoleBased: cachedDb.isRoleBased,
               confidence: cachedDb.confidence,
-              timestamp:
-                cachedDb.timestamp || cachedDb.updatedAt || cachedDb.createdAt,
+              timestamp: cachedDb.timestamp || cachedDb.updatedAt || cachedDb.createdAt,
             },
             history,
             {
               domain: cachedDb.domain || extractDomain(E),
-              provider:
-                cachedDb.domainProvider || cachedDb.provider || "Unavailable",
-            }
+              provider: cachedDb.domainProvider || cachedDb.provider || "Unavailable",
+            },
           );
 
           const subStatus = merged.sub_status || merged.subStatus || null;
           const rawStatus = merged.status || cachedDb.status || "Unknown";
-          const rawCategory =
-            merged.category || categoryFromStatus(rawStatus || "");
+          const rawCategory = merged.category || categoryFromStatus(rawStatus || "");
           const { status, category } = normalizeStatus(rawStatus, rawCategory);
 
           const confidence =
             typeof merged.confidence === "number"
               ? merged.confidence
               : typeof cachedDb.confidence === "number"
-              ? cachedDb.confidence
-              : null;
+                ? cachedDb.confidence
+                : null;
 
           const builtCached = buildReasonAndMessage(status, subStatus, {
             isDisposable: !!merged.isDisposable,
@@ -1937,10 +3518,7 @@ module.exports = function singleValidatorRouter(deps) {
             isDisposable: !!merged.isDisposable,
             isFree: !!merged.isFree,
             isRoleBased: !!merged.isRoleBased,
-            score:
-              typeof merged.score === "number"
-                ? merged.score
-                : cachedDb.score ?? 0,
+            score: typeof merged.score === "number" ? merged.score : cachedDb.score ?? 0,
             timestamp: cachedDb.timestamp || new Date(),
             section: "single",
           };
@@ -1948,18 +3526,11 @@ module.exports = function singleValidatorRouter(deps) {
           await replaceLatest(EmailLog, E, payload);
           await replaceLatest(UserEmailLog, E, payload);
 
-          stableCache.set(E, {
-            until: Date.now() + deps.CACHE_TTL_MS,
-            result: payload,
-          });
+          if (stableCache) {
+            stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
+          }
 
-          const credits = await debitOneCreditIfNeeded(
-            username,
-            payload.status,
-            E,
-            idemKey,
-            "single"
-          );
+          const credits = await debitOneCreditIfNeeded(username, payload.status, E, idemKey, "single");
 
           sendStatusToFrontend(
             E,
@@ -1980,39 +3551,23 @@ module.exports = function singleValidatorRouter(deps) {
             },
             sessionId,
             false,
-            username
+            username,
           );
 
-          logger("db_cache", `Cache hit (fresh) → returning cached result`, "info");
+          logger("db_cache", "Cache hit (fresh) → returning cached result", "info");
 
-          return res.json({
-            ...payload,
-            via: "db-cache",
-            cached: true,
-            credits,
-          });
+          return res.json({ ...payload, via: "db-cache", cached: true, credits });
         }
       }
 
-      // ✅ Yash logic: bank/healthcare OR proofpoint => SendGrid direct
-      const direct = await maybeSendgridDirectOrNull({
-        E,
-        username,
-        sessionId,
-        idemKey,
-        res,
-      });
+      // ✅ Yash: bank/healthcare OR proofpoint => SendGrid direct
+      const direct = await maybeSendgridDirectOrNull({ E, username, sessionId, idemKey, res });
       if (direct) return direct;
 
-      // in-flight guard (per user+email)
+      // inflight guard
       const inflightKey = username ? `${username}:${E}` : E;
-
-      if (inflight.has(inflightKey)) {
-        logger(
-          "attach",
-          "Another validation is already running; skipping duplicate",
-          "info"
-        );
+      if (inflight && inflight.has(inflightKey)) {
+        logger("attach", "Another validation is already running; skipping duplicate", "info");
         return res.json({
           email: E,
           status: "⏳ In progress",
@@ -2024,14 +3579,13 @@ module.exports = function singleValidatorRouter(deps) {
 
       let resolveInflight;
       const p = new Promise((r) => (resolveInflight = r));
-      inflight.set(inflightKey, p);
+      inflight && inflight.set(inflightKey, p);
 
       try {
-        // SMTP
         logger("start", "Running SMTP validation", "info");
-        const smtpResult = await deps.validateSMTP(E, { logger });
+        const smtpResult = await validateSMTP(E, { logger });
 
-        // ✅ Yash logic: if SMTP unknown => SendGrid fallback (and prefer SG result)
+        // ✅ Yash: if SMTP unknown => SendGrid fallback
         const fb = await maybeSendgridFallbackOnUnknown({
           E,
           username,
@@ -2043,13 +3597,12 @@ module.exports = function singleValidatorRouter(deps) {
         const viaLabel = fb?.via || "smtp";
 
         const history = await buildHistoryForEmail(E);
-
-        const { EmailLog: UserEmailLog2 } = deps.getUserDb(
+        const { EmailLog: UserEmailLog2 } = getUserDb(
           mongoose,
           EmailLog,
           RegionStat,
           DomainReputation,
-          username
+          username,
         );
 
         return await finalizeAndRespond({
@@ -2067,8 +3620,10 @@ module.exports = function singleValidatorRouter(deps) {
           shouldCache: true,
         });
       } finally {
-        inflight.delete(inflightKey);
-        resolveInflight();
+        inflight && inflight.delete(inflightKey);
+        try {
+          resolveInflight && resolveInflight();
+        } catch (e) {}
       }
     } catch (err) {
       console.error("❌ /api/single/validate:", err.message);
@@ -2076,8 +3631,17 @@ module.exports = function singleValidatorRouter(deps) {
     }
   });
 
+  // ────────────────────────────────────────────────────────────
   // POST /api/single/verify-smart
+  // (your existing flow: prelim -> if unknown, background stable)
+  // Yash rules are applied:
+  //   - direct sendgrid for bank/healthcare/proofpoint BEFORE SMTP
+  //   - fallback sendgrid when SMTP says unknown
+  // ────────────────────────────────────────────────────────────
   router.post("/verify-smart", async (req, res) => {
+    let inflightKey = null;
+    let resolveInflight = null;
+
     try {
       const idemKey =
         req.headers["x-idempotency-key"] ||
@@ -2088,31 +3652,27 @@ module.exports = function singleValidatorRouter(deps) {
         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
       if (!email) return res.status(400).json({ error: "Email is required" });
-      if (!username)
-        return res.status(400).json({ error: "Username is required" });
+      if (!username) return res.status(400).json({ error: "Username is required" });
 
       const E = normEmail(email);
       const logger = mkLogger(sessionId, E, username);
 
+      // credits check (idempotency aware)
       const user = await User.findOne({ username });
       if (!user) return res.status(404).json({ error: "User not found" });
       if (user.credits <= 0) {
-        const alreadyPaid = idemKey && deps.idempoGet(username, E, idemKey);
-        if (!alreadyPaid)
-          return res.status(400).json({ error: "You don't have credits" });
+        const alreadyPaid = idemKey && idempoGet(username, E, idemKey);
+        if (!alreadyPaid) return res.status(400).json({ error: "You don't have credits" });
       }
 
+      // OPTIONAL UI pending (does not affect validation logic)
       await upsertPendingJob({ username, email: E, idemKey, sessionId });
 
-      // in-flight guard (per user+email) — set inflight EARLY to prevent double prelim runs
-      const inflightKey = username ? `${username}:${E}` : E;
+      // inflight guard EARLY
+      inflightKey = username ? `${username}:${E}` : E;
 
-      if (inflight.has(inflightKey)) {
-        logger(
-          "attach",
-          "Another verification is already running; attaching via WS",
-          "info"
-        );
+      if (inflight && inflight.has(inflightKey)) {
+        logger("attach", "Another verification is already running; attaching via WS", "info");
         return res.json({
           email: E,
           status: "⏳ In progress",
@@ -2122,21 +3682,19 @@ module.exports = function singleValidatorRouter(deps) {
         });
       }
 
-      let resolveInflight;
       const p = new Promise((r) => (resolveInflight = r));
-      inflight.set(inflightKey, p);
+      inflight && inflight.set(inflightKey, p);
 
-      // helper to cleanup inflight when we return early (cache/direct/final)
       const clearInflight = () => {
         try {
-          inflight.delete(inflightKey);
+          inflight && inflight.delete(inflightKey);
         } catch (e) {}
         try {
           resolveInflight && resolveInflight();
         } catch (e) {}
       };
 
-      // freshest (global + user)
+      // Freshest (global + user)
       const { best: cachedDb, UserEmailLog } = await getFreshestFromDBs(
         mongoose,
         EmailLog,
@@ -2144,13 +3702,12 @@ module.exports = function singleValidatorRouter(deps) {
         DomainReputation,
         EmailLog,
         username,
-        E
+        E,
       );
 
       if (cachedDb) {
         const fresh =
-          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <=
-          FRESH_DB_MS;
+          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= FRESH_DB_MS;
 
         if (fresh) {
           await bumpUpdatedAt(EmailLog, E, "single");
@@ -2168,29 +3725,26 @@ module.exports = function singleValidatorRouter(deps) {
               isFree: cachedDb.isFree,
               isRoleBased: cachedDb.isRoleBased,
               confidence: cachedDb.confidence,
-              timestamp:
-                cachedDb.timestamp || cachedDb.updatedAt || cachedDb.createdAt,
+              timestamp: cachedDb.timestamp || cachedDb.updatedAt || cachedDb.createdAt,
             },
             history,
             {
               domain: cachedDb.domain || extractDomain(E),
-              provider:
-                cachedDb.domainProvider || cachedDb.provider || "Unavailable",
-            }
+              provider: cachedDb.domainProvider || cachedDb.provider || "Unavailable",
+            },
           );
 
           const subStatus = merged.sub_status || merged.subStatus || null;
           const rawStatus = merged.status || cachedDb.status || "Unknown";
-          const rawCategory =
-            merged.category || categoryFromStatus(rawStatus || "");
+          const rawCategory = merged.category || categoryFromStatus(rawStatus || "");
           const { status, category } = normalizeStatus(rawStatus, rawCategory);
 
           const confidence =
             typeof merged.confidence === "number"
               ? merged.confidence
               : typeof cachedDb.confidence === "number"
-              ? cachedDb.confidence
-              : null;
+                ? cachedDb.confidence
+                : null;
 
           const builtCached = buildReasonAndMessage(status, subStatus, {
             isDisposable: !!merged.isDisposable,
@@ -2218,10 +3772,7 @@ module.exports = function singleValidatorRouter(deps) {
             isDisposable: !!merged.isDisposable,
             isFree: !!merged.isFree,
             isRoleBased: !!merged.isRoleBased,
-            score:
-              typeof merged.score === "number"
-                ? merged.score
-                : cachedDb.score ?? 0,
+            score: typeof merged.score === "number" ? merged.score : cachedDb.score ?? 0,
             timestamp: cachedDb.timestamp || new Date(),
             section: "single",
           };
@@ -2229,18 +3780,11 @@ module.exports = function singleValidatorRouter(deps) {
           await replaceLatest(EmailLog, E, payload);
           await replaceLatest(UserEmailLog, E, payload);
 
-          stableCache.set(E, {
-            until: Date.now() + deps.CACHE_TTL_MS,
-            result: payload,
-          });
+          if (stableCache) {
+            stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
+          }
 
-          const credits = await debitOneCreditIfNeeded(
-            username,
-            payload.status,
-            E,
-            idemKey,
-            "single"
-          );
+          const credits = await debitOneCreditIfNeeded(username, payload.status, E, idemKey, "single");
 
           sendStatusToFrontend(
             E,
@@ -2261,66 +3805,51 @@ module.exports = function singleValidatorRouter(deps) {
             },
             sessionId,
             false,
-            username
+            username,
           );
 
           await markPendingDone(username, E);
-
-          const pending = await SinglePending.findOne({
-            username,
-            email: E,
-            status: "in_progress",
-          }).lean();
-
-          const isUnknown = categoryFromStatus(payload.status) === "unknown";
-          const inProgressFlag = !!(pending && isUnknown);
-
-          logger("db_cache", `Cache hit (fresh) → returning cached result`, "info");
+          logger("db_cache", "Cache hit (fresh) → returning cached result", "info");
 
           clearInflight();
           return res.json({
             ...payload,
             via: "db-cache",
             cached: true,
-            inProgress: inProgressFlag,
+            inProgress: false,
             credits,
           });
         }
       }
 
-      // short cache?
-      const hit = stableCache.get(E);
+      // stable cache hit (if you use it)
+      const hit = stableCache ? stableCache.get(E) : null;
       if (hit && hit.until > Date.now()) {
-        const { EmailLog: UserEmailLog2 } = deps.getUserDb(
+        const { EmailLog: UserEmailLog2 } = getUserDb(
           mongoose,
           EmailLog,
           RegionStat,
           DomainReputation,
-          username
+          username,
         );
 
         const historyHit = await buildHistoryForEmail(E);
         const mergedHit = mergeSMTPWithHistory(hit.result, historyHit, {
           domain: hit.result.domain || extractDomain(E),
-          provider:
-            hit.result.provider || hit.result.domainProvider || "Unavailable",
+          provider: hit.result.provider || hit.result.domainProvider || "Unavailable",
         });
 
         const subStatusH = mergedHit.sub_status || mergedHit.subStatus || null;
         const rawStatusH = mergedHit.status || hit.result.status || "Unknown";
-        const rawCategoryH =
-          mergedHit.category || categoryFromStatus(rawStatusH || "");
-        const { status: statusH, category: categoryH } = normalizeStatus(
-          rawStatusH,
-          rawCategoryH
-        );
+        const rawCategoryH = mergedHit.category || categoryFromStatus(rawStatusH || "");
+        const { status: statusH, category: categoryH } = normalizeStatus(rawStatusH, rawCategoryH);
 
         const confidenceH =
           typeof mergedHit.confidence === "number"
             ? mergedHit.confidence
             : typeof hit.result.confidence === "number"
-            ? hit.result.confidence
-            : null;
+              ? hit.result.confidence
+              : null;
 
         const builtHit = buildReasonAndMessage(statusH, subStatusH, {
           isDisposable: !!mergedHit.isDisposable,
@@ -2328,8 +3857,7 @@ module.exports = function singleValidatorRouter(deps) {
           isFree: !!mergedHit.isFree,
         });
 
-        const domainH =
-          mergedHit.domain || hit.result.domain || extractDomain(E);
+        const domainH = mergedHit.domain || hit.result.domain || extractDomain(E);
         const providerH =
           mergedHit.provider ||
           hit.result.provider ||
@@ -2352,18 +3880,16 @@ module.exports = function singleValidatorRouter(deps) {
               isDisposable: !!mergedHit.isDisposable,
               isFree: !!mergedHit.isFree,
               isRoleBased: !!mergedHit.isRoleBased,
-              score:
-                typeof mergedHit.score === "number"
-                  ? mergedHit.score
-                  : hit.result.score ?? 0,
+              score: typeof mergedHit.score === "number" ? mergedHit.score : hit.result.score ?? 0,
               timestamp: hit.result.timestamp || new Date(),
               section: "single",
             },
             $currentDate: { updatedAt: true },
           },
-          { upsert: true, new: true }
+          { upsert: true, new: true },
         );
 
+        // keep cache updated
         stableCache.set(E, {
           until: hit.until,
           result: {
@@ -2380,13 +3906,7 @@ module.exports = function singleValidatorRouter(deps) {
           },
         });
 
-        const credits = await debitOneCreditIfNeeded(
-          username,
-          statusH,
-          E,
-          idemKey,
-          "single"
-        );
+        const credits = await debitOneCreditIfNeeded(username, statusH, E, idemKey, "single");
 
         sendStatusToFrontend(
           E,
@@ -2398,10 +3918,7 @@ module.exports = function singleValidatorRouter(deps) {
             isDisposable: !!mergedHit.isDisposable,
             isFree: !!mergedHit.isFree,
             isRoleBased: !!mergedHit.isRoleBased,
-            score:
-              typeof mergedHit.score === "number"
-                ? mergedHit.score
-                : hit.result.score ?? 0,
+            score: typeof mergedHit.score === "number" ? mergedHit.score : hit.result.score ?? 0,
             subStatus: subStatusH,
             confidence: confidenceH,
             category: categoryH,
@@ -2410,20 +3927,11 @@ module.exports = function singleValidatorRouter(deps) {
           },
           sessionId,
           false,
-          username
+          username,
         );
 
         await markPendingDone(username, E);
-
-        const pending = await SinglePending.findOne({
-          username,
-          email: E,
-          status: "in_progress",
-        }).lean();
-
-        const inProgressFlag = !!(pending && categoryH === "unknown");
-
-        logger("stable_cache", `StableCache hit → returning cached result`, "info");
+        logger("stable_cache", "StableCache hit → returning cached result", "info");
 
         clearInflight();
         return res.json({
@@ -2437,27 +3945,18 @@ module.exports = function singleValidatorRouter(deps) {
           isDisposable: !!mergedHit.isDisposable,
           isFree: !!mergedHit.isFree,
           isRoleBased: !!mergedHit.isRoleBased,
-          score:
-            typeof mergedHit.score === "number"
-              ? mergedHit.score
-              : hit.result.score ?? 0,
+          score: typeof mergedHit.score === "number" ? mergedHit.score : hit.result.score ?? 0,
           timestamp: hit.result.timestamp || new Date(),
           section: "single",
           via: "smtp-stable",
           cached: true,
-          inProgress: inProgressFlag,
+          inProgress: false,
           credits,
         });
       }
 
-      // ✅ Yash logic: bank/healthcare OR proofpoint => SendGrid direct (verify-smart too)
-      const direct = await maybeSendgridDirectOrNull({
-        E,
-        username,
-        sessionId,
-        idemKey,
-        res,
-      });
+      // ✅ Yash: direct SendGrid before SMTP (verify-smart too)
+      const direct = await maybeSendgridDirectOrNull({ E, username, sessionId, idemKey, res });
       if (direct) {
         await markPendingDone(username, E);
         clearInflight();
@@ -2468,7 +3967,7 @@ module.exports = function singleValidatorRouter(deps) {
       logger("start", "verify-smart: running prelim SMTP validation", "info");
       const prelimRawSmtp = await validateSMTP(E, { logger });
 
-      // ✅ Yash logic: if prelim unknown => SendGrid fallback; if SG gives confident status, prefer it
+      // ✅ Yash: if SMTP unknown => SendGrid fallback (prefer SG result)
       const fb = await maybeSendgridFallbackOnUnknown({
         E,
         username,
@@ -2482,27 +3981,20 @@ module.exports = function singleValidatorRouter(deps) {
       const history = await buildHistoryForEmail(E);
       const prelim = mergeSMTPWithHistory(prelimRaw, history, {
         domain: prelimRaw.domain || extractDomain(E),
-        provider:
-          prelimRaw.provider ||
-          prelimRaw.domainProvider ||
-          (fb ? "SendGrid (fallback)" : "Unavailable"),
+        provider: prelimRaw.provider || prelimRaw.domainProvider || (fb ? "SendGrid (fallback)" : "Unavailable"),
       });
 
       const subStatusP = prelim.sub_status || prelim.subStatus || null;
       const rawStatusP = prelim.status || prelimRaw.status || "Unknown";
-      const rawCategoryP =
-        prelim.category || categoryFromStatus(rawStatusP || "");
-      const { status: statusP, category: categoryP } = normalizeStatus(
-        rawStatusP,
-        rawCategoryP
-      );
+      const rawCategoryP = prelim.category || categoryFromStatus(rawStatusP || "");
+      const { status: statusP, category: categoryP } = normalizeStatus(rawStatusP, rawCategoryP);
 
       const confidenceP =
         typeof prelim.confidence === "number"
           ? prelim.confidence
           : typeof prelimRaw.confidence === "number"
-          ? prelimRaw.confidence
-          : null;
+            ? prelimRaw.confidence
+            : null;
 
       const builtPrelim = buildReasonAndMessage(statusP, subStatusP, {
         isDisposable: !!prelim.isDisposable,
@@ -2519,17 +4011,11 @@ module.exports = function singleValidatorRouter(deps) {
         reason: prelim.reason || builtPrelim.reasonLabel,
         message: prelim.message || builtPrelim.message,
         domain: prelim.domain || extractDomain(E),
-        domainProvider:
-          prelim.provider ||
-          prelim.domainProvider ||
-          (fb ? "SendGrid (fallback)" : "Unavailable"),
+        domainProvider: prelim.provider || prelim.domainProvider || (fb ? "SendGrid (fallback)" : "Unavailable"),
         isDisposable: !!prelim.isDisposable,
         isFree: !!prelim.isFree,
         isRoleBased: !!prelim.isRoleBased,
-        score:
-          typeof prelim.score === "number"
-            ? prelim.score
-            : prelimRaw.score ?? 0,
+        score: typeof prelim.score === "number" ? prelim.score : prelimRaw.score ?? 0,
         timestamp: new Date(),
         section: "single",
       };
@@ -2556,79 +4042,66 @@ module.exports = function singleValidatorRouter(deps) {
         },
         sessionId,
         true,
-        username
+        username,
       );
 
-      const credits = await debitOneCreditIfNeeded(
-        username,
-        prelimPayload.status,
-        E,
-        idemKey,
-        "single"
-      );
+      const credits = await debitOneCreditIfNeeded(username, prelimPayload.status, E, idemKey, "single");
 
       const prelimCat = categoryFromStatus(prelimPayload.status);
       if (["valid", "invalid", "risky"].includes(prelimCat)) {
-        stableCache.set(E, {
-          until: Date.now() + deps.CACHE_TTL_MS,
-          result: prelimPayload,
-        });
-
+        if (stableCache) {
+          stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: prelimPayload });
+        }
         await markPendingDone(username, E);
 
         logger("final", `verify-smart resolved at prelim stage (${prelimCat})`, "info");
 
         clearInflight();
-        return res.json({
-          ...prelimPayload,
-          via: prelimVia,
-          inProgress: false,
-          credits,
-        });
+        return res.json({ ...prelimPayload, via: prelimVia, inProgress: false, credits });
       }
 
       // Unknown → background stabilization
-      await SinglePending.findOneAndUpdate(
-        { username, email: E },
-        { username, email: E, idemKey, sessionId, status: "in_progress" },
-        { upsert: true, new: true }
-      );
+      await upsertPendingJob({ username, email: E, idemKey, sessionId });
 
       // respond immediately (existing behavior)
-      res.json({
-        ...prelimPayload,
-        via: prelimVia,
-        inProgress: true,
-        credits,
-      });
+      res.json({ ...prelimPayload, via: prelimVia, inProgress: true, credits });
 
-      // keep inflight until background finishes (so later calls attach instead of starting new runs)
+      // keep inflight until background finishes
       (async () => {
         try {
-          // 2) FINAL SMTP-STABLE
           logger("stabilize_start", "Running SMTP-stable (background)", "info");
           const finalRaw = await validateSMTPStable(E, { logger });
+
+          // OPTIONAL: apply Yash fallback again if stable also unknown
+          const fb2 = await maybeSendgridFallbackOnUnknown({
+            E,
+            username,
+            sessionId,
+            smtpRaw: finalRaw,
+          });
+
+          const rawToUse = fb2?.sgTrueSendrResult || finalRaw;
+
           const historyFinal = await buildHistoryForEmail(E);
-          const final = mergeSMTPWithHistory(finalRaw, historyFinal, {
-            domain: finalRaw.domain || extractDomain(E),
-            provider: finalRaw.provider || "Unavailable",
+          const final = mergeSMTPWithHistory(rawToUse, historyFinal, {
+            domain: rawToUse.domain || extractDomain(E),
+            provider:
+              rawToUse.provider ||
+              rawToUse.domainProvider ||
+              (fb2 ? "SendGrid (fallback)" : "Unavailable"),
           });
 
           const subStatusF = final.sub_status || final.subStatus || null;
-          const rawStatusF = final.status || finalRaw.status || "Unknown";
-          const rawCategoryF =
-            final.category || categoryFromStatus(rawStatusF || "");
-          const { status: statusF, category: categoryF } = normalizeStatus(
-            rawStatusF,
-            rawCategoryF
-          );
+          const rawStatusF = final.status || rawToUse.status || "Unknown";
+          const rawCategoryF = final.category || categoryFromStatus(rawStatusF || "");
+          const { status: statusF, category: categoryF } = normalizeStatus(rawStatusF, rawCategoryF);
 
           const confidenceF =
             typeof final.confidence === "number"
               ? final.confidence
-              : typeof finalRaw.confidence === "number"
-              ? finalRaw.confidence
-              : null;
+              : typeof rawToUse.confidence === "number"
+                ? rawToUse.confidence
+                : null;
 
           const builtFinal = buildReasonAndMessage(statusF, subStatusF, {
             isDisposable: !!final.isDisposable,
@@ -2646,14 +4119,14 @@ module.exports = function singleValidatorRouter(deps) {
             message: final.message || builtFinal.message,
             domain: final.domain || prelimPayload.domain,
             domainProvider:
-              final.provider || prelimPayload.domainProvider || "Unavailable",
+              final.provider ||
+              final.domainProvider ||
+              prelimPayload.domainProvider ||
+              "Unavailable",
             isDisposable: !!final.isDisposable,
             isFree: !!final.isFree,
             isRoleBased: !!final.isRoleBased,
-            score:
-              typeof final.score === "number"
-                ? final.score
-                : prelimPayload.score ?? 0,
+            score: typeof final.score === "number" ? final.score : prelimPayload.score ?? 0,
             timestamp: new Date(),
             section: "single",
           };
@@ -2661,11 +4134,8 @@ module.exports = function singleValidatorRouter(deps) {
           await replaceLatest(EmailLog, E, finalPayload);
           await replaceLatest(UserEmailLog, E, finalPayload);
 
-          if (/Valid|Invalid|Risky/i.test(finalPayload.status)) {
-            stableCache.set(E, {
-              until: Date.now() + deps.CACHE_TTL_MS,
-              result: finalPayload,
-            });
+          if (stableCache && /Valid|Invalid|Risky/i.test(finalPayload.status)) {
+            stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: finalPayload });
           }
 
           sendStatusToFrontend(
@@ -2687,7 +4157,7 @@ module.exports = function singleValidatorRouter(deps) {
             },
             sessionId,
             true,
-            username
+            username,
           );
 
           logger("stabilize_done", `SMTP-stable finished → ${finalPayload.status}`, "info");
@@ -2695,35 +4165,46 @@ module.exports = function singleValidatorRouter(deps) {
           logger("stabilize_error", `SMTP-stable failed: ${e.message}`, "warn");
         } finally {
           await markPendingDone(username, E);
-          clearInflight();
+          try {
+            inflight && inflight.delete(inflightKey);
+          } catch (e) {}
+          try {
+            resolveInflight && resolveInflight();
+          } catch (e) {}
         }
       })();
     } catch (err) {
       console.error("❌ /api/single/verify-smart:", err.message);
+      try {
+        if (inflight && inflightKey) inflight.delete(inflightKey);
+      } catch (e) {}
+      try {
+        resolveInflight && resolveInflight();
+      } catch (e) {}
       return res.status(500).json({ error: err.message });
     }
   });
 
-  // POST /api/single/clear-history
+  // ────────────────────────────────────────────────────────────
+  // POST /api/single/clear-history (unchanged)
+  // ────────────────────────────────────────────────────────────
   router.post("/clear-history", async (req, res) => {
     try {
-      const { username } =
-        typeof req.body === "string" ? JSON.parse(req.body) : req.body;
-      if (!username)
-        return res
-          .status(400)
-          .json({ success: false, error: "Username required" });
+      const { username } = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      if (!username) {
+        return res.status(400).json({ success: false, error: "Username required" });
+      }
 
       const now = new Date();
       const updatedUser = await User.findOneAndUpdate(
         { username },
         { singleTimestamp: now },
-        { new: true }
+        { new: true },
       );
-      if (!updatedUser)
-        return res
-          .status(404)
-          .json({ success: false, error: "User not found" });
+
+      if (!updatedUser) {
+        return res.status(404).json({ success: false, error: "User not found" });
+      }
 
       res.json({
         success: true,
@@ -2736,21 +4217,17 @@ module.exports = function singleValidatorRouter(deps) {
     }
   });
 
-  // POST /api/single/pending
+  // ────────────────────────────────────────────────────────────
+  // POST /api/single/pending (kept for your frontend; safe if SinglePending not provided)
+  // ────────────────────────────────────────────────────────────
   router.post("/pending", async (req, res) => {
     try {
-      const { username } =
-        typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const { username } = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      if (!username) return res.status(400).json({ ok: false, error: "Username is required" });
 
-      if (!username)
-        return res
-          .status(400)
-          .json({ ok: false, error: "Username is required" });
+      if (!SinglePending) return res.json({ ok: true, pendings: [] });
 
-      const pendings = await SinglePending.find({
-        username,
-        status: "in_progress",
-      })
+      const pendings = await SinglePending.find({ username, status: "in_progress" })
         .sort({ createdAt: -1 })
         .lean();
 
@@ -2761,34 +4238,31 @@ module.exports = function singleValidatorRouter(deps) {
     }
   });
 
-  // POST /api/single/history
+  // ────────────────────────────────────────────────────────────
+  // POST /api/single/history (kept as your existing flow)
+  // ────────────────────────────────────────────────────────────
   router.post("/history", async (req, res) => {
     try {
-      const {
-        username,
-        limit: rawLimit = 50,
-        pageSize,
-      } = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const { username, limit: rawLimit = 50, pageSize } =
+        typeof req.body === "string" ? JSON.parse(req.body) : req.body;
 
-      if (!username)
-        return res
-          .status(400)
-          .json({ success: false, error: "Username is required" });
+      if (!username) {
+        return res.status(400).json({ success: false, error: "Username is required" });
+      }
 
       const user = await User.findOne({ username });
-      if (!user)
-        return res
-          .status(404)
-          .json({ success: false, error: "User not found" });
+      if (!user) {
+        return res.status(404).json({ success: false, error: "User not found" });
+      }
 
       const limit = rawLimit || pageSize || 50;
 
-      const { EmailLog: UserEmailLog } = deps.getUserDb(
+      const { EmailLog: UserEmailLog } = getUserDb(
         mongoose,
         EmailLog,
         RegionStat,
         DomainReputation,
-        username
+        username,
       );
 
       const query = { section: "single" };
@@ -2808,18 +4282,19 @@ module.exports = function singleValidatorRouter(deps) {
         .sort({ updatedAt: -1, createdAt: -1 })
         .limit(limit * 2);
 
-      const pendings = await SinglePending.find({
-        username,
-        status: "in_progress",
-      })
-        .select("email")
-        .lean();
+      // filter out pending in_progress if model exists
+      let inProgressSet = new Set();
+      if (SinglePending) {
+        const pendings = await SinglePending.find({ username, status: "in_progress" })
+          .select("email")
+          .lean();
 
-      const inProgressSet = new Set(
-        pendings
-          .map((p) => (p && p.email ? normEmail(p.email) : null))
-          .filter(Boolean)
-      );
+        inProgressSet = new Set(
+          pendings
+            .map((p) => (p && p.email ? normEmail(p.email) : null))
+            .filter(Boolean),
+        );
+      }
 
       validations = validations.filter((v) => {
         const e = normEmail(v.email);
@@ -2835,15 +4310,12 @@ module.exports = function singleValidatorRouter(deps) {
       });
 
       const formatted = validations.slice(0, limit).map((v) => {
-        const built = buildReasonAndMessage(
-          v.status || "",
-          v.subStatus || null,
-          {
-            isDisposable: !!v.isDisposable,
-            isRoleBased: !!v.isRoleBased,
-            isFree: !!v.isFree,
-          }
-        );
+        const built = buildReasonAndMessage(v.status || "", v.subStatus || null, {
+          isDisposable: !!v.isDisposable,
+          isRoleBased: !!v.isRoleBased,
+          isFree: !!v.isFree,
+        });
+
         return {
           id: v._id,
           email: v.email,
@@ -2857,12 +4329,7 @@ module.exports = function singleValidatorRouter(deps) {
           isFree: !!v.isFree,
           isRoleBased: !!v.isRoleBased,
           score: v.score != null ? v.score : 0,
-          timestamp: (
-            v.updatedAt ||
-            v.createdAt ||
-            v.timestamp ||
-            null
-          )?.toISOString(),
+          timestamp: (v.updatedAt || v.createdAt || v.timestamp || null)?.toISOString(),
           message: v.message || built.message,
         };
       });
