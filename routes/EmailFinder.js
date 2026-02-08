@@ -905,7 +905,6 @@
 
 
 
-
 // routes/EmailFinder.js
 const express = require("express");
 const mongoose = require("mongoose");
@@ -1076,7 +1075,9 @@ function deriveConfidence(vr = {}) {
     vr.isCatchAll === true ||
     /catch[- ]?all/i.test(reason) ||
     String(vr.category_detail || "").toLowerCase() === "accept_all" ||
-    String(vr.subStatus || vr.sub_status || "").toLowerCase().includes("catch");
+    String(vr.subStatus || vr.sub_status || "")
+      .toLowerCase()
+      .includes("catch");
 
   const smtpYes =
     vr.smtpAccepted === true ||
@@ -1365,10 +1366,9 @@ function makeCandidatesWithPriorityParts(domain, nameParts, preferredCodes = [])
    ACCURATE VALIDATION (bulk-like decisioning) for ONE candidate
    - Keeps Finder "success = Valid only"
    - Adds: proofpoint/bank-healthcare sendgrid + training/domain merge
-   - Speed: does parallel DB reads (history) and avoids extra passes
 ─────────────────────────────────────────────────────────────── */
 
-const FRESH_DB_MS = Number(process.env.FRESH_DB_MS || 15 * 24 * 60 * 60 * 1000); // 15 days default
+const FRESH_DB_MS = Number(process.env.FRESH_DB_MS || 15 * 24 * 60 * 60 * 1000); // not used in this file currently but kept
 const FINDER_CONCURRENCY = Number(process.env.FINDER_CONCURRENCY || 8);
 
 async function validateCandidateAccurate({
@@ -1520,8 +1520,14 @@ async function validateCandidateAccurate({
       const sgResult = await verifySendGrid(E, { logger });
       const elapsed = Date.now() - t0;
 
-      const metaSg = { domain, flags: { disposable: false, free: false, role: false } };
+      const metaSg = {
+        domain,
+        flags: { disposable: false, free: false, role: false },
+      };
       const result = toTrueSendrFormat(sgResult, metaSg);
+
+      // ✅ Provider label for Proofpoint/Bank path
+      result.provider = `${domainCategory} (via SendGrid)`;
 
       // best-effort log
       try {
@@ -1555,7 +1561,7 @@ async function validateCandidateAccurate({
         logger("sendgrid_log_error", logErr.message, "warn");
       }
 
-      const out = await finalize(result, domainCategory);
+      const out = await finalize(result, result.provider);
       return { ok: isDeliverable(out), out, source: "Live" };
     } catch (sgErr) {
       logger("sendgrid_error", sgErr.message, "warn");
@@ -1572,6 +1578,7 @@ async function validateCandidateAccurate({
 
     // If prelim says unknown → try SendGrid fallback (bulk behavior)
     const prelimCat = prelimRaw.category || categoryFromStatus(prelimRaw.status);
+
     if (String(prelimCat).toLowerCase() === "unknown") {
       try {
         logger(
@@ -1580,12 +1587,20 @@ async function validateCandidateAccurate({
           "warn",
         );
 
+        const smtpProviderLabel = prelimRaw?.provider || "Unknown Provider";
+
         const t0 = Date.now();
         const sgResult = await verifySendGrid(E, { logger });
         const elapsed = Date.now() - t0;
 
-        const metaSg = { domain, flags: { disposable: false, free: false, role: false } };
+        const metaSg = {
+          domain,
+          flags: { disposable: false, free: false, role: false },
+        };
         const sgTrueSendrResult = toTrueSendrFormat(sgResult, metaSg);
+
+        // ✅ FIX: provider must reflect SMTP provider in fallback path (NOT proofpoint)
+        sgTrueSendrResult.provider = `${smtpProviderLabel} (via SendGrid)`;
 
         // best-effort log
         try {
@@ -1605,7 +1620,7 @@ async function validateCandidateAccurate({
             isFallback: true,
             smtpCategory: prelimRaw.category,
             smtpSubStatus: prelimRaw.sub_status,
-            provider: prelimRaw.provider || "SMTP unknown fallback",
+            provider: sgTrueSendrResult.provider,
             elapsed_ms: sgResult.elapsed_ms,
             error: sgResult.error,
             username,
@@ -1621,10 +1636,7 @@ async function validateCandidateAccurate({
           logger("sendgrid_log_error", logErr.message, "warn");
         }
 
-        const out = await finalize(
-          sgTrueSendrResult,
-          sgTrueSendrResult.provider || "SendGrid (fallback)",
-        );
+        const out = await finalize(sgTrueSendrResult, sgTrueSendrResult.provider);
         return { ok: isDeliverable(out), out, source: "Live" };
       } catch (e) {
         logger("sendgrid_fallback_error", e.message, "warn");
@@ -1635,7 +1647,8 @@ async function validateCandidateAccurate({
     const prelimOut = await finalize(
       {
         ...prelimRaw,
-        category: prelimRaw.category || categoryFromStatus(prelimRaw.status || ""),
+        category:
+          prelimRaw.category || categoryFromStatus(prelimRaw.status || ""),
       },
       prelimRaw.provider || "Unavailable",
     );
@@ -1650,7 +1663,9 @@ async function validateCandidateAccurate({
       trainingTag: "finder",
     });
 
-    const stableCat = stableRaw.category || categoryFromStatus(stableRaw.status);
+    const stableCat =
+      stableRaw.category || categoryFromStatus(stableRaw.status);
+
     if (String(stableCat).toLowerCase() === "unknown") {
       // stable unknown → try SendGrid fallback (bulk behavior)
       try {
@@ -1660,12 +1675,20 @@ async function validateCandidateAccurate({
           "warn",
         );
 
+        const smtpProviderLabel = stableRaw?.provider || "Unknown Provider";
+
         const t0 = Date.now();
         const sgResult = await verifySendGrid(E, { logger });
         const elapsed = Date.now() - t0;
 
-        const metaSg = { domain, flags: { disposable: false, free: false, role: false } };
+        const metaSg = {
+          domain,
+          flags: { disposable: false, free: false, role: false },
+        };
         const sgTrueSendrResult = toTrueSendrFormat(sgResult, metaSg);
+
+        // ✅ FIX: provider must reflect SMTP provider in fallback path
+        sgTrueSendrResult.provider = `${smtpProviderLabel} (via SendGrid)`;
 
         // best-effort log
         try {
@@ -1685,7 +1708,7 @@ async function validateCandidateAccurate({
             isFallback: true,
             smtpCategory: stableRaw.category,
             smtpSubStatus: stableRaw.sub_status,
-            provider: stableRaw.provider || "SMTP stable unknown fallback",
+            provider: sgTrueSendrResult.provider,
             elapsed_ms: sgResult.elapsed_ms,
             error: sgResult.error,
             username,
@@ -1701,10 +1724,7 @@ async function validateCandidateAccurate({
           logger("sendgrid_log_error", logErr.message, "warn");
         }
 
-        const out = await finalize(
-          sgTrueSendrResult,
-          sgTrueSendrResult.provider || "SendGrid (stable fallback)",
-        );
+        const out = await finalize(sgTrueSendrResult, sgTrueSendrResult.provider);
         return { ok: isDeliverable(out), out, source: "Live" };
       } catch (e) {
         logger("sendgrid_stable_fallback_error", e.message, "warn");
@@ -1744,8 +1764,6 @@ async function validateCandidateAccurate({
 
 /* ───────────────────────────────────────────────────────────────
    FIND deliverable among candidates (same "first valid wins")
-   - same chunking behavior
-   - uses bulk-like logic per candidate
 ─────────────────────────────────────────────────────────────── */
 
 async function findDeliverableParallelEnhanced(
@@ -1779,7 +1797,7 @@ async function findDeliverableParallelEnhanced(
 
     const deliverables = results.filter((r) => r.ok);
     if (deliverables.length) {
-      // pick earliest in the original candidate order (same as current behavior)
+      // pick earliest in the original candidate order
       let best = deliverables[0];
       let bestIdx = candidates.findIndex((c) => c.email === best.email);
 
@@ -1793,7 +1811,7 @@ async function findDeliverableParallelEnhanced(
 
       return {
         email: best.email,
-        final: best.out, // ✅ merged, bulk-like final object
+        final: best.out, // ✅ merged final object
         code: best.code,
         index: bestIdx,
       };
@@ -2243,7 +2261,7 @@ module.exports = function EmailFinderRouter() {
 
   /* ───────────────────────────── HISTORY ─────────────────────────────
      GET /api/finder/history?limit=50
-  ───────────────────────────────────────────────────────────────────── */
+  ──────────────────────────────────────────────────────────────── */
   router.get("/history", requireAuth, async (req, res) => {
     try {
       const tenant = req.tenant;
