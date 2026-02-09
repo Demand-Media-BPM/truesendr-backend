@@ -27,8 +27,8 @@ async function isProofpointDomain(domain) {
     const records = await dns.resolveMx(domain);
     const mxHosts = records.map(r => r.exchange.toLowerCase()).join(',');
     
-    // Check for Proofpoint MX patterns
-    return /pphosted\.com|proofpoint\.com/i.test(mxHosts);
+    // Check for Proofpoint MX patterns (including Proofpoint Essentials)
+    return /pphosted\.com|ppe-hosted\.com|proofpoint\.com/i.test(mxHosts);
   } catch {
     return false;
   }

@@ -1994,7 +1994,7 @@ const rolePrefixes      = new Set([
 const GATEWAY_PATTERNS = {
   mimecast:        /(^|\.)mimecast\.com$/i,
   mimecast_alt:    /(^|\.)mcsv\.net$/i,
-  proofpoint:      /(^|\.)pphosted\.com$/i,
+  proofpoint:      /(^|\.)(pphosted\.com|ppe-hosted\.com|proofpoint\.com)$/i,
   barracuda:       /(^|\.)barracudanetworks\.com$/i,
   ironport:        /(^|\.)iphmx\.com$/i,
   topsec:          /(^|\.)topsec\.com$/i,
@@ -2014,7 +2014,7 @@ function matchGateway(host) {
 // “Trusted enterprise gateway” flavour: Proofpoint, Mimecast etc.
 function detectTrustedGateway(mxHost, provider, gatewayName) {
   const blob = `${mxHost || ''} ${provider || ''} ${gatewayName || ''}`.toLowerCase();
-  if (blob.includes('pphosted.com') || blob.includes('proofpoint')) return 'proofpoint';
+  if (blob.includes('pphosted.com') || blob.includes('ppe-hosted.com') || blob.includes('proofpoint')) return 'proofpoint';
   if (blob.includes('mimecast')) return 'mimecast';
   if (blob.includes('barracuda')) return 'barracuda';
   return null;
@@ -2083,7 +2083,7 @@ const TRAINING_TTL_MS = +process.env.TRAINING_TTL_MS || 10 * 60 * 1000;
 function mxToProvider(mxCsv) {
   const s = (mxCsv || '').toLowerCase();
   if (s.includes('mimecast.com')) return 'Mimecast Secure Email Gateway';
-  if (s.includes('pphosted.com') || s.includes('proofpoint.com'))
+  if (s.includes('pphosted.com') || s.includes('ppe-hosted.com') || s.includes('proofpoint.com'))
     return 'Proofpoint Email Protection';
   if (s.includes('barracudanetworks.com')) return 'Barracuda Email Security Gateway';
   if (s.includes('google.com')) return 'Gmail / Google Workspace';
