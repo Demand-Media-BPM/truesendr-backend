@@ -2,7 +2,6 @@ require("dotenv").config();
 const ENV = require("./config/env");
 ENV.assertProdRequired();
 
-
 const express = require("express");
 const bodyParser = require("body-parser");
 const cors = require("cors");
@@ -40,7 +39,6 @@ const PORT = ENV.PORTSERVER;
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-
 const allowedSet = new Set((ENV.ALLOWED_ORIGINS || []).map((s) => s.trim()));
 
 app.use((req, res, next) => {
@@ -53,7 +51,7 @@ app.use((req, res, next) => {
   res.header(
     "Access-Control-Allow-Headers",
     reqHeaders ||
-      "Content-Type, Authorization, X-User, X-Idempotency-Key, Cache-Control, Pragma, If-Modified-Since, ngrok-skip-browser-warning, X-Requested-With"
+      "Content-Type, Authorization, X-User, X-Idempotency-Key, Cache-Control, Pragma, If-Modified-Since, ngrok-skip-browser-warning, X-Requested-With",
   );
   res.header("Access-Control-Max-Age", "86400");
 
@@ -79,7 +77,6 @@ app.use((req, res, next) => {
   return res.status(403).json({ error: "CORS blocked for this origin" });
 });
 
-
 // ─────────────────────────────────────────────────────────────────────────────
 const stableCache = new Map(); // short-lived results for single validation
 const inflight = new Map(); // de-dupe concurrent validations per email
@@ -91,10 +88,8 @@ const idempoStore = new Map();
 const FRESH_DB_MS = 2 * 24 * 60 * 60 * 1000; // 48h
 const cancelMap = new Map();
 
-
 const REQUIRE_AUTH = ENV.REQUIRE_AUTH;
 const BULK_REQUIRE_AUTH = ENV.BULK_REQUIRE_AUTH;
-
 
 /* ─────────────────────────────────────────────────────────────────────────────
    ✅ CORS — simple, permissive, and applied EARLY to every route
@@ -147,7 +142,7 @@ app.use((req, res, next) => {
   ) {
     res.setHeader(
       "Cache-Control",
-      "no-store, no-cache, must-revalidate, proxy-revalidate"
+      "no-store, no-cache, must-revalidate, proxy-revalidate",
     );
     res.setHeader("Pragma", "no-cache");
     res.setHeader("Expires", "0");
@@ -160,7 +155,7 @@ app.use((req, res, next) => {
 app.use(
   helmet({
     crossOriginResourcePolicy: { policy: "cross-origin" },
-  })
+  }),
 );
 app.use(compression());
 app.use((req, res, next) => {
@@ -264,7 +259,7 @@ wss.on("connection", (ws, req) => {
       addUserSocket(user, ws);
     }
 
-    if (sid && user) sessionClients.set(`${user}:${sid}`, ws);
+    if (sid && user) sessionClients.set(`${normUserKey(user)}:${sid}`, ws);
     else if (sid) sessionClients.set(sid, ws);
   } catch {}
 
@@ -283,8 +278,10 @@ wss.on("connection", (ws, req) => {
         }
       }
 
+      // if (data.sessionId && userField)
+      //   sessionClients.set(`${userField}:${data.sessionId}`, ws);
       if (data.sessionId && userField)
-        sessionClients.set(`${userField}:${data.sessionId}`, ws);
+        sessionClients.set(`${normUserKey(userField)}:${data.sessionId}`, ws);
       else if (data.sessionId) sessionClients.set(data.sessionId, ws);
     } catch {}
   });
@@ -300,7 +297,9 @@ wss.on("connection", (ws, req) => {
   });
 });
 
-function heartbeat() { this.isAlive = true; }
+function heartbeat() {
+  this.isAlive = true;
+}
 
 wss.on("connection", (ws, req) => {
   ws.isAlive = true;
@@ -311,12 +310,13 @@ const interval = setInterval(() => {
   wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
-    try { ws.ping(); } catch {}
+    try {
+      ws.ping();
+    } catch {}
   });
 }, 25000);
 
 wss.on("close", () => clearInterval(interval));
-
 
 /* ✅ NEW: realtime deliverability broadcaster
    - routes/deliverability.js will call this when DB updates happen
@@ -344,7 +344,7 @@ function sendProgressToFrontend(
   total,
   sessionId = null,
   username = null,
-  bulkId = null
+  bulkId = null,
 ) {
   if (!sessionId || !username) return;
   const sessKey = `${username}:${sessionId}`;
@@ -372,7 +372,7 @@ function sendLogToFrontend(
   message,
   step = null,
   level = "info",
-  username = null
+  username = null,
 ) {
   const payload = JSON.stringify({
     type: "log",
@@ -398,11 +398,13 @@ function sendStatusToFrontend(
   sessionId = null,
   _persist = true,
   username = null,
-  section = null
+  section = null,
 ) {
   const payload = JSON.stringify({
     type: "status",
-    section: section || details?.section || null, // ✅ add
+    section: section || details?.section || null,
+    sessionId: sessionId || null, // ✅ add
+    username: username ? normUserKey(username) : null, // ✅ add normalized
     email,
     status,
     timestamp,
@@ -419,12 +421,26 @@ function sendStatusToFrontend(
     message: details?.message || "",
     reason: details?.reason || "",
   });
+
+  const u = username ? normUserKey(username) : null;
+
   const ws =
-    (username && sessionClients.get(`${username}:${sessionId}`)) ||
-    sessionClients.get(sessionId);
-  if (ws?.readyState === WebSocket.OPEN) ws.send(payload);
-  else
-    clients.forEach((c) => c.readyState === WebSocket.OPEN && c.send(payload));
+    (u && sessionId && sessionClients.get(`${u}:${sessionId}`)) ||
+    (sessionId && sessionClients.get(sessionId));
+
+  // ✅ IMPORTANT: do NOT broadcast single/bulk statuses to everyone
+  if (ws?.readyState === WebSocket.OPEN) {
+    ws.send(payload);
+    return;
+  }
+
+  // optional: just log so you can see mismatches instead of leaking to other users
+  console.warn("[WS][status] No target socket found", {
+    u,
+    sessionId,
+    email,
+    section,
+  });
 }
 
 function sendBulkStatsToFrontend(sessionId, username, payload) {
@@ -457,7 +473,7 @@ mongoose
       regionStats = regions.map(
         (r) =>
           existing.find((e) => e.region === r) ||
-          new RegionStat({ region: r, sent: 0, bounces: 0 })
+          new RegionStat({ region: r, sent: 0, bounces: 0 }),
       );
     }
   })
@@ -486,7 +502,7 @@ async function incrementStat(region, type) {
   await RegionStat.updateOne(
     { region },
     { $inc: { [type]: 1 } },
-    { upsert: true }
+    { upsert: true },
   );
 }
 
@@ -502,7 +518,7 @@ function getSesClient(region) {
       new SESClient({
         region,
         credentials: { accessKeyId, secretAccessKey },
-      })
+      }),
     );
   }
   return sesClients.get(region);
@@ -592,7 +608,7 @@ async function debitOneCreditIfNeeded(
   status,
   email = null,
   idemKey = null,
-  mode = null // pass "single" from singleValidator.js (already done)
+  mode = null, // pass "single" from singleValidator.js (already done)
 ) {
   const cat = categoryFromStatus(status);
 
@@ -613,7 +629,7 @@ async function debitOneCreditIfNeeded(
               RegionStat,
               DomainReputation,
               username,
-              { mode: "single", counts: { unknown: 1, requests: 1 } }
+              { mode: "single", counts: { unknown: 1, requests: 1 } },
             );
           } catch (e) {
             console.warn("dashstat (single unknown) inc failed:", e.message);
@@ -629,7 +645,7 @@ async function debitOneCreditIfNeeded(
             RegionStat,
             DomainReputation,
             username,
-            { mode: "single", counts: { unknown: 1, requests: 1 } }
+            { mode: "single", counts: { unknown: 1, requests: 1 } },
           );
         } catch (e) {
           console.warn("dashstat (single unknown) inc failed:", e.message);
@@ -648,7 +664,7 @@ async function debitOneCreditIfNeeded(
   const updated = await User.findOneAndUpdate(
     { username },
     { $inc: { credits: -1 } },
-    { new: true }
+    { new: true },
   );
   const creditsAfter = updated?.credits ?? null;
   if (idemKey && email) idempoSet(username, email, idemKey, creditsAfter);
@@ -662,7 +678,7 @@ async function debitOneCreditIfNeeded(
         RegionStat,
         DomainReputation,
         username,
-        { mode: "single", counts: { [cat]: 1, requests: 1 } }
+        { mode: "single", counts: { [cat]: 1, requests: 1 } },
       );
     } catch (e) {
       console.warn("dashstat (single billable) inc failed:", e.message);
@@ -755,7 +771,6 @@ const TrainingRouter = require("./routes/training")(routeDeps);
 const SendGridWebhookRouter = require("./routes/sendgridWebhook")(routeDeps);
 app.use("/api/sendgrid", SendGridWebhookRouter);
 
-
 app.use("/api/single", singleValidatorRouter);
 app.use("/api/bulk", bulkValidatorRouter);
 app.use("/api/dashboard", dashboardRouter);
@@ -786,7 +801,7 @@ app.get("/stats", async (req, res) => {
       EmailLog,
       RegionStat,
       DomainReputation,
-      username
+      username,
     );
 
     const total = await UserEmailLog.countDocuments();
@@ -849,17 +864,17 @@ app.post("/send-email", auth, async (req, res) => {
             isDisposable: disposableDomains.includes(domain),
             isFree: freeEmailProviders.includes(domain),
             isRoleBased: roleBasedEmails.includes(
-              (email.split("@")[0] || "").toLowerCase()
+              (email.split("@")[0] || "").toLowerCase(),
             ),
           },
-          sessionId
+          sessionId,
         );
         logger(
           "reputation",
           `Blocked by domain reputation (bounceRate=${(
             bounceRate * 100
           ).toFixed(1)}%)`,
-          "warn"
+          "warn",
         );
         return res
           .status(200)
@@ -888,7 +903,7 @@ app.post("/send-email", auth, async (req, res) => {
             isFree: cached.isFree,
             isRoleBased: cached.isRoleBased,
           },
-          sessionId
+          sessionId,
         );
         logger("cache", `Reused cached result: ${cached.status}`);
         return res.json({ success: true, cached: true });
@@ -902,7 +917,7 @@ app.post("/send-email", auth, async (req, res) => {
       "smtp_result",
       `SMTP pre-check: ${smtpResult.category} (${
         smtpResult.sub_status || "n/a"
-      })`
+      })`,
     );
 
     if (smtpResult.category === "invalid") {
@@ -918,7 +933,7 @@ app.post("/send-email", auth, async (req, res) => {
           isFree: smtpResult.isFree,
           isRoleBased: smtpResult.isRoleBased,
         },
-        sessionId
+        sessionId,
       );
       logger("done", "Pre-check says undeliverable → not sending");
       return res.status(200).json({ skipped: true, reason: "SMTP invalid" });
@@ -939,7 +954,7 @@ app.post("/send-email", auth, async (req, res) => {
             isFree: smtpResult.isFree,
             isRoleBased: smtpResult.isRoleBased,
           },
-          sessionId
+          sessionId,
         );
         logger("done", "Pre-check risky & previously tried → not sending");
         return res
@@ -949,7 +964,7 @@ app.post("/send-email", auth, async (req, res) => {
       logger(
         "info",
         "Pre-check risky but first time → sending once via SES (one-shot)",
-        "warn"
+        "warn",
       );
     }
 
