@@ -397,10 +397,12 @@ function sendStatusToFrontend(
   details,
   sessionId = null,
   _persist = true,
-  username = null
+  username = null,
+  section = null
 ) {
   const payload = JSON.stringify({
     type: "status",
+    section: section || details?.section || null, // ✅ add
     email,
     status,
     timestamp,

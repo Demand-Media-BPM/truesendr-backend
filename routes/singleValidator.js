@@ -3161,6 +3161,7 @@ module.exports = function singleValidatorRouter(deps) {
       sessionId,
       true,
       username,
+      "single"
     );
 
     return res.json({ ...payload, via, cached, credits });
@@ -3253,6 +3254,7 @@ module.exports = function singleValidatorRouter(deps) {
             sessionId,
             true,
             username,
+            "single"
           );
 
           const userCredits = await debitOneCreditIfNeeded(
@@ -3552,6 +3554,7 @@ module.exports = function singleValidatorRouter(deps) {
             sessionId,
             false,
             username,
+            "single"
           );
 
           logger("db_cache", "Cache hit (fresh) → returning cached result", "info");
@@ -3806,6 +3809,7 @@ module.exports = function singleValidatorRouter(deps) {
             sessionId,
             false,
             username,
+            "single"
           );
 
           await markPendingDone(username, E);
@@ -3928,6 +3932,7 @@ module.exports = function singleValidatorRouter(deps) {
           sessionId,
           false,
           username,
+          "single"
         );
 
         await markPendingDone(username, E);
@@ -4043,6 +4048,7 @@ module.exports = function singleValidatorRouter(deps) {
         sessionId,
         true,
         username,
+        "single"
       );
 
       const credits = await debitOneCreditIfNeeded(username, prelimPayload.status, E, idemKey, "single");
@@ -4158,6 +4164,7 @@ module.exports = function singleValidatorRouter(deps) {
             sessionId,
             true,
             username,
+            "single"
           );
 
           logger("stabilize_done", `SMTP-stable finished → ${finalPayload.status}`, "info");
