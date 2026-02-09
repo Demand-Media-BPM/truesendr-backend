@@ -1911,6 +1911,21 @@ function parseDomainList(envVal) {
 const BANK_DOMAIN_SET = parseDomainList(process.env.BANK_DOMAINS);
 const HIGH_RISK_DOMAIN_SET = parseDomainList(process.env.HIGH_RISK_DOMAINS);
 
+// Government/official domain patterns (automatically treated as risky)
+const GOVERNMENT_TLD_PATTERNS = [
+  /\.gov$/i,           // US government (.gov)
+  /\.gov\.[a-z]{2}$/i, // International government (.gov.uk, .gov.au, etc.)
+  /\.mil$/i,           // US military (.mil)
+  /\.edu$/i,           // Educational institutions (.edu)
+  /\.ac\.[a-z]{2}$/i,  // Academic institutions (.ac.uk, .ac.jp, etc.)
+  /\.gouv\.[a-z]{2}$/i // French government (.gouv.fr, etc.)
+];
+
+function isGovernmentDomain(domain) {
+  const d = String(domain || '').toLowerCase();
+  return GOVERNMENT_TLD_PATTERNS.some(pattern => pattern.test(d));
+}
+
 /* ────────────────────────────────────────────────────────────────────────────
  *  OWNER VERIFIER (optional plugin) – used across ALL providers
  * ──────────────────────────────────────────────────────────────────────────── */
@@ -2907,12 +2922,13 @@ async function validateSMTP(email, opts = {}) {
   const domainLower = (meta.domain || '').toLowerCase();
   const isBankDomain = BANK_DOMAIN_SET.has(domainLower);
   const isHighRiskDomain = HIGH_RISK_DOMAIN_SET.has(domainLower);
+  const isGovDomain = isGovernmentDomain(domainLower);
 
-  // ─────────────────────────────────────────
-  // POLICY SHORTCUT: BANK / HIGH-RISK DOMAINS
+  // ──────────────────────────────────────────────────────────
+  // POLICY SHORTCUT: BANK / HIGH-RISK / GOVERNMENT DOMAINS
   // (MX only → provider, no SMTP probing)
-  // ─────────────────────────────────────────
-  if (isBankDomain || isHighRiskDomain) {
+  // ──────────────────────────────────────────────────────────
+  if (isBankDomain || isHighRiskDomain || isGovDomain) {
     let providerLabel = 'Unavailable';
     try {
       const mx = await resolveMxCached(domainLower);
@@ -2923,6 +2939,8 @@ async function validateSMTP(email, opts = {}) {
     result.status = 'risky';
     result.sub_status = isBankDomain
       ? 'bank_domain_policy'
+      : isGovDomain
+      ? 'government_domain_policy'
       : 'high_risk_domain_policy';
     result.score = scoreFrom(result, result.flags);
 
@@ -2930,6 +2948,8 @@ async function validateSMTP(email, opts = {}) {
       confidence: 0.7,
       reason: isBankDomain
         ? 'Domain is configured as a bank / financial organization. Validation marked as Risky by policy without SMTP probing.'
+        : isGovDomain
+        ? 'Domain is a government or official institution (.gov, .mil, .edu, etc.). Validation marked as Risky by policy without SMTP probing.'
         : 'Domain is configured as high-risk. Validation marked as Risky by policy without SMTP probing.'
     };
 
@@ -3302,6 +3322,9 @@ async function validateSMTP(email, opts = {}) {
   } else if (result.status === 'risky' && result.sub_status === 'high_risk_domain_policy') {
     reason =
       'Domain is configured as high-risk. Validation marked as Risky by policy.';
+  } else if (result.status === 'risky' && result.sub_status === 'government_domain_policy') {
+    reason =
+      'Domain is a government or official institution (.gov, .mil, .edu, etc.). Validation marked as Risky by policy.';
   } else if (result.status === 'risky' && result.sub_status === 'trained_domain_high_risky_history') {
     reason =
       'Training data shows this domain has a high proportion of risky/invalid mailboxes; treated as risky even though this probe was accepted.';
@@ -3337,6 +3360,7 @@ async function validateSMTP(email, opts = {}) {
       result.sub_status === 'm365_ambiguous_5xx' ||
       result.sub_status === 'bank_domain_policy' ||
       result.sub_status === 'high_risk_domain_policy' ||
+      result.sub_status === 'government_domain_policy' ||
       result.sub_status === 'trained_domain_high_risky_history' ||
       result.sub_status === 'trained_domain_mostly_valid_but_smtp_ambiguous')
   )
@@ -3397,6 +3421,8 @@ function toServerShape(r, extras) {
         ? 'Risky (Bank domain policy)'
         : r.sub_status === 'high_risk_domain_policy'
         ? 'Risky (High-risk domain policy)'
+        : r.sub_status === 'government_domain_policy'
+        ? 'Risky (Government domain policy)'
         : r.sub_status === 'trained_domain_high_risky_history'
         ? 'Risky (Domain history)'
         : r.sub_status === 'trained_domain_mostly_valid_but_smtp_ambiguous'
@@ -3482,10 +3508,11 @@ async function validateSMTPStable(email, opts = {}) {
     const r = await validateSMTP(email, opts);
     rounds.push(r);
 
-    // if policy already decided (bank/high-risk), no need for more rounds
+    // if policy already decided (bank/high-risk/government), no need for more rounds
     if (
       r.sub_status === 'bank_domain_policy' ||
-      r.sub_status === 'high_risk_domain_policy'
+      r.sub_status === 'high_risk_domain_policy' ||
+      r.sub_status === 'government_domain_policy'
     ) {
       logger(
         'policy_stable_loop',
