@@ -38,6 +38,51 @@ function normalizeNamePart(s) {
   );
 }
 
+// ✅ Block free mail providers at signup (business email only)
+const FREE_EMAIL_DOMAINS = new Set([
+  "gmail.com",
+  "googlemail.com",
+  "yahoo.com",
+  "yahoo.in",
+  "yahoo.co.in",
+  "outlook.com",
+  "hotmail.com",
+  "live.com",
+  "msn.com",
+  "icloud.com",
+  "me.com",
+  "aol.com",
+  "proton.me",
+  "protonmail.com",
+  "zoho.com",
+  "yandex.com",
+  "yandex.ru",
+  "gmx.com",
+  "mail.com",
+  "rediffmail.com",
+]);
+
+function getEmailDomain(email) {
+  const e = String(email || "")
+    .trim()
+    .toLowerCase();
+  const at = e.lastIndexOf("@");
+  if (at === -1) return "";
+  return e.slice(at + 1);
+}
+
+function assertBusinessEmail(email) {
+  const domain = getEmailDomain(email);
+  if (!domain || FREE_EMAIL_DOMAINS.has(domain)) {
+    return {
+      ok: false,
+      code: "BUSINESS_EMAIL_REQUIRED",
+      message: "Please use a business/company email (free emails not allowed).",
+    };
+  }
+  return { ok: true };
+}
+
 function secondsLeftFrom(lastSentAt, msInterval) {
   const diff = Date.now() - new Date(lastSentAt).getTime();
   const leftMs = Math.max(0, msInterval - diff);
@@ -163,6 +208,12 @@ router.post("/auth/request-code", async (req, res) => {
     }
 
     const normEmail = String(email).toLowerCase().trim();
+
+    // ✅ NEW: business email only
+    const bizCheck = assertBusinessEmail(normEmail);
+    if (!bizCheck.ok) {
+      return res.status(400).json(bizCheck);
+    }
 
     // Email must be unique
     const uByEmail = await User.findOne({ email: normEmail });

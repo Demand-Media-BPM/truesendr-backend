@@ -1,0 +1,246 @@
+[33mcommit 9e3a51076af4fd6efed702b4ad2e1ad8cff7ba22[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m)[m
+Author: Yashwardhan Singh <yashwardhan.s@demandmediabpm.com>
+Date:   Tue Feb 10 23:43:09 2026 +0530
+
+    Sendgrid bulk update
+
+[33mcommit e01b58958870fffe6b3b068ef987918d7d8b9494[m
+Merge: f0dbac1 ba590f3
+Author: Yashwardhan Singh <yashwardhan.s@demandmediabpm.com>
+Date:   Tue Feb 10 19:05:10 2026 +0530
+
+    Sendgrid Webhook update
+
+[33mcommit f0dbac19b3ff8d95bf2f43780dbc025638d06742[m
+Author: Yashwardhan Singh <yashwardhan.s@demandmediabpm.com>
+Date:   Mon Feb 9 21:46:06 2026 +0530
+
+    gov
+
+[33mcommit ba590f37bcede5b6e1e55b8dc8831e391ad1d31c[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Mon Feb 9 21:00:40 2026 +0530
+
+    this is changes in server.js
+
+[33mcommit 52e9d992cdecf0cd5d04f3a29cbccc3380ec7677[m
+Author: Yashwardhan Singh <yashwardhan.s@demandmediabpm.com>
+Date:   Mon Feb 9 20:18:48 2026 +0530
+
+    ppe-update
+
+[33mcommit d3c5a7347610cdb9653cdf0ffd9b47c6ace633a5[m
+Author: Yashwardhan Singh <yashwardhan.s@demandmediabpm.com>
+Date:   Mon Feb 9 20:12:45 2026 +0530
+
+    ppe
+
+[33mcommit 8bc84cb6984046f239ef6b6a02fbf5e4a8d470e3[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Mon Feb 9 18:45:06 2026 +0530
+
+    changes in single and server.js
+
+[33mcommit ab06c0ede2e849dd2cb595dd73f846dd3210f45f[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Sun Feb 8 17:56:32 2026 +0530
+
+    this push for single validator issue solving 2
+
+[33mcommit a6a9fbd62454152db19af5950bfc2f20522ec7bf[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Sun Feb 8 17:11:10 2026 +0530
+
+    this push for single validator issue solving 1
+
+[33mcommit 3586fb4b9e060d20e442a01989133fbf749ff448[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Sun Feb 8 15:20:19 2026 +0530
+
+    this push for single validator issue solving
+
+[33mcommit cece13d78028ad378fe2130b55b36785edf2d56a[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Sat Feb 7 18:33:46 2026 +0530
+
+    merge the yash code with my code
+
+[33mcommit 2f95bbf2708705f92fb7fc8cde9320cf336cbb35[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Sat Feb 7 01:01:13 2026 +0530
+
+    This is a removal of commited code
+
+[33mcommit c969d9f580f5386aa359a7067dd7e0b06ca093ca[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Fri Feb 6 23:43:09 2026 +0530
+
+    Make changes in deliverability route about call 26
+
+[33mcommit 8ebf6b80b05f7bf1398d3241f14d64686800538a[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Fri Feb 6 00:14:42 2026 +0530
+
+    Make changes in deliverability route about call 25
+
+[33mcommit 763fc7034f4e1cd49a31b813398b2e6bb52211ed[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Fri Feb 6 00:03:00 2026 +0530
+
+    Make changes in deliverability route about call 24
+
+[33mcommit d0bc0eba60f9ce5f3aa4aad23170513bd1cac804[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 23:45:07 2026 +0530
+
+    Make changes in deliverability route about call 23
+
+[33mcommit 8d7c95ae86a71a63f1e03980438dca72a490ffb1[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 22:59:36 2026 +0530
+
+    Make changes in deliverability route about call 22
+
+[33mcommit 907e5cf5b3d89233242ebcea8586c9145568f8aa[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 22:37:57 2026 +0530
+
+    Make changes in deliverability route about call 21
+
+[33mcommit 3f92b844069a5e3c176bd01b05e5369209d0b240[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 21:29:44 2026 +0530
+
+    Make changes in deliverability route about call 20
+
+[33mcommit 9175183a1daa717d0bfc735da4cb408a32eae125[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 21:14:52 2026 +0530
+
+    Make changes in deliverability route about call 19
+
+[33mcommit 07e5abbccdd8da95c3d967e2944887eabbcbbba0[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 20:59:06 2026 +0530
+
+    Make changes in deliverability route about call 18
+
+[33mcommit 2bb03885b31f398d362b5fcea4fd0078c8d4e9d1[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 20:45:43 2026 +0530
+
+    Make changes in deliverability route about call 17
+
+[33mcommit 38f036aa2490db63bf68be5a11e4b26c89cb89be[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 20:34:14 2026 +0530
+
+    Make changes in deliverability route about call 16
+
+[33mcommit 6bf6db4ede0bb8888ac6bbad7e918312ec0b5490[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 19:00:31 2026 +0530
+
+    Make changes in deliverability route about call 15
+
+[33mcommit cc17fb997a27f5a30d86d196fdb231dfd7a48119[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 18:47:53 2026 +0530
+
+    Make changes in deliverability route about call 14
+
+[33mcommit aac90ce51b7c96ec2519b0b13cd47e7a91afa722[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 18:32:46 2026 +0530
+
+    Make changes in deliverability route about call 13
+
+[33mcommit f963a4693c909d9b250b1808abe7b754dbc323e9[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 02:45:14 2026 +0530
+
+    Make changes in deliverability route about call 12
+
+[33mcommit c3c3b99b6282219e0186b7a8f2822d12c3359a2e[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 02:08:46 2026 +0530
+
+    Make changes in deliverability route about call 11
+
+[33mcommit 5f01b07a3345b8af66df3082d1564e99402b337b[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 01:48:53 2026 +0530
+
+    Make changes in deliverability route about call 10
+
+[33mcommit 84108bb2b48c316babbb0d42817c33c91c5d3535[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 01:20:48 2026 +0530
+
+    Make changes in deliverability route about call 9
+
+[33mcommit 9ebd481c341061cee4b52ebdf5b6d0dd658238be[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 00:55:22 2026 +0530
+
+    Make changes in deliverability route about call 8
+
+[33mcommit fefcaa60e340c026e9b2b367004b20531f040b1b[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 00:21:16 2026 +0530
+
+    Make changes in deliverability route about call 7
+
+[33mcommit 3cfe79f0ab6a1d7846fc5fc9dd45dd3aa12f65e4[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Thu Feb 5 00:09:24 2026 +0530
+
+    Make changes in deliverability route about call 6
+
+[33mcommit 8a5cb5b0c4f51cbcd71692ded9496df26f100a2c[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Wed Feb 4 23:56:32 2026 +0530
+
+    Make changes in deliverability route about call 5
+
+[33mcommit e865c4c47471eb5e522145d02fb80c17ad4dbd5a[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Wed Feb 4 23:36:31 2026 +0530
+
+    Make changes in deliverability route about call 4
+
+[33mcommit d7a9a643e5e6477c129893dc907432228049a243[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Wed Feb 4 23:11:37 2026 +0530
+
+    Make changes in deliverability route about call 3
+
+[33mcommit f83719b37fe8f3af278e655ddb278bdfc18592fc[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Wed Feb 4 22:29:36 2026 +0530
+
+    Make changes in deliverability route about call 2
+
+[33mcommit 74776aed31cafa3def6522b94d5c658a57d74187[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Wed Feb 4 20:42:58 2026 +0530
+
+    Make changes in deliverability route about call
+
+[33mcommit 9d52c20c644fd2bda8ecd98c0f67d41832d58e53[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Wed Feb 4 20:28:36 2026 +0530
+
+    I make changes in url
+
+[33mcommit 4b29295f03afbfc75a10c7ebd268840e8cb2aace[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Wed Feb 4 20:14:41 2026 +0530
+
+    This is changes in deliverability route, about implement Auth 2.0 for microsoft bussiness
+
+[33mcommit e646facd1c345623283cac837b470107dd3300c8[m
+Author: Saurabh Shinde <saurabhshinde9637@gmail.com>
+Date:   Tue Feb 3 02:32:12 2026 +0530
+
+    make c
