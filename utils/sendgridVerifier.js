@@ -117,16 +117,17 @@ async function sendVerificationEmail(email, options = {}) {
     if (statusCode >= 200 && statusCode < 300) {
       return {
         success: true,
-        status: 'deliverable',
-        sub_status: 'sendgrid_accepted',
-        reason: 'SendGrid accepted the email for delivery. Mailbox is likely valid.',
+        status: 'pending',
+        sub_status: 'sendgrid_pending_webhook',
+        reason: 'Email sent to SendGrid. Waiting for delivery confirmation via webhook.',
         provider: 'SendGrid',
         method: 'web_api',
         messageId,
         statusCode,
-        confidence: 0.85,
-        category: 'valid',
-        elapsed_ms: elapsed
+        confidence: null,
+        category: 'pending',
+        elapsed_ms: elapsed,
+        awaitingWebhook: true
       };
     } else {
       return {
