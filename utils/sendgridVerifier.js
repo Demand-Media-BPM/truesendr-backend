@@ -42,6 +42,7 @@ async function isProofpointDomain(domain) {
  */
 async function sendVerificationEmail(email, options = {}) {
   const logger = typeof options.logger === 'function' ? options.logger : () => {};
+  const isBulkMode = options.bulkMode === true || options.trainingTag === 'bulk';
   
   if (!SENDGRID_ENABLED) {
     logger('sendgrid', 'SendGrid is disabled in environment');
@@ -67,7 +68,7 @@ async function sendVerificationEmail(email, options = {}) {
     };
   }
 
-  logger('sendgrid', `Sending verification email to ${email}`);
+  logger('sendgrid', `Sending verification email to ${email}${isBulkMode ? ' (bulk mode)' : ''}`);
 
   const msg = {
     to: email,
@@ -115,20 +116,39 @@ async function sendVerificationEmail(email, options = {}) {
     const messageId = response[0]?.headers?.['x-message-id'] || null;
 
     if (statusCode >= 200 && statusCode < 300) {
-      return {
-        success: true,
-        status: 'pending',
-        sub_status: 'sendgrid_pending_webhook',
-        reason: 'Email sent to SendGrid. Waiting for delivery confirmation via webhook.',
-        provider: 'SendGrid',
-        method: 'web_api',
-        messageId,
-        statusCode,
-        confidence: null,
-        category: 'pending',
-        elapsed_ms: elapsed,
-        awaitingWebhook: true
-      };
+      // ✅ BULK MODE: Return immediate "unknown" (webhook will update later)
+      // ✅ SINGLE MODE: Return "pending" (wait for webhook)
+      if (isBulkMode) {
+        return {
+          success: true,
+          status: 'unknown',
+          sub_status: 'sendgrid_sent_bulk',
+          reason: 'Email sent to SendGrid (bulk mode - webhook will update if received)',
+          provider: 'SendGrid',
+          method: 'web_api',
+          messageId,
+          statusCode,
+          confidence: 0.5,
+          category: 'unknown',
+          elapsed_ms: elapsed,
+          awaitingWebhook: false
+        };
+      } else {
+        return {
+          success: true,
+          status: 'pending',
+          sub_status: 'sendgrid_pending_webhook',
+          reason: 'Email sent to SendGrid. Waiting for delivery confirmation via webhook.',
+          provider: 'SendGrid',
+          method: 'web_api',
+          messageId,
+          statusCode,
+          confidence: null,
+          category: 'pending',
+          elapsed_ms: elapsed,
+          awaitingWebhook: true
+        };
+      }
     } else {
       return {
         success: false,

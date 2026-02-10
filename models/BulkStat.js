@@ -118,6 +118,7 @@ const BulkStatSchema = new mongoose.Schema(
         "cleaning",
         "cleaned",
         "running",
+        "waiting_for_webhooks",
         "done",
         "failed",
         "canceled",
@@ -134,6 +135,7 @@ const BulkStatSchema = new mongoose.Schema(
         "needs_fix",
         "ready",
         "running",
+        "waiting_for_webhooks",
         "done",
         "failed",
         "canceled",
@@ -141,6 +143,14 @@ const BulkStatSchema = new mongoose.Schema(
       default: "analyzed",
       index: true,
     },
+
+    // ─────────────────────────────────────────────
+    // SendGrid webhook tracking
+    // ─────────────────────────────────────────────
+    sendgridEmailCount: { type: Number, default: 0 }, // Total emails sent to SendGrid
+    sendgridPendingCount: { type: Number, default: 0 }, // Webhooks still pending
+    sendgridMessageIds: { type: [String], default: [] }, // Track messageIds for webhooks
+    webhookTimeoutAt: { type: Date, default: null }, // When to stop waiting for webhooks
 
     error: { type: String, default: null },
 

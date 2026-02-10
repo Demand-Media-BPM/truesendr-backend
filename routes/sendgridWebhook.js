@@ -121,8 +121,216 @@ module.exports = function sendgridWebhookRouter(deps) {
     const pending = await SendGridPending.findOne({ messageId });
 
     if (!pending) {
-      console.log(`ℹ️ [SendGrid Webhook] No pending record found for messageId: ${messageId}, email: ${E}, event: ${eventType} - may be already processed or non-pending email`);
-      // Still update SendGridLog if exists
+      console.log(`ℹ️ [SendGrid Webhook] No pending record found for messageId: ${messageId}, email: ${E}, event: ${eventType} - checking if bulk email`);
+      
+      // ✅ Check if this is a bulk email (saved directly to EmailLog with messageId in SendGridLog)
+      if (messageId) {
+        try {
+          const sendGridLog = await SendGridLog.findOne({ messageId });
+          
+          if (sendGridLog && sendGridLog.bulkId) {
+            console.log(`📦 [SendGrid Webhook] Found bulk email: ${E} (bulkId: ${sendGridLog.bulkId})`);
+            
+            // Determine final status for bulk email
+            let finalStatus = null;
+            let finalSubStatus = null;
+            let finalCategory = null;
+            let confidence = 0.5;
+
+            switch (eventType) {
+              case 'delivered':
+              case 'open':
+              case 'click':
+              case 'unsubscribe':
+                finalStatus = '✅ Valid Email (SendGrid)';
+                finalSubStatus = `sendgrid_${eventType}`;
+                finalCategory = 'valid';
+                confidence = eventType === 'click' || eventType === 'open' ? 0.99 : 0.95;
+                break;
+
+              case 'bounce':
+                finalStatus = '❌ Invalid Email (SendGrid)';
+                finalSubStatus = type === 'soft' ? 'sendgrid_soft_bounce' : 'sendgrid_hard_bounce';
+                finalCategory = 'invalid';
+                confidence = type === 'soft' ? 0.75 : 0.98;
+                break;
+
+              case 'dropped':
+                finalStatus = '❌ Invalid Email (SendGrid)';
+                finalSubStatus = 'sendgrid_dropped';
+                finalCategory = 'invalid';
+                confidence = 0.90;
+                break;
+
+              case 'deferred':
+                finalStatus = '❌ Invalid Email (SendGrid)';
+                finalSubStatus = 'sendgrid_deferred';
+                finalCategory = 'invalid';
+                confidence = 0.85;
+                break;
+
+              case 'spamreport':
+                finalStatus = '⚠️ Risky (SendGrid)';
+                finalSubStatus = 'sendgrid_spam_report';
+                finalCategory = 'risky';
+                confidence = 0.85;
+                break;
+
+              case 'processed':
+                // Not final - wait for delivered/bounce
+                console.log(`ℹ️ Processed event for bulk email ${E} - waiting for final status`);
+                await SendGridLog.findOneAndUpdate(
+                  { messageId },
+                  {
+                    $set: {
+                      webhookEvent: eventType,
+                      webhookTimestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
+                    }
+                  }
+                );
+                return;
+
+              default:
+                console.log(`ℹ️ Unhandled event type for bulk: ${eventType}`);
+                return;
+            }
+
+            // Build final payload
+            const built = buildReasonAndMessage(finalStatus, finalSubStatus, {
+              isDisposable: false,
+              isRoleBased: false,
+              isFree: false,
+            });
+
+            const finalPayload = {
+              email: E,
+              status: finalStatus,
+              subStatus: finalSubStatus,
+              confidence,
+              category: finalCategory,
+              reason: reason || built.reasonLabel,
+              message: `SendGrid ${eventType}: ${reason || built.message}`,
+              domain: sendGridLog.domain || (E.includes('@') ? E.split('@')[1] : 'N/A'),
+              domainProvider: sendGridLog.provider || 'SendGrid',
+              isDisposable: false,
+              isFree: false,
+              isRoleBased: false,
+              score: finalCategory === 'valid' ? 90 : finalCategory === 'invalid' ? 5 : 45,
+              timestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
+              section: 'bulk',
+            };
+
+            // Update global EmailLog
+            await replaceLatest(EmailLog, E, finalPayload);
+
+            // Update user EmailLog
+            if (sendGridLog.username) {
+              const { EmailLog: UserEmailLog } = getUserDb(
+                mongoose,
+                EmailLog,
+                deps.RegionStat,
+                deps.DomainReputation,
+                sendGridLog.username
+              );
+              await replaceLatest(UserEmailLog, E, finalPayload);
+            }
+
+            // Update SendGridLog
+            await SendGridLog.findOneAndUpdate(
+              { messageId },
+              {
+                $set: {
+                  webhookEvent: eventType,
+                  webhookTimestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
+                  webhookReason: reason,
+                  webhookType: type,
+                  webhookResponse: response,
+                  webhookStatus: status,
+                  webhookAttempt: attempt,
+                  finalCategory: finalCategory,
+                  finalStatus: finalStatus,
+                }
+              }
+            );
+
+            // ✅ Send WebSocket notification to frontend (CRITICAL for UI update!)
+            if (sendGridLog.sessionId && sendGridLog.username) {
+              try {
+                sendStatusToFrontend(
+                  E,
+                  finalPayload.status,
+                  finalPayload.timestamp,
+                  {
+                    domain: finalPayload.domain,
+                    provider: finalPayload.domainProvider,
+                    isDisposable: finalPayload.isDisposable,
+                    isFree: finalPayload.isFree,
+                    isRoleBased: finalPayload.isRoleBased,
+                    score: finalPayload.score,
+                    subStatus: finalPayload.subStatus,
+                    confidence: finalPayload.confidence,
+                    category: finalPayload.category,
+                    message: finalPayload.message,
+                    reason: finalPayload.reason,
+                  },
+                  sendGridLog.sessionId,
+                  true,
+                  sendGridLog.username,
+                  'bulk'
+                );
+                console.log(`📡 [SendGrid Webhook] WebSocket notification sent to frontend for ${E}`);
+              } catch (wsErr) {
+                console.warn(`⚠️ WebSocket notification failed for ${E}:`, wsErr.message);
+              }
+            }
+
+            // ============================================================
+            // ✅ STEP 4: Decrement webhook counter in BulkStat
+            // ============================================================
+            try {
+              const BulkStat = mongoose.model('BulkStat');
+              
+              // Find BulkStat that contains this messageId
+              const bulkStat = await BulkStat.findOne({
+                sendgridMessageIds: messageId,
+                state: 'waiting_for_webhooks'
+              });
+              
+              if (bulkStat) {
+                // Decrement pending count and remove messageId
+                const result = await BulkStat.findOneAndUpdate(
+                  { bulkId: bulkStat.bulkId },
+                  {
+                    $inc: { sendgridPendingCount: -1 },
+                    $pull: { sendgridMessageIds: messageId }
+                  },
+                  { new: true }
+                );
+                
+                if (result) {
+                  const remaining = result.sendgridPendingCount;
+                  const total = result.sendgridEmailCount;
+                  console.log(`📉 [SendGrid Webhook] Bulk ${bulkStat.bulkId}: ${remaining}/${total} webhooks remaining`);
+                  
+                  // If this was the last webhook, log completion
+                  if (remaining === 0) {
+                    console.log(`🎉 [SendGrid Webhook] Bulk ${bulkStat.bulkId}: All webhooks received!`);
+                  }
+                }
+              }
+            } catch (err) {
+              console.warn(`⚠️  [SendGrid Webhook] Failed to update BulkStat counter:`, err.message);
+            }
+
+            console.log(`✅ [SendGrid Webhook] Bulk email processed: ${E} -> ${finalStatus} (${finalCategory})`);
+            return;
+          }
+        } catch (e) {
+          console.warn('Bulk email webhook processing failed:', e.message);
+        }
+      }
+      
+      // Not found in pending or bulk - just update SendGridLog if exists
       if (messageId) {
         try {
           await SendGridLog.findOneAndUpdate(

@@ -131,6 +131,11 @@ const sendGridLogSchema = new mongoose.Schema({
     index: true,
     default: null
   },
+  bulkId: {
+    type: String,
+    index: true,
+    default: null
+  },
   // Flags
   isDisposable: {
     type: Boolean,
@@ -159,6 +164,7 @@ sendGridLogSchema.index({ email: 1, createdAt: -1 });
 sendGridLogSchema.index({ domain: 1, category: 1 });
 sendGridLogSchema.index({ username: 1, createdAt: -1 });
 sendGridLogSchema.index({ messageId: 1 }, { sparse: true });
+sendGridLogSchema.index({ bulkId: 1 }, { sparse: true });
 sendGridLogSchema.index({ isProofpoint: 1, category: 1 });
 sendGridLogSchema.index({ createdAt: -1 });
 
