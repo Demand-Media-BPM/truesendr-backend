@@ -2018,6 +2018,9 @@ const GATEWAY_PATTERNS = {
   ms_eop:          /(^|\.)protection\.outlook\.com$/i // Microsoft EOP gateway
 };
 
+
+
+
 function matchGateway(host) {
   const h = (host || '').toLowerCase();
   for (const [name, re] of Object.entries(GATEWAY_PATTERNS)) {
