@@ -336,10 +336,10 @@ function toTrueSendrFormat(sgResult, meta = {}) {
     sgResult.category === 'risky' ? '⚠️' : '❔';
 
   const statusText =
-    sgResult.category === 'valid' ? 'Valid Email (SendGrid)' :
-    sgResult.category === 'invalid' ? 'Invalid Email (SendGrid)' :
-    sgResult.category === 'risky' ? 'Risky (SendGrid)' :
-    'Unknown (SendGrid)';
+    sgResult.category === 'valid' ? 'Valid Email' :
+    sgResult.category === 'invalid' ? 'Invalid Email' :
+    sgResult.category === 'risky' ? 'Risky' :
+    'Unknown';
 
   return {
     status: `${icon} ${statusText}`,
