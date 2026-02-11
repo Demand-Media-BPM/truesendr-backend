@@ -142,35 +142,35 @@ module.exports = function sendgridWebhookRouter(deps) {
               case 'open':
               case 'click':
               case 'unsubscribe':
-                finalStatus = '✅ Valid Email (SendGrid)';
+                finalStatus = 'Valid';
                 finalSubStatus = `sendgrid_${eventType}`;
                 finalCategory = 'valid';
                 confidence = eventType === 'click' || eventType === 'open' ? 0.99 : 0.95;
                 break;
 
               case 'bounce':
-                finalStatus = '❌ Invalid Email (SendGrid)';
+                finalStatus = 'Invalid';
                 finalSubStatus = type === 'soft' ? 'sendgrid_soft_bounce' : 'sendgrid_hard_bounce';
                 finalCategory = 'invalid';
                 confidence = type === 'soft' ? 0.75 : 0.98;
                 break;
 
               case 'dropped':
-                finalStatus = '❌ Invalid Email (SendGrid)';
+                finalStatus = 'Invalid';
                 finalSubStatus = 'sendgrid_dropped';
                 finalCategory = 'invalid';
                 confidence = 0.90;
                 break;
 
               case 'deferred':
-                finalStatus = '❌ Invalid Email (SendGrid)';
+                finalStatus = 'Invalid';
                 finalSubStatus = 'sendgrid_deferred';
                 finalCategory = 'invalid';
                 confidence = 0.85;
                 break;
 
               case 'spamreport':
-                finalStatus = '⚠️ Risky (SendGrid)';
+                finalStatus = 'Risky';
                 finalSubStatus = 'sendgrid_spam_report';
                 finalCategory = 'risky';
                 confidence = 0.85;
@@ -363,7 +363,7 @@ module.exports = function sendgridWebhookRouter(deps) {
 
     switch (eventType) {
       case 'delivered':
-        finalStatus = '✅ Valid Email (SendGrid)';
+        finalStatus = 'Valid';
         finalSubStatus = 'sendgrid_delivered';
         finalCategory = 'valid';
         confidence = 0.95;
@@ -371,7 +371,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         break;
 
       case 'bounce':
-        finalStatus = '❌ Invalid Email (SendGrid)';
+        finalStatus = 'Invalid';
         finalSubStatus = type === 'soft' ? 'sendgrid_soft_bounce' : 'sendgrid_hard_bounce';
         finalCategory = 'invalid';
         confidence = type === 'soft' ? 0.75 : 0.98;
@@ -379,7 +379,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         break;
 
       case 'dropped':
-        finalStatus = '❌ Invalid Email (SendGrid)';
+        finalStatus = 'Invalid';
         finalSubStatus = 'sendgrid_dropped';
         finalCategory = 'invalid';
         confidence = 0.90;
@@ -387,7 +387,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         break;
 
       case 'deferred':
-        finalStatus = '❌ Invalid Email (SendGrid)';
+        finalStatus = 'Invalid';
         finalSubStatus = 'sendgrid_deferred';
         finalCategory = 'invalid';
         confidence = 0.85;
@@ -402,7 +402,7 @@ module.exports = function sendgridWebhookRouter(deps) {
       case 'open':
       case 'click':
         // Strong signal - email was delivered
-        finalStatus = '✅ Valid Email (SendGrid)';
+        finalStatus = 'Valid';
         finalSubStatus = 'sendgrid_engaged';
         finalCategory = 'valid';
         confidence = 0.99;
@@ -410,7 +410,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         break;
 
       case 'spamreport':
-        finalStatus = '⚠️ Risky (SendGrid)';
+        finalStatus = 'Risky';
         finalSubStatus = 'sendgrid_spam_report';
         finalCategory = 'risky';
         confidence = 0.85;
@@ -418,7 +418,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         break;
 
       case 'unsubscribe':
-        finalStatus = '✅ Valid Email (SendGrid)';
+        finalStatus = 'Valid';
         finalSubStatus = 'sendgrid_unsubscribed';
         finalCategory = 'valid';
         confidence = 0.95;
