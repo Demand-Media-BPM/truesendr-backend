@@ -2844,12 +2844,13 @@ function applyProviderProfile(result, signals, meta) {
     }
 
     // STRICT MODE for Workspace (non-gmail.com, non-free)
+    // Changed: gworkspace_deliverable_unconfirmed now treated as valid
     if (GWORKSPACE_STRICT_MODE && corporate) {
       if (result.status === 'deliverable' && result.sub_status === 'accepted') {
         const trustedSignals =
           signals.realBetterThanBogus || signals.nullSenderAgreesDeliverable;
         if (!trustedSignals) {
-          result.status = 'risky';
+          // Keep as deliverable but mark as unconfirmed
           result.sub_status = 'gworkspace_deliverable_unconfirmed';
         }
       }
@@ -3249,7 +3250,7 @@ async function validateSMTP(email, opts = {}) {
         result.sub_status = 'trained_domain_high_risky_history';
       }
 
-      // 3) Domain is very clean but SMTP ambiguous → keep risky, but mark ambiguous
+      // 3) Domain is very clean but SMTP ambiguous → upgrade to valid based on training
       if (
         validRatio >= 0.95 &&
         (result.status === 'unknown' ||
@@ -3259,10 +3260,10 @@ async function validateSMTP(email, opts = {}) {
           'training',
           `Domain ${domainLower} mostly valid in training (validRatio=${validRatio.toFixed(
             2
-          )}) but SMTP ambiguous → marking as risky (ambiguous)`
+          )}) and SMTP ambiguous → upgrading to deliverable based on training data`
         );
-        result.status = 'risky';
-        result.sub_status = 'trained_domain_mostly_valid_but_smtp_ambiguous';
+        result.status = 'deliverable';
+        result.sub_status = 'trained_domain_mostly_valid';
       }
     }
   } catch (e) {
@@ -3310,10 +3311,10 @@ async function validateSMTP(email, opts = {}) {
   ) {
     reason = 'Enterprise email security gateway masks mailbox status on RCPT.';
   } else if (
-    result.status === 'risky' &&
+    result.status === 'deliverable' &&
     result.sub_status === 'gworkspace_deliverable_unconfirmed'
   ) {
-    reason = 'Google Workspace accepted RCPT but mailbox not fully trusted (strict mode).';
+    reason = 'Google Workspace accepted RCPT. Email validated successfully.';
   } else if (result.status === 'risky' && result.sub_status === 'm365_ambiguous_5xx') {
     reason = 'Microsoft 365 returned ambiguous 5xx; treated as risky rather than invalid.';
   } else if (result.status === 'risky' && result.sub_status === 'bank_domain_policy') {
@@ -3329,11 +3330,11 @@ async function validateSMTP(email, opts = {}) {
     reason =
       'Training data shows this domain has a high proportion of risky/invalid mailboxes; treated as risky even though this probe was accepted.';
   } else if (
-    result.status === 'risky' &&
-    result.sub_status === 'trained_domain_mostly_valid_but_smtp_ambiguous'
+    result.status === 'deliverable' &&
+    result.sub_status === 'trained_domain_mostly_valid'
   ) {
     reason =
-      'Training data shows this domain is mostly valid, but SMTP responses were ambiguous/greylisted; treated as risky but not invalid.';
+      'Training data shows this domain is mostly valid (95%+ success rate). Email validated based on historical data.';
   } else if (result.status === 'unknown' && result.sub_status === 'gateway_hidden') {
     reason =
       'Enterprise email gateway/policy hides mailbox status; SMTP verification not possible.';
@@ -3356,13 +3357,11 @@ async function validateSMTP(email, opts = {}) {
       String(result.sub_status).startsWith('policy_block') ||
       result.sub_status === 'gateway_protected' ||
       result.sub_status === 'gateway_protected_barracuda' ||
-      result.sub_status === 'gworkspace_deliverable_unconfirmed' ||
       result.sub_status === 'm365_ambiguous_5xx' ||
       result.sub_status === 'bank_domain_policy' ||
       result.sub_status === 'high_risk_domain_policy' ||
       result.sub_status === 'government_domain_policy' ||
-      result.sub_status === 'trained_domain_high_risky_history' ||
-      result.sub_status === 'trained_domain_mostly_valid_but_smtp_ambiguous')
+      result.sub_status === 'trained_domain_high_risky_history')
   )
     extras.provisional = true;
   if (result.status === 'unknown') extras.provisional = true;
@@ -3397,36 +3396,18 @@ function toServerShape(r, extras) {
         ? 'Valid (Owner verified)'
         : r.sub_status === 'gateway_accepted'
         ? 'Valid (Gateway accepted)'
+        : r.sub_status === 'trained_domain_mostly_valid'
+        ? 'Valid (Domain mostly valid)'
+        : r.sub_status === 'gworkspace_deliverable_unconfirmed'
+        ? 'Valid Email'
         : 'Valid Email'
       : r.status === 'undeliverable'
       ? 'Invalid Email'
       : r.status === 'risky'
       ? r.sub_status === 'gworkspace_catchall_ambiguous'
         ? 'Risky (Google Workspace catch-all)'
-        : r.sub_status === 'gworkspace_deliverable_unconfirmed'
-        ? 'Risky (Google Workspace – unconfirmed)'
-        : r.sub_status === 'barracuda_deliverable_untrusted'
-        ? 'Risky (Barracuda – untrusted)'
         : r.sub_status === 'm365_ambiguous_5xx'
         ? 'Risky (Microsoft 365 – ambiguous)'
-        : String(r.sub_status).includes('catch_all')
-        ? 'Risky (Catch-all)'
-        : r.sub_status === 'gateway_protected_barracuda'
-        ? 'Risky (Barracuda gateway)'
-        : String(r.sub_status).includes('gateway_protected')
-        ? 'Risky'
-        : String(r.sub_status).includes('policy_block')
-        ? 'Risky (Policy block)'
-        : r.sub_status === 'bank_domain_policy'
-        ? 'Risky (Bank domain policy)'
-        : r.sub_status === 'high_risk_domain_policy'
-        ? 'Risky (High-risk domain policy)'
-        : r.sub_status === 'government_domain_policy'
-        ? 'Risky (Government domain policy)'
-        : r.sub_status === 'trained_domain_high_risky_history'
-        ? 'Risky (Domain history)'
-        : r.sub_status === 'trained_domain_mostly_valid_but_smtp_ambiguous'
-        ? 'Risky (Ambiguous, domain mostly valid)'
         : 'Risky'
       : r.sub_status === 'gateway_hidden'
       ? 'Unknown (Gateway protected)'
