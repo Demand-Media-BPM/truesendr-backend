@@ -65,7 +65,13 @@ module.exports = function bulkValidatorRouter(deps) {
     return b;
   }
 
-  async function saveBufferToGridFS(username, buf, filename, mime, metadata = {}) {
+  async function saveBufferToGridFS(
+    username,
+    buf,
+    filename,
+    mime,
+    metadata = {},
+  ) {
     return new Promise((resolve, reject) => {
       const upload = bucket(username).openUploadStream(filename, {
         contentType: mime || "application/octet-stream",
@@ -391,7 +397,8 @@ module.exports = function bulkValidatorRouter(deps) {
       username,
       buffer,
       originalName || "bulk.xlsx",
-      mime || "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      mime ||
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       { username, kind: "original", bulkId },
     );
 
@@ -607,7 +614,10 @@ module.exports = function bulkValidatorRouter(deps) {
       );
 
       // read original
-      const origBuffer = await readGridFSToBuffer(username, meta.originalFileId);
+      const origBuffer = await readGridFSToBuffer(
+        username,
+        meta.originalFileId,
+      );
       const { rows } = readWorkbookFromBuffer(origBuffer);
       if (!rows.length) return res.status(400).send("Empty sheet");
 
@@ -743,16 +753,52 @@ module.exports = function bulkValidatorRouter(deps) {
   });
 
   // ───────────────────────────────────────────────────────────
+  // Billing category normalizer (credits computed at END only)
+  // ───────────────────────────────────────────────────────────
+  function normalizeOutcomeCategory(input) {
+    const s = String(input || "")
+      .trim()
+      .toLowerCase()
+      .replace(/^[^a-z0-9]+/g, ""); // remove emojis/symbols
+
+    if (s === "valid" || s.startsWith("valid")) return "valid";
+    if (s === "invalid" || s.startsWith("invalid")) return "invalid";
+    if (s === "risky" || s.startsWith("risky")) return "risky";
+    if (s === "unknown" || s.startsWith("unknown")) return "unknown";
+
+    if (s.includes("valid")) return "valid";
+    if (s.includes("invalid") || s.includes("undeliverable")) return "invalid";
+    if (s.includes("risky") || s.includes("risk")) return "risky";
+
+    return "unknown";
+  }
+
+  function getOutcomeCategory(final) {
+    // prefer explicit category if you already store it
+    return normalizeOutcomeCategory(final?.category || final?.status || "");
+  }
+
+  // ───────────────────────────────────────────────────────────
   // helper: bump live counters + WS
   // ───────────────────────────────────────────────────────────
-  async function bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, cat) {
+  async function bumpLiveCounts(
+    UserBulkStat,
+    bulkId,
+    username,
+    sessionId,
+    cat,
+  ) {
     const inc = {};
     if (cat === "valid") inc.valid = 1;
     else if (cat === "invalid") inc.invalid = 1;
     else if (cat === "risky") inc.risky = 1;
     else inc.unknown = 1;
 
-    const doc = await UserBulkStat.findOneAndUpdate({ bulkId }, { $inc: inc }, { new: true });
+    const doc = await UserBulkStat.findOneAndUpdate(
+      { bulkId },
+      { $inc: inc },
+      { new: true },
+    );
 
     if (doc && sessionId) {
       sendBulkStatsToFrontend(sessionId, username, {
@@ -771,101 +817,127 @@ module.exports = function bulkValidatorRouter(deps) {
   // ───────────────────────────────────────────────────────────
   // ✅ NEW: Wait for SendGrid webhooks before completing bulk job
   // ───────────────────────────────────────────────────────────
-  async function waitForSendGridWebhooks(bulkId, username, sessionId, UserBulkStat) {
+  async function waitForSendGridWebhooks(
+    bulkId,
+    username,
+    sessionId,
+    UserBulkStat,
+  ) {
     const MAX_WAIT_TIME = 20000; // 20 seconds
     const CHECK_INTERVAL = 1000; // Check every 1 second
     const startTime = Date.now();
-    
-    console.log(`⏳ [BULK][${bulkId}] Starting webhook wait loop (max ${MAX_WAIT_TIME/1000}s)...`);
-    
+
+    console.log(
+      `⏳ [BULK][${bulkId}] Starting webhook wait loop (max ${MAX_WAIT_TIME / 1000}s)...`,
+    );
+
     while (Date.now() - startTime < MAX_WAIT_TIME) {
       // Check current status
       const bulkStat = await UserBulkStat.findOne({ bulkId }).lean();
-      
+
       if (!bulkStat) {
-        console.warn(`⚠️  [BULK][${bulkId}] BulkStat not found, exiting wait loop`);
+        console.warn(
+          `⚠️  [BULK][${bulkId}] BulkStat not found, exiting wait loop`,
+        );
         break;
       }
-      
+
       const pending = bulkStat.sendgridPendingCount || 0;
       const total = bulkStat.sendgridEmailCount || 0;
       const received = total - pending;
-      
-      console.log(`📬 [BULK][${bulkId}] Webhooks: ${received}/${total} received (${pending} pending)`);
-      
+
+      console.log(
+        `📬 [BULK][${bulkId}] Webhooks: ${received}/${total} received (${pending} pending)`,
+      );
+
       // Check if all webhooks received
       if (pending === 0) {
         console.log(`✅ [BULK][${bulkId}] All webhooks received!`);
         break;
       }
-      
+
       // Send progress update to frontend
       if (sendBulkStatsToFrontend && sessionId) {
         try {
           sendBulkStatsToFrontend(sessionId, username, {
             bulkId,
-            state: 'waiting_for_webhooks',
-            phase: 'waiting_for_webhooks',
+            state: "waiting_for_webhooks",
+            phase: "waiting_for_webhooks",
             message: `Waiting for ${pending} delivery confirmations...`,
             sendgridPending: pending,
             sendgridTotal: total,
             sendgridReceived: received,
-            progressPercent: Math.round((received / total) * 100)
+            progressPercent: Math.round((received / total) * 100),
           });
         } catch (err) {
-          console.warn(`⚠️  [BULK][${bulkId}] Failed to send progress update:`, err.message);
+          console.warn(
+            `⚠️  [BULK][${bulkId}] Failed to send progress update:`,
+            err.message,
+          );
         }
       }
-      
+
       // Wait before next check
-      await new Promise(resolve => setTimeout(resolve, CHECK_INTERVAL));
+      await new Promise((resolve) => setTimeout(resolve, CHECK_INTERVAL));
     }
-    
+
     // Check if we timed out
     const finalStat = await UserBulkStat.findOne({ bulkId }).lean();
     const finalPending = finalStat?.sendgridPendingCount || 0;
-    
+
     if (finalPending > 0) {
-      console.warn(`⚠️  [BULK][${bulkId}] Timeout: ${finalPending} webhooks still pending after ${MAX_WAIT_TIME/1000}s`);
+      console.warn(
+        `⚠️  [BULK][${bulkId}] Timeout: ${finalPending} webhooks still pending after ${MAX_WAIT_TIME / 1000}s`,
+      );
     } else {
-      console.log(`✅ [BULK][${bulkId}] Webhook wait complete: All ${finalStat?.sendgridEmailCount || 0} webhooks received`);
+      console.log(
+        `✅ [BULK][${bulkId}] Webhook wait complete: All ${finalStat?.sendgridEmailCount || 0} webhooks received`,
+      );
     }
-    
+
     // Reset webhook tracking fields
     await UserBulkStat.findOneAndUpdate(
       { bulkId },
       {
         $set: {
           sendgridPendingCount: 0,
-          webhookTimeoutAt: null
-        }
-      }
+          webhookTimeoutAt: null,
+        },
+      },
     );
   }
 
   // ───────────────────────────────────────────────────────────
   // ✅ NEW: Regenerate result file with updated EmailLog data
   // ───────────────────────────────────────────────────────────
-  async function regenerateResultFile(bulkId, username, UserEmailLog, UserBulkStat, toValidate) {
-    console.log(`🔄 [BULK][${bulkId}] Regenerating result file with updated statuses...`);
-    
+  async function regenerateResultFile(
+    bulkId,
+    username,
+    UserEmailLog,
+    UserBulkStat,
+    toValidate,
+  ) {
+    console.log(
+      `🔄 [BULK][${bulkId}] Regenerating result file with updated statuses...`,
+    );
+
     // Fetch updated EmailLog entries for all emails
-    const emails = toValidate.map(item => item.email);
+    const emails = toValidate.map((item) => item.email);
     const updatedLogs = await UserEmailLog.find({
-      email: { $in: emails }
+      email: { $in: emails },
     }).lean();
-    
+
     // Create a map for quick lookup
     const logMap = new Map();
-    updatedLogs.forEach(log => {
+    updatedLogs.forEach((log) => {
       logMap.set(log.email, log);
     });
-    
+
     // Build result rows with updated data
-    const printable = toValidate.map(item => {
+    const printable = toValidate.map((item) => {
       const E = item.email;
       const log = logMap.get(E);
-      
+
       if (!log) {
         return {
           Email: E,
@@ -885,11 +957,15 @@ module.exports = function bulkValidatorRouter(deps) {
           Source: "Unknown",
         };
       }
-      
+
       return {
         Email: E,
-        Status: log.status ? log.status.replace(/^[^a-zA-Z0-9]+/, "") : "Unknown",
-        Timestamp: log.timestamp ? new Date(log.timestamp).toLocaleString() : "N/A",
+        Status: log.status
+          ? log.status.replace(/^[^a-zA-Z0-9]+/, "")
+          : "Unknown",
+        Timestamp: log.timestamp
+          ? new Date(log.timestamp).toLocaleString()
+          : "N/A",
         Domain: log.domain || extractDomain(E),
         Provider: log.domainProvider || log.provider || "Unavailable",
         Disposable: log.isDisposable ? "Yes" : "No",
@@ -904,7 +980,7 @@ module.exports = function bulkValidatorRouter(deps) {
         Source: "Live",
       };
     });
-    
+
     // Recalculate category counts
     const catCounts = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
     for (const row of printable) {
@@ -912,17 +988,17 @@ module.exports = function bulkValidatorRouter(deps) {
       if (catCounts[k] !== undefined) catCounts[k] += 1;
       else catCounts.unknown += 1;
     }
-    
+
     // Generate new Excel file
     const sheet = xlsx.utils.json_to_sheet(printable);
     const book = xlsx.utils.book_new();
     xlsx.utils.book_append_sheet(book, sheet, "Results");
-    
+
     const outBuffer = xlsx.write(book, {
       type: "buffer",
       bookType: "xlsx",
     });
-    
+
     // Save to GridFS
     const saved = await saveBufferToGridFS(
       username,
@@ -931,9 +1007,9 @@ module.exports = function bulkValidatorRouter(deps) {
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
       { username, kind: "result", bulkId },
     );
-    
+
     console.log(`✅ [BULK][${bulkId}] Result file regenerated successfully`);
-    
+
     return { saved, catCounts };
   }
 
@@ -972,7 +1048,9 @@ module.exports = function bulkValidatorRouter(deps) {
     if (meta.state === "needs_fix" && !skipInvalidFormat) {
       return res
         .status(400)
-        .send("Invalid format emails exist. Download & fix or Skip & Continue.");
+        .send(
+          "Invalid format emails exist. Download & fix or Skip & Continue.",
+        );
     }
 
     // Choose input file for validation:
@@ -1072,8 +1150,6 @@ module.exports = function bulkValidatorRouter(deps) {
         );
       } catch {}
 
-      let billableCount = 0;
-
       const delay = (ms) => new Promise((r) => setTimeout(r, ms));
       let _lastProgressDbWrite = 0;
       const writeProgressToDbThrottled = async (current, total0) => {
@@ -1092,7 +1168,8 @@ module.exports = function bulkValidatorRouter(deps) {
       };
 
       const mapWithConcurrency = async (items, limit, worker, onProgress) => {
-        let nextIndex = 0, done = 0;
+        let nextIndex = 0,
+          done = 0;
         const results = new Array(items.length);
 
         async function runner() {
@@ -1108,8 +1185,12 @@ module.exports = function bulkValidatorRouter(deps) {
             } finally {
               done++;
 
-              try { onProgress(done, items.length); } catch {}
-              try { await writeProgressToDbThrottled(done, items.length); } catch {}
+              try {
+                onProgress(done, items.length);
+              } catch {}
+              try {
+                await writeProgressToDbThrottled(done, items.length);
+              } catch {}
 
               await delay(5);
             }
@@ -1164,10 +1245,16 @@ module.exports = function bulkValidatorRouter(deps) {
 
         // Yash-style domain logs
         console.log(`🔵 [BULK][${E}] Extracted domain: ${domain}`);
-        console.log(`🔵 [BULK][${E}] Bank/Healthcare: ${isBankOrHealthcare ? "YES" : "NO"}`);
-        console.log(`🔵 [BULK][${E}] Proofpoint: ${isProofpoint ? "YES" : "NO"}`);
+        console.log(
+          `🔵 [BULK][${E}] Bank/Healthcare: ${isBankOrHealthcare ? "YES" : "NO"}`,
+        );
+        console.log(
+          `🔵 [BULK][${E}] Proofpoint: ${isProofpoint ? "YES" : "NO"}`,
+        );
         if (isBankOrHealthcare) {
-          console.log(`🔵 [BULK][${E}] Domain type: ${getDomainCategory(domain)}`);
+          console.log(
+            `🔵 [BULK][${E}] Domain type: ${getDomainCategory(domain)}`,
+          );
         }
 
         // Cache read (GLOBAL EmailLog)
@@ -1287,8 +1374,8 @@ module.exports = function bulkValidatorRouter(deps) {
               isBankOrHealthcare && isProofpoint
                 ? "bank_healthcare_proofpoint"
                 : isBankOrHealthcare
-                ? "bank_healthcare"
-                : "proofpoint",
+                  ? "bank_healthcare"
+                  : "proofpoint",
               `${domainCategory} detected → using SendGrid verification`,
               "info",
             );
@@ -1304,7 +1391,9 @@ module.exports = function bulkValidatorRouter(deps) {
                   console.log(`📊 [BULK][${E}] Domain Reputation:`);
                   console.log(`   Sent: ${domainStats.sent}`);
                   console.log(`   Invalid: ${domainStats.invalid}`);
-                  console.log(`   Bounce Rate: ${(bounceRate * 100).toFixed(1)}%`);
+                  console.log(
+                    `   Bounce Rate: ${(bounceRate * 100).toFixed(1)}%`,
+                  );
 
                   logger(
                     "domain_reputation",
@@ -1313,7 +1402,9 @@ module.exports = function bulkValidatorRouter(deps) {
                   );
 
                   if (bounceRate >= 0.6) {
-                    console.log(`⚠️  [BULK][${E}] HIGH BOUNCE RATE - Marking as risky\n`);
+                    console.log(
+                      `⚠️  [BULK][${E}] HIGH BOUNCE RATE - Marking as risky\n`,
+                    );
 
                     final = {
                       email: E,
@@ -1334,12 +1425,20 @@ module.exports = function bulkValidatorRouter(deps) {
                     };
 
                     await replaceLatest(EmailLog, E, { email: E, ...final });
-                    await replaceLatest(UserEmailLog, E, { email: E, ...final });
+                    await replaceLatest(UserEmailLog, E, {
+                      email: E,
+                      ...final,
+                    });
 
                     // ✅ EARLY RETURN like Yash (this impacts correctness safety)
-                    const cat = categoryFromStatus(final.status || "");
-                    if (["valid", "invalid", "risky"].includes(cat)) billableCount++;
-                    await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, cat);
+                    const cat = getOutcomeCategory(final);
+                    await bumpLiveCounts(
+                      UserBulkStat,
+                      bulkId,
+                      username,
+                      sessionId,
+                      cat,
+                    );
 
                     // WS per item
                     try {
@@ -1386,7 +1485,7 @@ module.exports = function bulkValidatorRouter(deps) {
                   }
                 } else {
                   console.log(
-                    `📊 [BULK][${E}] Domain Reputation: No data or insufficient samples (< 5)`
+                    `📊 [BULK][${E}] Domain Reputation: No data or insufficient samples (< 5)`,
                   );
                 }
               } catch (e) {
@@ -1400,10 +1499,15 @@ module.exports = function bulkValidatorRouter(deps) {
             try {
               console.log(`🚀 [BULK][${E}] Starting SendGrid verification...`);
               const t0 = Date.now();
-              const sgResult = await verifySendGrid(E, { logger, trainingTag: 'bulk' });
+              const sgResult = await verifySendGrid(E, {
+                logger,
+                trainingTag: "bulk",
+              });
               const elapsed = Date.now() - t0;
 
-              console.log(`\n✅ [BULK][${E}] SendGrid Response (${elapsed}ms):`);
+              console.log(
+                `\n✅ [BULK][${E}] SendGrid Response (${elapsed}ms):`,
+              );
               console.log(`   Status: ${sgResult.status}`);
               console.log(`   Category: ${sgResult.category}`);
               console.log(`   Sub-Status: ${sgResult.sub_status || "N/A"}`);
@@ -1456,7 +1560,9 @@ module.exports = function bulkValidatorRouter(deps) {
               console.log(`\n📚 [BULK][${E}] Building email history...`);
               const history = await buildHistoryForEmail(E);
               console.log(`   Domain samples: ${history.domainSamples || 0}`);
-              console.log(`   Training samples: ${history.trainingSamples || 0}`);
+              console.log(
+                `   Training samples: ${history.trainingSamples || 0}`,
+              );
 
               const merged = mergeSMTPWithHistory(result, history, {
                 domain: result.domain || domain,
@@ -1471,8 +1577,8 @@ module.exports = function bulkValidatorRouter(deps) {
                 typeof merged.confidence === "number"
                   ? merged.confidence
                   : typeof result.confidence === "number"
-                  ? result.confidence
-                  : null;
+                    ? result.confidence
+                    : null;
 
               const built = buildReasonAndMessage(status, subStatus, {
                 isDisposable: !!merged.isDisposable,
@@ -1496,7 +1602,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 score:
                   typeof merged.score === "number"
                     ? merged.score
-                    : result.score ?? 50,
+                    : (result.score ?? 50),
                 timestamp: new Date(),
                 section: "bulk",
               };
@@ -1533,16 +1639,21 @@ module.exports = function bulkValidatorRouter(deps) {
             // Yash uses strict check: prelimRaw.category === "unknown"
             if (prelimRaw.category === "unknown") {
               console.log(
-                `\n⚠️  [BULK][${E}] SMTP returned UNKNOWN → Attempting SendGrid fallback...`
+                `\n⚠️  [BULK][${E}] SMTP returned UNKNOWN → Attempting SendGrid fallback...`,
               );
 
               try {
                 console.log(`🚀 [BULK][${E}] Starting SendGrid fallback...`);
                 const t0 = Date.now();
-                const sgResult = await verifySendGrid(E, { logger, trainingTag: 'bulk' });
+                const sgResult = await verifySendGrid(E, {
+                  logger,
+                  trainingTag: "bulk",
+                });
                 const elapsed = Date.now() - t0;
 
-                console.log(`\n✅ [BULK][${E}] SendGrid Fallback (${elapsed}ms):`);
+                console.log(
+                  `\n✅ [BULK][${E}] SendGrid Fallback (${elapsed}ms):`,
+                );
                 console.log(`   Status: ${sgResult.status}`);
                 console.log(`   Category: ${sgResult.category}`);
 
@@ -1589,21 +1700,27 @@ module.exports = function bulkValidatorRouter(deps) {
                 console.log(`\n📚 [BULK][${E}] Building email history...`);
                 const history = await buildHistoryForEmail(E);
 
-                const merged = mergeSMTPWithHistory(sgTrueSendrResult, history, {
-                  domain: sgTrueSendrResult.domain || domain,
-                  provider: sgTrueSendrResult.provider || "SendGrid (fallback)",
-                });
+                const merged = mergeSMTPWithHistory(
+                  sgTrueSendrResult,
+                  history,
+                  {
+                    domain: sgTrueSendrResult.domain || domain,
+                    provider:
+                      sgTrueSendrResult.provider || "SendGrid (fallback)",
+                  },
+                );
 
                 const subStatus = merged.sub_status || merged.subStatus || null;
-                const status = merged.status || sgTrueSendrResult.status || "❔ Unknown";
+                const status =
+                  merged.status || sgTrueSendrResult.status || "❔ Unknown";
                 const cat = merged.category || categoryFromStatus(status || "");
 
                 const confidence =
                   typeof merged.confidence === "number"
                     ? merged.confidence
                     : typeof sgTrueSendrResult.confidence === "number"
-                    ? sgTrueSendrResult.confidence
-                    : null;
+                      ? sgTrueSendrResult.confidence
+                      : null;
 
                 const built = buildReasonAndMessage(status, subStatus, {
                   isDisposable: !!merged.isDisposable,
@@ -1627,7 +1744,7 @@ module.exports = function bulkValidatorRouter(deps) {
                   score:
                     typeof merged.score === "number"
                       ? merged.score
-                      : sgTrueSendrResult.score ?? 50,
+                      : (sgTrueSendrResult.score ?? 50),
                   timestamp: new Date(),
                   section: "bulk",
                 };
@@ -1640,7 +1757,9 @@ module.exports = function bulkValidatorRouter(deps) {
                 console.log(`   SendGrid Result: ${sgResult.category}\n`);
               } catch (sgError) {
                 logger("sendgrid_fallback_error", sgError.message, "warn");
-                console.log(`⚠️  [BULK][${E}] SendGrid fallback failed → continue SMTP merge\n`);
+                console.log(
+                  `⚠️  [BULK][${E}] SendGrid fallback failed → continue SMTP merge\n`,
+                );
               }
             }
 
@@ -1698,7 +1817,9 @@ module.exports = function bulkValidatorRouter(deps) {
                 // 3) SMTP STABLE (Yash) → if unknown → SendGrid fallback
                 // ───────────────────────────────────────────────
                 try {
-                  console.log(`\n🔍 [BULK][${E}] Starting SMTP stable validation...`);
+                  console.log(
+                    `\n🔍 [BULK][${E}] Starting SMTP stable validation...`,
+                  );
                   const stableRaw = await validateSMTPStable(E, {
                     logger,
                     trainingTag: "bulk",
@@ -1707,7 +1828,9 @@ module.exports = function bulkValidatorRouter(deps) {
                   console.log(`\n✅ [BULK][${E}] SMTP Stable Result:`);
                   console.log(`   Status: ${stableRaw.status}`);
                   console.log(`   Category: ${stableRaw.category}`);
-                  console.log(`   Sub-Status: ${stableRaw.sub_status || "N/A"}`);
+                  console.log(
+                    `   Sub-Status: ${stableRaw.sub_status || "N/A"}`,
+                  );
 
                   smtpStableCat =
                     stableRaw.category || categoryFromStatus(stableRaw.status);
@@ -1715,16 +1838,23 @@ module.exports = function bulkValidatorRouter(deps) {
                   // Yash strict: stableRaw.category === "unknown"
                   if (stableRaw.category === "unknown") {
                     console.log(
-                      `\n⚠️  [BULK][${E}] SMTP Stable returned UNKNOWN → Attempting SendGrid fallback...`
+                      `\n⚠️  [BULK][${E}] SMTP Stable returned UNKNOWN → Attempting SendGrid fallback...`,
                     );
 
                     try {
-                      console.log(`🚀 [BULK][${E}] Starting SendGrid fallback (stable)...`);
+                      console.log(
+                        `🚀 [BULK][${E}] Starting SendGrid fallback (stable)...`,
+                      );
                       const t0 = Date.now();
-                      const sgResult = await verifySendGrid(E, { logger, trainingTag: 'bulk' });
+                      const sgResult = await verifySendGrid(E, {
+                        logger,
+                        trainingTag: "bulk",
+                      });
                       const elapsed = Date.now() - t0;
 
-                      console.log(`\n✅ [BULK][${E}] SendGrid Fallback (${elapsed}ms):`);
+                      console.log(
+                        `\n✅ [BULK][${E}] SendGrid Fallback (${elapsed}ms):`,
+                      );
                       console.log(`   Status: ${sgResult.status}`);
                       console.log(`   Category: ${sgResult.category}`);
 
@@ -1732,7 +1862,10 @@ module.exports = function bulkValidatorRouter(deps) {
                         domain,
                         flags: { disposable: false, free: false, role: false },
                       };
-                      const sgTrueSendrResult = toTrueSendrFormat(sgResult, metaSg);
+                      const sgTrueSendrResult = toTrueSendrFormat(
+                        sgResult,
+                        metaSg,
+                      );
 
                       try {
                         await SendGridLog.create({
@@ -1751,7 +1884,9 @@ module.exports = function bulkValidatorRouter(deps) {
                           isFallback: true,
                           smtpCategory: stableRaw.category,
                           smtpSubStatus: stableRaw.sub_status,
-                          provider: stableRaw.provider || "Unknown (SMTP stable fallback)",
+                          provider:
+                            stableRaw.provider ||
+                            "Unknown (SMTP stable fallback)",
                           elapsed_ms: sgResult.elapsed_ms,
                           error: sgResult.error,
                           username,
@@ -1763,29 +1898,44 @@ module.exports = function bulkValidatorRouter(deps) {
                           rawResponse: sgResult,
                           elapsed_client_ms: elapsed,
                         });
-                        console.log(`✅ [BULK][${E}] SendGridLog saved (stable fallback)`);
+                        console.log(
+                          `✅ [BULK][${E}] SendGridLog saved (stable fallback)`,
+                        );
                       } catch (logErr) {
                         logger("sendgrid_log_error", logErr.message, "warn");
                       }
 
-                      console.log(`\n📚 [BULK][${E}] Building email history...`);
+                      console.log(
+                        `\n📚 [BULK][${E}] Building email history...`,
+                      );
                       const history = await buildHistoryForEmail(E);
 
-                      const merged = mergeSMTPWithHistory(sgTrueSendrResult, history, {
-                        domain: sgTrueSendrResult.domain || domain,
-                        provider: sgTrueSendrResult.provider || "SendGrid (stable fallback)",
-                      });
+                      const merged = mergeSMTPWithHistory(
+                        sgTrueSendrResult,
+                        history,
+                        {
+                          domain: sgTrueSendrResult.domain || domain,
+                          provider:
+                            sgTrueSendrResult.provider ||
+                            "SendGrid (stable fallback)",
+                        },
+                      );
 
-                      const subStatus = merged.sub_status || merged.subStatus || null;
-                      const status = merged.status || sgTrueSendrResult.status || "❔ Unknown";
-                      const cat = merged.category || categoryFromStatus(status || "");
+                      const subStatus =
+                        merged.sub_status || merged.subStatus || null;
+                      const status =
+                        merged.status ||
+                        sgTrueSendrResult.status ||
+                        "❔ Unknown";
+                      const cat =
+                        merged.category || categoryFromStatus(status || "");
 
                       const confidence =
                         typeof merged.confidence === "number"
                           ? merged.confidence
                           : typeof sgTrueSendrResult.confidence === "number"
-                          ? sgTrueSendrResult.confidence
-                          : null;
+                            ? sgTrueSendrResult.confidence
+                            : null;
 
                       const built = buildReasonAndMessage(status, subStatus, {
                         isDisposable: !!merged.isDisposable,
@@ -1802,27 +1952,41 @@ module.exports = function bulkValidatorRouter(deps) {
                         reason: merged.reason || built.reasonLabel,
                         message: merged.message || built.message,
                         domain: merged.domain || domain,
-                        domainProvider: merged.provider || "SendGrid (stable fallback)",
+                        domainProvider:
+                          merged.provider || "SendGrid (stable fallback)",
                         isDisposable: !!merged.isDisposable,
                         isFree: !!merged.isFree,
                         isRoleBased: !!merged.isRoleBased,
                         score:
                           typeof merged.score === "number"
                             ? merged.score
-                            : sgTrueSendrResult.score ?? 50,
+                            : (sgTrueSendrResult.score ?? 50),
                         timestamp: new Date(),
                         section: "bulk",
                       };
 
                       await replaceLatest(EmailLog, E, { email: E, ...final });
-                      await replaceLatest(UserEmailLog, E, { email: E, ...final });
+                      await replaceLatest(UserEmailLog, E, {
+                        email: E,
+                        ...final,
+                      });
 
-                      console.log(`\n✅ [BULK][${E}] SENDGRID STABLE FALLBACK COMPLETE`);
-                      console.log(`   Original SMTP Stable: ${stableRaw.category}`);
+                      console.log(
+                        `\n✅ [BULK][${E}] SENDGRID STABLE FALLBACK COMPLETE`,
+                      );
+                      console.log(
+                        `   Original SMTP Stable: ${stableRaw.category}`,
+                      );
                       console.log(`   SendGrid Result: ${sgResult.category}\n`);
                     } catch (sgError) {
-                      logger("sendgrid_stable_fallback_error", sgError.message, "warn");
-                      console.log(`⚠️  [BULK][${E}] SendGrid stable fallback failed → continue SMTP stable merge\n`);
+                      logger(
+                        "sendgrid_stable_fallback_error",
+                        sgError.message,
+                        "warn",
+                      );
+                      console.log(
+                        `⚠️  [BULK][${E}] SendGrid stable fallback failed → continue SMTP stable merge\n`,
+                      );
                     }
                   }
 
@@ -1830,13 +1994,19 @@ module.exports = function bulkValidatorRouter(deps) {
                   if (!final) {
                     const historyStable = await buildHistoryForEmail(E);
 
-                    const stable = mergeSMTPWithHistory(stableRaw, historyStable, {
-                      domain: stableRaw.domain || extractDomain(E),
-                      provider: stableRaw.provider || "Unavailable",
-                    });
+                    const stable = mergeSMTPWithHistory(
+                      stableRaw,
+                      historyStable,
+                      {
+                        domain: stableRaw.domain || extractDomain(E),
+                        provider: stableRaw.provider || "Unavailable",
+                      },
+                    );
 
-                    const subStatusS = stable.sub_status || stable.subStatus || null;
-                    const catS = stable.category || categoryFromStatus(stable.status);
+                    const subStatusS =
+                      stable.sub_status || stable.subStatus || null;
+                    const catS =
+                      stable.category || categoryFromStatus(stable.status);
 
                     const builtStable = buildReasonAndMessage(
                       stable.status,
@@ -1866,17 +2036,22 @@ module.exports = function bulkValidatorRouter(deps) {
                       isFree: !!stable.isFree,
                       isRoleBased: !!stable.isRoleBased,
                       score:
-                        typeof stable.score === "number"
-                          ? stable.score
-                          : 0,
+                        typeof stable.score === "number" ? stable.score : 0,
                       section: "bulk",
                     };
 
                     await replaceLatest(EmailLog, E, { email: E, ...final });
-                    await replaceLatest(UserEmailLog, E, { email: E, ...final });
+                    await replaceLatest(UserEmailLog, E, {
+                      email: E,
+                      ...final,
+                    });
                   }
                 } catch {
-                  const builtUnknown = buildReasonAndMessage("❔ Unknown", null, {});
+                  const builtUnknown = buildReasonAndMessage(
+                    "❔ Unknown",
+                    null,
+                    {},
+                  );
                   final = {
                     email: E,
                     status: "❔ Unknown",
@@ -1929,7 +2104,8 @@ module.exports = function bulkValidatorRouter(deps) {
               subStatus: final.subStatus || null,
               confidence:
                 typeof final.confidence === "number" ? final.confidence : null,
-              category: final.category || categoryFromStatus(final.status || ""),
+              category:
+                final.category || categoryFromStatus(final.status || ""),
               message: final.message,
               reason: final.reason,
             },
@@ -1939,9 +2115,7 @@ module.exports = function bulkValidatorRouter(deps) {
           );
         } catch {}
 
-        const cat = categoryFromStatus(final?.status);
-        if (["valid", "invalid", "risky"].includes(cat)) billableCount++;
-
+        const cat = getOutcomeCategory(final);
         await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, cat);
 
         return {
@@ -1977,12 +2151,9 @@ module.exports = function bulkValidatorRouter(deps) {
             sendProgressToFrontend(done, total0, sessionId, username, bulkId),
         );
 
-        // Bill only for checked categories
-        if (billableCount > 0) {
-          await User.updateOne({ username }, { $inc: { credits: -billableCount } });
-        }
-
-        console.log(`\n✅ [BULK][${bulkId}] All emails processed. Checking for SendGrid emails...`);
+        console.log(
+          `\n✅ [BULK][${bulkId}] All emails processed. Checking for SendGrid emails...`,
+        );
 
         // ============================================================
         // ✅ STEP 1: Track SendGrid emails that need webhook confirmation
@@ -1990,68 +2161,92 @@ module.exports = function bulkValidatorRouter(deps) {
         const sendgridMessageIds = [];
         const sendGridLogs = await SendGridLog.find({
           bulkId,
-          messageId: { $exists: true, $ne: null }
-        }).select('messageId email').lean();
+          messageId: { $exists: true, $ne: null },
+        })
+          .select("messageId email")
+          .lean();
 
-        sendGridLogs.forEach(log => {
+        sendGridLogs.forEach((log) => {
           if (log.messageId) {
             sendgridMessageIds.push(log.messageId);
           }
         });
 
-        console.log(`📊 [BULK][${bulkId}] Found ${sendgridMessageIds.length} SendGrid emails awaiting webhooks`);
+        console.log(
+          `📊 [BULK][${bulkId}] Found ${sendgridMessageIds.length} SendGrid emails awaiting webhooks`,
+        );
 
         // ============================================================
         // ✅ STEP 2: If SendGrid emails exist, wait for webhooks
         // ============================================================
         if (sendgridMessageIds.length > 0) {
           console.log(`⏸️  [BULK][${bulkId}] Entering webhook wait state...`);
-          
+
           // Update state to waiting_for_webhooks
           await UserBulkStat.findOneAndUpdate(
             { bulkId },
             {
               $set: {
-                state: 'waiting_for_webhooks',
-                phase: 'waiting_for_webhooks',
+                state: "waiting_for_webhooks",
+                phase: "waiting_for_webhooks",
                 sendgridEmailCount: sendgridMessageIds.length,
                 sendgridPendingCount: sendgridMessageIds.length,
                 sendgridMessageIds: sendgridMessageIds,
-                webhookTimeoutAt: new Date(Date.now() + 20000) // 20 second timeout
-              }
-            }
+                webhookTimeoutAt: new Date(Date.now() + 20000), // 20 second timeout
+              },
+            },
           );
-          
+
           // Send progress update to frontend
           if (sendBulkStatsToFrontend && sessionId) {
             sendBulkStatsToFrontend(sessionId, username, {
               bulkId,
-              state: 'waiting_for_webhooks',
-              phase: 'waiting_for_webhooks',
+              state: "waiting_for_webhooks",
+              phase: "waiting_for_webhooks",
               message: `Waiting for ${sendgridMessageIds.length} delivery confirmations...`,
               sendgridPending: sendgridMessageIds.length,
               sendgridTotal: sendgridMessageIds.length,
               progressCurrent: total,
-              progressTotal: total
+              progressTotal: total,
             });
           }
-          
+
           // Wait for webhooks
-          await waitForSendGridWebhooks(bulkId, username, sessionId, UserBulkStat);
-          
-          console.log(`✅ [BULK][${bulkId}] Webhook wait complete. Regenerating result file...`);
-          
+          await waitForSendGridWebhooks(
+            bulkId,
+            username,
+            sessionId,
+            UserBulkStat,
+          );
+
+          console.log(
+            `✅ [BULK][${bulkId}] Webhook wait complete. Regenerating result file...`,
+          );
+
           // ============================================================
           // ✅ STEP 3: Regenerate result file with updated statuses
           // ============================================================
-          const { saved: regeneratedSaved, catCounts: regeneratedCounts } = await regenerateResultFile(
-            bulkId,
-            username,
-            UserEmailLog,
-            UserBulkStat,
-            toValidate
-          );
-          
+          const { saved: regeneratedSaved, catCounts: regeneratedCounts } =
+            await regenerateResultFile(
+              bulkId,
+              username,
+              UserEmailLog,
+              UserBulkStat,
+              toValidate,
+            );
+
+          const finalCreditsUsed =
+            (regeneratedCounts.valid || 0) +
+            (regeneratedCounts.invalid || 0) +
+            (regeneratedCounts.risky || 0);
+
+          if (finalCreditsUsed > 0) {
+            await User.updateOne(
+              { username },
+              { $inc: { credits: -finalCreditsUsed } },
+            );
+          }
+
           // Update BulkStat with regenerated file and final counts
           await UserBulkStat.updateOne(
             { bulkId },
@@ -2063,7 +2258,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 resultFileId: regeneratedSaved.id,
                 resultMime: regeneratedSaved.contentType,
                 resultSize: regeneratedSaved.length,
-                creditsUsed: billableCount,
+                creditsUsed: finalCreditsUsed,
 
                 valid: regeneratedCounts.valid,
                 invalid: regeneratedCounts.invalid,
@@ -2084,7 +2279,7 @@ module.exports = function bulkValidatorRouter(deps) {
               state: "done",
               phase: "done",
               finishedAt: new Date().toISOString(),
-              creditsUsed: billableCount,
+              creditsUsed: finalCreditsUsed,
               counts: { ...regeneratedCounts },
               canDownload: true,
             });
@@ -2107,27 +2302,45 @@ module.exports = function bulkValidatorRouter(deps) {
 
           if (sessionId)
             setTimeout(
-              () => deps.progressStore.delete(`${username}:${sessionId}:${bulkId}`),
+              () =>
+                deps.progressStore.delete(`${username}:${sessionId}:${bulkId}`),
               60_000,
             );
 
           if (streamToRes) {
             res.setHeader("Content-Type", regeneratedSaved.contentType);
-            res.setHeader("Content-Disposition", `attachment; filename="validated_emails.xlsx"`);
+            res.setHeader(
+              "Content-Disposition",
+              `attachment; filename="validated_emails.xlsx"`,
+            );
             bucket(username).openDownloadStream(regeneratedSaved.id).pipe(res);
           }
         } else {
           // ============================================================
           // ✅ NO SendGrid emails - complete immediately (original flow)
           // ============================================================
-          console.log(`✅ [BULK][${bulkId}] No SendGrid emails - completing immediately`);
-          
+          console.log(
+            `✅ [BULK][${bulkId}] No SendGrid emails - completing immediately`,
+          );
+
           const printable = processed.filter(Boolean);
           const catCounts = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
           for (const row of printable) {
             const k = String(row.Category || "unknown").toLowerCase();
             if (catCounts[k] !== undefined) catCounts[k] += 1;
             else catCounts.unknown += 1;
+          }
+
+          const finalCreditsUsed =
+            (catCounts.valid || 0) +
+            (catCounts.invalid || 0) +
+            (catCounts.risky || 0);
+
+          if (finalCreditsUsed > 0) {
+            await User.updateOne(
+              { username },
+              { $inc: { credits: -finalCreditsUsed } },
+            );
           }
 
           const sheet = xlsx.utils.json_to_sheet(printable);
@@ -2157,7 +2370,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 resultFileId: saved.id,
                 resultMime: saved.contentType,
                 resultSize: saved.length,
-                creditsUsed: billableCount,
+                creditsUsed: finalCreditsUsed,
 
                 valid: catCounts.valid,
                 invalid: catCounts.invalid,
@@ -2178,7 +2391,7 @@ module.exports = function bulkValidatorRouter(deps) {
               state: "done",
               phase: "done",
               finishedAt: new Date().toISOString(),
-              creditsUsed: billableCount,
+              creditsUsed: finalCreditsUsed,
               counts: { ...catCounts },
               canDownload: true,
             });
@@ -2201,13 +2414,17 @@ module.exports = function bulkValidatorRouter(deps) {
 
           if (sessionId)
             setTimeout(
-              () => deps.progressStore.delete(`${username}:${sessionId}:${bulkId}`),
+              () =>
+                deps.progressStore.delete(`${username}:${sessionId}:${bulkId}`),
               60_000,
             );
 
           if (streamToRes) {
             res.setHeader("Content-Type", saved.contentType);
-            res.setHeader("Content-Disposition", `attachment; filename="validated_emails.xlsx"`);
+            res.setHeader(
+              "Content-Disposition",
+              `attachment; filename="validated_emails.xlsx"`,
+            );
             bucket(username).openDownloadStream(saved.id).pipe(res);
           }
         }
@@ -2218,12 +2435,17 @@ module.exports = function bulkValidatorRouter(deps) {
           await UserBulkStat.updateOne(
             { bulkId },
             {
-              $set: { state: "canceled", phase: "canceled", finishedAt: new Date() },
+              $set: {
+                state: "canceled",
+                phase: "canceled",
+                finishedAt: new Date(),
+              },
               $currentDate: { updatedAt: true },
             },
           );
 
-          if (streamToRes) return res.status(200).json({ ok: false, canceled: true });
+          if (streamToRes)
+            return res.status(200).json({ ok: false, canceled: true });
           return;
         }
 
@@ -2556,7 +2778,10 @@ module.exports = function bulkValidatorRouter(deps) {
     if (!doc || !doc.originalFileId)
       return res.status(404).send("Original not found");
 
-    res.setHeader("Content-Type", doc.originalMime || "application/octet-stream");
+    res.setHeader(
+      "Content-Type",
+      doc.originalMime || "application/octet-stream",
+    );
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="${doc.originalName || "uploaded.xlsx"}"`,
@@ -2593,7 +2818,9 @@ module.exports = function bulkValidatorRouter(deps) {
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="${
-        doc.originalName ? `validated_${doc.originalName}` : "validated_emails.xlsx"
+        doc.originalName
+          ? `validated_${doc.originalName}`
+          : "validated_emails.xlsx"
       }"`,
     );
 
@@ -2610,7 +2837,10 @@ module.exports = function bulkValidatorRouter(deps) {
     const worksheet = xlsx.utils.json_to_sheet([{ Email: "" }]);
     xlsx.utils.book_append_sheet(workbook, worksheet, "Template");
     const buffer = xlsx.write(workbook, { type: "buffer", bookType: "xlsx" });
-    res.setHeader("Content-Disposition", "attachment; filename=email_template.xlsx");
+    res.setHeader(
+      "Content-Disposition",
+      "attachment; filename=email_template.xlsx",
+    );
     res.setHeader(
       "Content-Type",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2754,7 +2984,11 @@ module.exports = function bulkValidatorRouter(deps) {
 
       if (sid) {
         const one = deps.progressStore.get(`${username}:${sid}:${bid}`);
-        if (one && typeof one.current === "number" && typeof one.total === "number") {
+        if (
+          one &&
+          typeof one.current === "number" &&
+          typeof one.total === "number"
+        ) {
           storeCurrent = one.current || 0;
           storeTotal = one.total || 0;
         }
