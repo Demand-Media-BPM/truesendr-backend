@@ -329,20 +329,14 @@ function toTrueSendrFormat(sgResult, meta = {}) {
   if (flags.role) score -= 10;
   score = Math.max(0, Math.min(100, score));
 
-  // Build status text with icon
-  const icon = 
-    sgResult.category === 'valid' ? '✅' :
-    sgResult.category === 'invalid' ? '❌' :
-    sgResult.category === 'risky' ? '⚠️' : '❔';
-
   const statusText =
-    sgResult.category === 'valid' ? 'Valid Email' :
-    sgResult.category === 'invalid' ? 'Invalid Email' :
+    sgResult.category === 'valid' ? 'Valid' :
+    sgResult.category === 'invalid' ? 'Invalid' :
     sgResult.category === 'risky' ? 'Risky' :
     'Unknown';
 
   return {
-    status: `${icon} ${statusText}`,
+    status: statusText,
     category: sgResult.category,
     sub_status: sgResult.sub_status,
     domain: sgResult.domain || meta.domain || 'N/A',

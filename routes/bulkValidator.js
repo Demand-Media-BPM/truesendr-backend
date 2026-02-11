@@ -1317,7 +1317,7 @@ module.exports = function bulkValidatorRouter(deps) {
 
                     final = {
                       email: E,
-                      status: "⚠️ Risky (High Bounce Domain)",
+                      status: "⚠️ Risky",
                       subStatus: "high_bounce_bank_healthcare",
                       confidence: 0.85,
                       category: "risky",

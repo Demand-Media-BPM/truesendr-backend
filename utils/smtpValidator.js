@@ -3384,44 +3384,17 @@ function toServerShape(r, extras) {
   else if (r.status === 'undeliverable') category = 'invalid';
   else if (r.status === 'risky') category = 'risky';
 
-  const icon =
-    r.status === 'deliverable'
-      ? '✅'
-      : r.status === 'undeliverable'
-      ? '❌'
-      : r.status === 'risky'
-      ? '⚠️'
-      : '❔';
-
   const text =
     r.status === 'deliverable'
-      ? r.sub_status === 'owner_verified'
-        ? 'Valid (Owner verified)'
-        : r.sub_status === 'gateway_accepted'
-        ? 'Valid (Gateway accepted)'
-        : r.sub_status === 'trained_domain_mostly_valid'
-        ? 'Valid (Domain mostly valid)'
-        : r.sub_status === 'gworkspace_deliverable_unconfirmed'
-        ? 'Valid Email'
-        : 'Valid Email'
+      ? 'Valid'
       : r.status === 'undeliverable'
-      ? 'Invalid Email'
+      ? 'Invalid'
       : r.status === 'risky'
-      ? r.sub_status === 'gworkspace_catchall_ambiguous'
-        ? 'Risky (Google Workspace catch-all)'
-        : r.sub_status === 'm365_ambiguous_5xx'
-        ? 'Risky (Microsoft 365 – ambiguous)'
-        : 'Risky'
-      : r.sub_status === 'gateway_hidden'
-      ? 'Unknown (Gateway protected)'
-      : r.sub_status === 'yahoo_greylist'
-      ? 'Unknown (Yahoo greylist)'
-      : r.sub_status === 'zoho_policy_unknown'
-      ? 'Unknown (Policy / Zoho)'
+      ? 'Risky'
       : 'Unknown';
 
   return {
-    status: `${icon} ${text}`,
+    status: text,
     category,
     domain: r.domain,
     provider: r.provider,

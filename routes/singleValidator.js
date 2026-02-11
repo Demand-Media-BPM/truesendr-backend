@@ -314,7 +314,7 @@ module.exports = function singleValidatorRouter(deps) {
 
         const invalidPayload = {
           email: E,
-          status: "❌ Invalid Email",
+          status: "Invalid",
           subStatus: "invalid_domain_no_mx",
           confidence: 0.99,
           category: "invalid",
@@ -392,10 +392,10 @@ module.exports = function singleValidatorRouter(deps) {
         username,
       );
 
-      const invalidPayload = {
-        email: E,
-        status: "❌ Invalid Email",
-        subStatus: "invalid_domain_dns_error",
+        const invalidPayload = {
+          email: E,
+          status: "Invalid",
+          subStatus: "invalid_domain_dns_error",
         confidence: 0.95,
         category: "invalid",
         reason: "Invalid Domain",
@@ -498,7 +498,7 @@ module.exports = function singleValidatorRouter(deps) {
 
           const riskyPayload = {
             email: E,
-            status: "⚠️ Risky (High Bounce Domain)",
+            status: "Risky",
             subStatus: "high_bounce_bank_healthcare",
             confidence: 0.85,
             category: "risky",
@@ -599,10 +599,10 @@ module.exports = function singleValidatorRouter(deps) {
             ? "sendgrid-bank-healthcare"
             : "sendgrid-proofpoint";
       
-      return res.json({
-        email: E,
-        status: "⏳ Processing (SendGrid)",
-        category: "pending",
+        return res.json({
+          email: E,
+          status: "Processing",
+          category: "pending",
         subStatus: "sendgrid_pending_webhook",
         message: "Email verification already in progress. Waiting for delivery confirmation...",
         domain,
@@ -684,10 +684,10 @@ module.exports = function singleValidatorRouter(deps) {
       }
       
       // Return response WITHOUT saving to EmailLog
-      return res.json({
-        email: E,
-        status: "⏳ Processing (SendGrid)",
-        category: "pending",
+        return res.json({
+          email: E,
+          status: "Processing",
+          category: "pending",
         subStatus: "sendgrid_pending_webhook",
         message: "Email sent for verification. Waiting for delivery confirmation...",
         domain,
@@ -976,7 +976,7 @@ module.exports = function singleValidatorRouter(deps) {
         logger("attach", "Another validation is already running; skipping duplicate", "info");
         return res.json({
           email: E,
-          status: "⏳ In progress",
+          status: "In progress",
           category: "unknown",
           via: "smtp",
           inProgress: true,
@@ -1081,7 +1081,7 @@ module.exports = function singleValidatorRouter(deps) {
         logger("attach", "Another verification is already running; attaching via WS", "info");
         return res.json({
           email: E,
-          status: "⏳ In progress",
+          status: "In progress",
           category: "unknown",
           via: "smtp",
           inProgress: true,
@@ -1729,7 +1729,7 @@ module.exports = function singleValidatorRouter(deps) {
         return {
           id: v._id,
           email: v.email,
-          status: v.status || "❔ Unknown",
+          status: v.status || "Unknown",
           subStatus: v.subStatus || null,
           confidence: typeof v.confidence === "number" ? v.confidence : null,
           category: v.category || categoryFromStatus(v.status || ""),
