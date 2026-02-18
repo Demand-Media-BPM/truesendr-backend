@@ -159,12 +159,23 @@ app.use(
   }),
 );
 app.use(compression());
+
+// ✅ Razorpay webhook needs RAW body for signature verification
+app.use("/api/payment", bodyParser.raw({ type: "application/json" }));
+
+
 app.use((req, res, next) => {
+  // ✅ Razorpay webhook must keep raw body untouched
+  if (req.originalUrl.startsWith("/api/payment")) return next();
+
   // SNS sometimes sends text/plain
-  if (req.headers["x-amz-sns-message-type"])
-    bodyParser.text({ type: "*/*" })(req, res, next);
-  else bodyParser.json()(req, res, next);
+  if (req.headers["x-amz-sns-message-type"]) {
+    return bodyParser.text({ type: "*/*" })(req, res, next);
+  }
+
+  return bodyParser.json()(req, res, next);
 });
+
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -767,6 +778,8 @@ const bulkValidatorRouter = require("./routes/bulkValidator")(routeDeps);
 const EmailFinderRouter = require("./routes/EmailFinder");
 const ToxicityCheckerRouter = require("./routes/ToxicityChecker")(routeDeps);
 const FileCleanerRouter = require("./routes/fileCleaner");
+const paymentRoutes = require("./routes/payment")(routeDeps);
+
 
 // 🆕 NEW: Training / dataset routes (Bouncer import, domain stats)
 const TrainingRouter = require("./routes/training")(routeDeps);
@@ -782,6 +795,8 @@ app.use("/api/finder", EmailFinderRouter());
 app.use("/api/toxicity", ToxicityCheckerRouter);
 app.use("/api/training", TrainingRouter);
 app.use("/api/phone", phoneValidatorRoutes);
+app.use("/api/payment", paymentRoutes);
+
 
 /* ✅ NEW: deliverability route must be mounted as factory to receive deps */
 app.use("/api/deliverability", deliverabilityRoutes(routeDeps));
