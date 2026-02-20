@@ -88,19 +88,20 @@ module.exports = function paymentRouter(_deps = {}) {
           .json({ ok: false, message: "Minimum purchase is 1000 credits" });
       }
 
-      // 🔧 IMPORTANT: set your pricing in INR (paise)
-      // If you want to keep the same UI numbers, set these envs to match frontend.
+      // 🔧 PRICING in USD (cents)      
       const PRICE_PER_CREDIT = Number(
-        process.env.CREDITS_PRICE_PER_CREDIT || 0.75,
-      ); // INR per credit (default example)
-      const GST_RATE = Number(process.env.CREDITS_GST_RATE || 0.18);
+        process.env.CREDITS_PRICE_PER_CREDIT || 0.008,
+      ); // USD per credit
+      const GST_RATE = Number(process.env.CREDITS_GST_RATE || 0.18); // 18% => 0.18
 
       const subTotal = credits * PRICE_PER_CREDIT;
       const tax = subTotal * GST_RATE;
       const total = subTotal + tax;
 
-      const amountPaise = Math.round((subTotal + tax) * 100);
-      if (amountPaise < 100) {
+      // Razorpay amount is always in the smallest currency unit
+      // USD -> cents
+      const amountMinor = Math.round(total * 100);
+      if (amountMinor < 50) {
         return res.status(400).json({
           ok: false,
           message: "Amount too small. Check pricing config.",
@@ -114,8 +115,8 @@ module.exports = function paymentRouter(_deps = {}) {
       const receipt = `ts_${username}_${Date.now()}`;
 
       const order = await rzp.orders.create({
-        amount: amountPaise,
-        currency: "INR",
+        amount: amountMinor,
+        currency: "USD",
         receipt,
         notes: {
           username,
@@ -127,8 +128,11 @@ module.exports = function paymentRouter(_deps = {}) {
         userId: user._id,
         username,
         credits,
-        amountPaise,
-        currency: "INR",
+
+        amountMinor, // ✅ new
+        amountPaise: amountMinor, // ✅ keep compatibility (optional but recommended)
+
+        currency: "USD",
         razorpayOrderId: order.id,
         status: "created",
         notes: order.notes || {},
@@ -144,7 +148,7 @@ module.exports = function paymentRouter(_deps = {}) {
         },
         pricing: {
           credits,
-          amountPaise,
+          amountMinor,
         },
       });
     } catch (err) {
@@ -244,11 +248,16 @@ module.exports = function paymentRouter(_deps = {}) {
         process.env.RAZORPAY_AUTO_CAPTURE === "true"
       ) {
         try {
-          await rzp.payments.capture(
-            razorpay_payment_id,
-            rec.amountPaise,
-            "INR",
-          );
+          const captureAmount = Number(rec.amountMinor ?? rec.amountPaise ?? 0);
+          if (!captureAmount) {
+            return res.status(500).json({
+              ok: false,
+              message:
+                "Order amount missing (amountMinor/amountPaise). Check DB schema.",
+            });
+          }
+
+          await rzp.payments.capture(razorpay_payment_id, captureAmount, "USD");
           rec.status = "captured";
           await rec.save();
         } catch (e) {

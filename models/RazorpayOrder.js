@@ -8,8 +8,10 @@ const razorpayOrderSchema = new mongoose.Schema(
 
     // credits purchase intent
     credits: { type: Number, required: true },
-    amountPaise: { type: Number, required: true },
-    currency: { type: String, default: "INR" },
+amountMinor: { type: Number, required: true },      // ✅ NEW (use this everywhere going forward)
+amountPaise: { type: Number, required: false },     // ✅ keep for old records (not required anymore)
+
+currency: { type: String, default: "USD" },         // ✅ default USD now
 
     // Razorpay identifiers
     razorpayOrderId: { type: String, required: true, unique: true, index: true },

@@ -1,4 +1,3 @@
-
 // // routes/EmailFinder.js
 // const express = require("express");
 // const mongoose = require("mongoose");
@@ -173,7 +172,6 @@
 //   const cat = String(vr.category || "").toLowerCase();
 //   return cat === "valid";
 // }
-
 
 // /* ───────────────────────────────────────────────────────────────
 //    PATTERNS
@@ -910,6 +908,7 @@ const express = require("express");
 const mongoose = require("mongoose");
 const multer = require("multer");
 const XLSX = require("xlsx");
+const dns = require("dns").promises;
 
 const User = require("../models/User");
 const FinderGlobal = require("../models/Finder");
@@ -936,7 +935,10 @@ const {
   toTrueSendrFormat,
 } = require("../utils/sendgridVerifier");
 const SendGridLog = require("../models/SendGridLog");
-const { classifyDomain, getDomainCategory } = require("../utils/domainClassifier");
+const {
+  classifyDomain,
+  getDomainCategory,
+} = require("../utils/domainClassifier");
 
 // GLOBAL collections (shared)
 const DomainPattern = require("../models/DomainPattern");
@@ -953,10 +955,7 @@ const upload = multer({
 ─────────────────────────────────────────────────────────────── */
 
 function normalizeTenant(username) {
-  return String(username || "")
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "-");
+  return String(username || "").trim().toLowerCase().replace(/\s+/g, "-");
 }
 
 function getUserDbByTenant(tenant) {
@@ -1011,6 +1010,10 @@ async function requireAuth(req, res, next) {
 /* ───────────────────────────────────────────────────────────────
    UTILITIES
 ─────────────────────────────────────────────────────────────── */
+
+function normEmail(x) {
+  return String(x || "").trim().toLowerCase();
+}
 
 function normalizeASCII(s = "") {
   return String(s || "")
@@ -1111,7 +1114,7 @@ function isDeliverable(vr = {}) {
 ─────────────────────────────────────────────────────────────── */
 
 async function buildHistoryForEmail(emailNorm) {
-  const E = String(emailNorm || "").trim().toLowerCase();
+  const E = normEmail(emailNorm);
   const domain = extractDomain(E);
   if (!domain || domain === "N/A") return {};
 
@@ -1363,22 +1366,48 @@ function makeCandidatesWithPriorityParts(domain, nameParts, preferredCodes = [])
 }
 
 /* ───────────────────────────────────────────────────────────────
-   ACCURATE VALIDATION (bulk-like decisioning) for ONE candidate
-   - Keeps Finder "success = Valid only"
-   - Adds: proofpoint/bank-healthcare sendgrid + training/domain merge
+   BULK-LIKE VALIDATION for ONE candidate
+   ✅ NO EmailLog (no global cache, no global writes)
 ─────────────────────────────────────────────────────────────── */
 
-const FRESH_DB_MS = Number(process.env.FRESH_DB_MS || 15 * 24 * 60 * 60 * 1000); // not used in this file currently but kept
+const FRESH_DB_MS = Number(process.env.FRESH_DB_MS || 15 * 24 * 60 * 60 * 1000);
 const FINDER_CONCURRENCY = Number(process.env.FINDER_CONCURRENCY || 8);
 
-async function validateCandidateAccurate({
+// FinderGlobal freshness window (no EmailLog)
+const FRESH_FINDER_MS = Number(
+  process.env.FRESH_FINDER_MS || 15 * 24 * 60 * 60 * 1000,
+);
+
+function normalizeOutcomeCategory(input) {
+  const s = String(input || "")
+    .trim()
+    .toLowerCase()
+    .replace(/^[^a-z0-9]+/g, "");
+
+  if (s === "valid" || s.startsWith("valid")) return "valid";
+  if (s === "invalid" || s.startsWith("invalid")) return "invalid";
+  if (s === "risky" || s.startsWith("risky")) return "risky";
+  if (s === "unknown" || s.startsWith("unknown")) return "unknown";
+
+  if (s.includes("valid")) return "valid";
+  if (s.includes("invalid") || s.includes("undeliverable")) return "invalid";
+  if (s.includes("risky") || s.includes("risk")) return "risky";
+
+  return "unknown";
+}
+
+function getOutcomeCategory(final) {
+  return normalizeOutcomeCategory(final?.category || final?.status || "");
+}
+
+async function validateCandidateBulkLike({
   email,
   username,
   jobId,
   domainLC,
-  nameParts,
+  cancel,
 }) {
-  const E = String(email || "").trim().toLowerCase();
+  const E = normEmail(email);
   const domain = extractDomain(E) || domainLC;
 
   const logger = (step, message, level = "info") => {
@@ -1387,8 +1416,81 @@ async function validateCandidateAccurate({
     );
   };
 
-  // classify domain (same as bulk)
-  const domainClassification = classifyDomain(domain);
+  // ✅ cooperative stop ASAP
+  if (cancel?.isStopped?.()) {
+    return { ok: false, out: null, source: "Live" };
+  }
+
+  // Early DNS/MX check
+  try {
+    const mxRecords = await dns.resolveMx(domain);
+    if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
+
+    if (!mxRecords || mxRecords.length === 0) {
+      logger(
+        "domain_validation",
+        `Domain ${domain} has no MX records - cannot receive emails`,
+        "warn",
+      );
+      const built = buildReasonAndMessage("Invalid", "invalid_domain_no_mx", {});
+      return {
+        ok: false,
+        out: {
+          email: E,
+          status: "❌ Invalid",
+          subStatus: "invalid_domain_no_mx",
+          category: "invalid",
+          confidence: 0.99,
+          reason: "Invalid Domain",
+          message:
+            built.message ||
+            `Domain ${domain} has no MX records and cannot receive emails`,
+          domain,
+          domainProvider: "N/A",
+          isDisposable: false,
+          isFree: false,
+          isRoleBased: false,
+          score: 0,
+        },
+        source: "Live",
+      };
+    }
+  } catch (dnsError) {
+    logger(
+      "domain_validation",
+      `DNS lookup failed for ${domain}: ${dnsError.message}`,
+      "warn",
+    );
+    const built = buildReasonAndMessage(
+      "Invalid",
+      "invalid_domain_dns_error",
+      {},
+    );
+    return {
+      ok: false,
+      out: {
+        email: E,
+        status: "❌ Invalid",
+        subStatus: "invalid_domain_dns_error",
+        category: "invalid",
+        confidence: 0.95,
+        reason: "Invalid Domain",
+        message: built.message || `Domain ${domain} does not exist or DNS failed`,
+        domain,
+        domainProvider: "N/A",
+        isDisposable: false,
+        isFree: false,
+        isRoleBased: false,
+        score: 0,
+      },
+      source: "Live",
+    };
+  }
+
+  if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
+
+  // Domain flags (same as bulk)
+  const domainClassification = classifyDomain(domain) || {};
   const isBankOrHealthcare =
     !!domainClassification &&
     (domainClassification.isBank || domainClassification.isHealthcare);
@@ -1396,11 +1498,20 @@ async function validateCandidateAccurate({
   let isProofpoint = false;
   try {
     isProofpoint = await isProofpointDomain(domain);
-  } catch {
+  } catch (e) {
     isProofpoint = false;
+    logger("proofpoint_check_error", e.message || "failed", "warn");
   }
 
-  // helper: evaluate a raw result through history merge + formatting
+  if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
+
+  // Track SMTP-only categories to apply “trust SMTP valid”
+  let smtpPrimaryCat = null;
+  let smtpStableCat = null;
+
+  let final = null;
+
+  // helper: merge with history and return final formatted object
   const finalize = async (raw, providerLabelForMerge) => {
     const history = await buildHistoryForEmail(E);
 
@@ -1413,38 +1524,29 @@ async function validateCandidateAccurate({
     const status = merged.status || raw.status || "❔ Unknown";
     const cat = merged.category || categoryFromStatus(status || "");
 
-    // build reason/message (same style)
+    const confidence =
+      typeof merged.confidence === "number"
+        ? merged.confidence
+        : typeof raw.confidence === "number"
+          ? raw.confidence
+          : null;
+
     const built = buildReasonAndMessage(status, subStatus, {
       isDisposable: !!merged.isDisposable,
       isRoleBased: !!merged.isRoleBased,
       isFree: !!merged.isFree,
     });
 
-    // IMPORTANT: if SMTP itself said valid, never downgrade to risky
-    const rawCat = raw.category || categoryFromStatus(raw.status || "");
-    let finalCat = String(cat || "unknown").toLowerCase();
-    let finalStatus = status;
-
-    if (String(rawCat).toLowerCase() === "valid" && finalCat === "risky") {
-      finalCat = "valid";
-      finalStatus = "✅ Valid";
-    }
-
     return {
       email: E,
-      status: finalStatus,
+      status,
       subStatus,
-      category: finalCat,
-      confidence:
-        typeof merged.confidence === "number"
-          ? merged.confidence
-          : typeof raw.confidence === "number"
-          ? raw.confidence
-          : null,
+      category: String(cat || "unknown").toLowerCase(),
+      confidence,
       reason: merged.reason || built.reasonLabel,
       message: merged.message || built.message,
       domain: merged.domain || domain,
-      domainProvider: merged.provider || raw.provider || "Unavailable",
+      domainProvider: merged.provider || raw.provider || providerLabelForMerge,
       isDisposable: !!merged.isDisposable,
       isFree: !!merged.isFree,
       isRoleBased: !!merged.isRoleBased,
@@ -1452,12 +1554,181 @@ async function validateCandidateAccurate({
         typeof merged.score === "number"
           ? merged.score
           : typeof raw.score === "number"
-          ? raw.score
-          : 0,
+            ? raw.score
+            : 0,
+      isCatchAll: merged.isCatchAll === true,
+      timestamp: new Date(),
     };
   };
 
-  // 1) For bank/healthcare or proofpoint → SendGrid FIRST (bulk behavior)
+  // ✅ Bulk-like: wait until webhook updates SendGridLog.status/category
+  const SENDGRID_WAIT_MS = Number(process.env.SENDGRID_WAIT_MS || 20000);
+  const SENDGRID_POLL_MS = Number(process.env.SENDGRID_POLL_MS || 750);
+
+  async function waitForSendGridFinalByMessageId(messageId) {
+    const started = Date.now();
+
+    while (Date.now() - started < SENDGRID_WAIT_MS) {
+      if (cancel?.isStopped?.()) return null;
+
+      const row = await SendGridLog.findOne({ messageId }).lean();
+      if (!row) {
+        await new Promise((r) => setTimeout(r, SENDGRID_POLL_MS));
+        continue;
+      }
+
+      if (row.webhookReceived === true) return row;
+
+      const cat = String(row.category || "").toLowerCase();
+      if (cat && cat !== "unknown") return row;
+
+      await new Promise((r) => setTimeout(r, SENDGRID_POLL_MS));
+    }
+
+    return null;
+  }
+
+  // helper: sendgrid → (pending => wait webhook) → toTrueSendrFormat → merge → return
+  async function doSendGrid({ providerLabel, isFallback, smtpRawForLog }) {
+    if (cancel?.isStopped?.()) {
+      logger("sendgrid_skip", "Skipped because winner already found", "info");
+      throw new Error("cancelled");
+    }
+
+    const t0 = Date.now();
+    const sgResult = await verifySendGrid(E, { logger, trainingTag: "finder" });
+    const elapsedMs = Date.now() - t0;
+    logger("sendgrid_time", `verifySendGrid elapsed=${elapsedMs}ms`, "info");
+
+    const messageId = sgResult?.messageId || sgResult?.sg_message_id || null;
+
+    // schema status enum: deliverable / undeliverable / risky / unknown
+    const schemaStatus = String(sgResult?.status || "unknown").toLowerCase();
+    const statusSafe = ["deliverable", "undeliverable", "risky", "unknown"].includes(
+      schemaStatus,
+    )
+      ? schemaStatus
+      : "unknown";
+
+    // schema category enum: valid / invalid / risky / unknown
+    const categorySafe = normalizeOutcomeCategory(
+      sgResult?.category || sgResult?.status || "unknown",
+    );
+
+    const isPendingLike =
+      categorySafe === "unknown" ||
+      /pending|processing|queued/i.test(String(sgResult?.sub_status || "")) ||
+      /pending|processing|queued/i.test(String(sgResult?.status || ""));
+
+    const metaSg = {
+      domain,
+      flags: { disposable: false, free: false, role: false },
+    };
+
+    let sgTrueSendr = toTrueSendrFormat(sgResult, metaSg);
+    sgTrueSendr.provider = providerLabel;
+    sgTrueSendr.domainProvider = providerLabel;
+
+    // ✅ Create SendGridLog row (required fields: status, category)
+    try {
+      await SendGridLog.create({
+        email: E,
+        domain,
+        username,
+        sessionId: null,
+        bulkId: null,
+
+        messageId,
+        status: statusSafe,
+        category: categorySafe,
+        sub_status:
+          sgResult?.sub_status || (isPendingLike ? "sendgrid_pending" : null),
+
+        confidence:
+          typeof sgResult?.confidence === "number" ? sgResult.confidence : 0.5,
+        score: typeof sgTrueSendr?.score === "number" ? sgTrueSendr.score : 50,
+
+        reason: sgResult?.reason || null,
+        statusCode: sgResult?.statusCode ?? null,
+        method: sgResult?.method || "web_api",
+
+        isProofpoint: !!isProofpoint,
+        isFallback: !!isFallback,
+
+        smtpCategory: smtpRawForLog?.category || null,
+        smtpSubStatus: smtpRawForLog?.sub_status || null,
+
+        provider: providerLabel,
+        elapsed_ms: sgResult?.elapsed_ms ?? null,
+        error: sgResult?.error || null,
+        rawResponse: sgResult,
+
+        isDisposable: !!sgTrueSendr?.isDisposable,
+        isFree: !!sgTrueSendr?.isFree,
+        isRoleBased: !!sgTrueSendr?.isRoleBased,
+      });
+    } catch (e) {
+      logger("sendgrid_log_error", e.message, "warn");
+    }
+
+    // ✅ if pending-like and messageId, wait for webhook update
+    if (isPendingLike && messageId) {
+      logger(
+        "sendgrid_wait",
+        `Pending-like → waiting webhook for messageId=${messageId}`,
+        "info",
+      );
+
+      const row = await waitForSendGridFinalByMessageId(messageId);
+
+      if (cancel?.isStopped?.()) return null;
+
+      if (row) {
+        sgTrueSendr = {
+          email: E,
+          domain,
+          provider: providerLabel,
+          status:
+            row.category === "valid"
+              ? "✅ Valid"
+              : row.category === "invalid"
+                ? "❌ Invalid"
+                : row.category === "risky"
+                  ? "⚠️ Risky"
+                  : "❔ Unknown",
+          sub_status: row.sub_status || null,
+          category: String(row.category || "unknown").toLowerCase(),
+          confidence: typeof row.confidence === "number" ? row.confidence : 0.85,
+          reason: row.bounceReason || row.reason || null,
+          message: row.bounceReason ? `SendGrid: ${row.bounceReason}` : null,
+          isDisposable: !!row.isDisposable,
+          isFree: !!row.isFree,
+          isRoleBased: !!row.isRoleBased,
+          score: typeof row.score === "number" ? row.score : 50,
+          isCatchAll: false,
+        };
+
+        logger(
+          "sendgrid_wait_done",
+          `Webhook finalized → ${sgTrueSendr.category}`,
+          "info",
+        );
+      } else {
+        logger(
+          "sendgrid_wait_timeout",
+          `No webhook final within ${SENDGRID_WAIT_MS}ms`,
+          "warn",
+        );
+      }
+    }
+
+    if (cancel?.isStopped?.()) return null;
+
+    const out = await finalize(sgTrueSendr, providerLabel);
+    return out;
+  }
+
+  // 1) SPECIAL DOMAIN → SendGrid first + bank/healthcare reputation gate
   if (isBankOrHealthcare || isProofpoint) {
     const domainCategory = isBankOrHealthcare
       ? getDomainCategory(domain)
@@ -1467,18 +1738,23 @@ async function validateCandidateAccurate({
       isBankOrHealthcare && isProofpoint
         ? "bank_healthcare_proofpoint"
         : isBankOrHealthcare
-        ? "bank_healthcare"
-        : "proofpoint",
-      `${domainCategory} detected → trying SendGrid verification first`,
+          ? "bank_healthcare"
+          : "proofpoint",
+      `${domainCategory} detected → using SendGrid verification`,
       "info",
     );
 
-    // Optional guard: high bounce bank/healthcare => mark risky fast (bulk behavior)
+    // bank/healthcare domain reputation gate (same as bulk)
     if (isBankOrHealthcare) {
       try {
         const domainStats = await DomainReputation.findOne({ domain }).lean();
+        if (cancel?.isStopped?.())
+          return { ok: false, out: null, source: "Live" };
+
         if (domainStats && domainStats.sent >= 5) {
-          const bounceRate = domainStats.invalid / domainStats.sent;
+          const bounceRate =
+            domainStats.sent > 0 ? domainStats.invalid / domainStats.sent : 0;
+
           logger(
             "domain_reputation",
             `Sent=${domainStats.sent} Invalid=${domainStats.invalid} BounceRate=${(
@@ -1488,9 +1764,9 @@ async function validateCandidateAccurate({
           );
 
           if (bounceRate >= 0.6) {
-            const fastRisky = {
+            const fastRiskyRaw = {
               email: E,
-              status: "⚠️ Risky (High Bounce Domain)",
+              status: "⚠️ Risky",
               sub_status: "high_bounce_bank_healthcare",
               category: "risky",
               confidence: 0.85,
@@ -1505,8 +1781,9 @@ async function validateCandidateAccurate({
               isRoleBased: false,
               score: 20,
             };
-            const out = await finalize(fastRisky, domainCategory);
-            return { ok: isDeliverable(out), out, source: "Live" };
+
+            final = await finalize(fastRiskyRaw, domainCategory);
+            return { ok: isDeliverable(final), out: final, source: "Live" };
           }
         }
       } catch (e) {
@@ -1514,236 +1791,124 @@ async function validateCandidateAccurate({
       }
     }
 
-    // SendGrid verify
     try {
-      const t0 = Date.now();
-      const sgResult = await verifySendGrid(E, { logger });
-      const elapsed = Date.now() - t0;
+      const providerLabel = `${domainCategory} (via SendGrid)`;
+      final = await doSendGrid({
+        providerLabel,
+        isFallback: false,
+        smtpRawForLog: null,
+      });
 
-      const metaSg = {
-        domain,
-        flags: { disposable: false, free: false, role: false },
-      };
-      const result = toTrueSendrFormat(sgResult, metaSg);
-
-      // ✅ Provider label for Proofpoint/Bank path
-      result.provider = `${domainCategory} (via SendGrid)`;
-
-      // best-effort log
-      try {
-        await SendGridLog.create({
-          email: E,
-          domain,
-          status: sgResult.status,
-          sub_status: sgResult.sub_status,
-          category: sgResult.category,
-          confidence: sgResult.confidence || 0.5,
-          score: result.score || 50,
-          reason: sgResult.reason,
-          messageId: sgResult.messageId,
-          statusCode: sgResult.statusCode,
-          method: sgResult.method || "web_api",
-          isProofpoint: !!isProofpoint,
-          isFallback: false,
-          provider: `${domainCategory} (via SendGrid)`,
-          elapsed_ms: sgResult.elapsed_ms,
-          error: sgResult.error,
-          username,
-          sessionId: null,
-          bulkId: null,
-          isDisposable: result.isDisposable,
-          isFree: result.isFree,
-          isRoleBased: result.isRoleBased,
-          rawResponse: sgResult,
-          elapsed_client_ms: elapsed,
-        });
-      } catch (logErr) {
-        logger("sendgrid_log_error", logErr.message, "warn");
+      if (final) {
+        return { ok: isDeliverable(final), out: final, source: "Live" };
       }
 
-      const out = await finalize(result, result.provider);
-      return { ok: isDeliverable(out), out, source: "Live" };
+      if (cancel?.isStopped?.())
+        return { ok: false, out: null, source: "Live" };
     } catch (sgErr) {
       logger("sendgrid_error", sgErr.message, "warn");
-      // fall through to SMTP
+      // fall through to SMTP path
     }
   }
 
-  // 2) SMTP path (bulk-like): validateSMTP first then stable if still unknown-ish
+  if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
+
+  // 2) SMTP prelim → if unknown -> SendGrid fallback
   try {
-    const prelimRaw = await validateSMTP(E, {
-      logger,
-      trainingTag: "finder",
-    });
+    const prelimRaw = await validateSMTP(E, { logger, trainingTag: "finder" });
 
-    // If prelim says unknown → try SendGrid fallback (bulk behavior)
-    const prelimCat = prelimRaw.category || categoryFromStatus(prelimRaw.status);
+    if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
 
-    if (String(prelimCat).toLowerCase() === "unknown") {
+    smtpPrimaryCat =
+      prelimRaw.category || categoryFromStatus(prelimRaw.status || "");
+
+    if (prelimRaw.category === "unknown" && !cancel?.isStopped?.()) {
+      logger(
+        "sendgrid_fallback",
+        "SMTP returned UNKNOWN → Attempting SendGrid fallback...",
+        "info",
+      );
       try {
-        logger(
-          "sendgrid_fallback",
-          "SMTP returned unknown → trying SendGrid fallback",
-          "warn",
-        );
-
-        const smtpProviderLabel = prelimRaw?.provider || "Unknown Provider";
-
-        const t0 = Date.now();
-        const sgResult = await verifySendGrid(E, { logger });
-        const elapsed = Date.now() - t0;
-
-        const metaSg = {
-          domain,
-          flags: { disposable: false, free: false, role: false },
-        };
-        const sgTrueSendrResult = toTrueSendrFormat(sgResult, metaSg);
-
-        // ✅ FIX: provider must reflect SMTP provider in fallback path (NOT proofpoint)
-        sgTrueSendrResult.provider = `${smtpProviderLabel} (via SendGrid)`;
-
-        // best-effort log
-        try {
-          await SendGridLog.create({
-            email: E,
-            domain,
-            status: sgResult.status,
-            sub_status: sgResult.sub_status,
-            category: sgResult.category,
-            confidence: sgResult.confidence || 0.5,
-            score: sgTrueSendrResult.score || 50,
-            reason: sgResult.reason,
-            messageId: sgResult.messageId,
-            statusCode: sgResult.statusCode,
-            method: sgResult.method || "web_api",
-            isProofpoint: false,
-            isFallback: true,
-            smtpCategory: prelimRaw.category,
-            smtpSubStatus: prelimRaw.sub_status,
-            provider: sgTrueSendrResult.provider,
-            elapsed_ms: sgResult.elapsed_ms,
-            error: sgResult.error,
-            username,
-            sessionId: null,
-            bulkId: null,
-            isDisposable: sgTrueSendrResult.isDisposable,
-            isFree: sgTrueSendrResult.isFree,
-            isRoleBased: sgTrueSendrResult.isRoleBased,
-            rawResponse: sgResult,
-            elapsed_client_ms: elapsed,
-          });
-        } catch (logErr) {
-          logger("sendgrid_log_error", logErr.message, "warn");
-        }
-
-        const out = await finalize(sgTrueSendrResult, sgTrueSendrResult.provider);
-        return { ok: isDeliverable(out), out, source: "Live" };
-      } catch (e) {
-        logger("sendgrid_fallback_error", e.message, "warn");
+        final = await doSendGrid({
+          providerLabel: "SendGrid (fallback)",
+          isFallback: true,
+          smtpRawForLog: prelimRaw,
+        });
+      } catch (sgError) {
+        logger("sendgrid_fallback_error", sgError.message, "warn");
       }
     }
 
-    // Merge prelim with history; if not unknown => accept
-    const prelimOut = await finalize(
-      {
-        ...prelimRaw,
-        category:
-          prelimRaw.category || categoryFromStatus(prelimRaw.status || ""),
-      },
-      prelimRaw.provider || "Unavailable",
-    );
+    if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
 
-    if (String(prelimOut.category).toLowerCase() !== "unknown") {
-      return { ok: isDeliverable(prelimOut), out: prelimOut, source: "Live" };
+    // If still not final: merge prelim SMTP with history; accept if not unknown
+    if (!final) {
+      const prelimMerged = await finalize(
+        {
+          ...prelimRaw,
+          category:
+            prelimRaw.category || categoryFromStatus(prelimRaw.status || ""),
+        },
+        prelimRaw.provider || "Unavailable",
+      );
+
+      if (
+        String(prelimMerged.category || "unknown").toLowerCase() !== "unknown"
+      ) {
+        final = prelimMerged;
+      }
     }
 
-    // else run stable
-    const stableRaw = await validateSMTPStable(E, {
-      logger,
-      trainingTag: "finder",
-    });
+    if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
 
-    const stableCat =
-      stableRaw.category || categoryFromStatus(stableRaw.status);
+    // 3) If still not final => SMTP stable → if unknown -> SendGrid fallback
+    if (!final) {
+      const stableRaw = await validateSMTPStable(E, {
+        logger,
+        trainingTag: "finder",
+      });
 
-    if (String(stableCat).toLowerCase() === "unknown") {
-      // stable unknown → try SendGrid fallback (bulk behavior)
-      try {
+      if (cancel?.isStopped?.())
+        return { ok: false, out: null, source: "Live" };
+
+      smtpStableCat =
+        stableRaw.category || categoryFromStatus(stableRaw.status || "");
+
+      if (stableRaw.category === "unknown" && !cancel?.isStopped?.()) {
         logger(
           "sendgrid_stable_fallback",
-          "SMTP stable returned unknown → trying SendGrid fallback",
-          "warn",
+          "SMTP Stable returned UNKNOWN → Attempting SendGrid fallback...",
+          "info",
         );
-
-        const smtpProviderLabel = stableRaw?.provider || "Unknown Provider";
-
-        const t0 = Date.now();
-        const sgResult = await verifySendGrid(E, { logger });
-        const elapsed = Date.now() - t0;
-
-        const metaSg = {
-          domain,
-          flags: { disposable: false, free: false, role: false },
-        };
-        const sgTrueSendrResult = toTrueSendrFormat(sgResult, metaSg);
-
-        // ✅ FIX: provider must reflect SMTP provider in fallback path
-        sgTrueSendrResult.provider = `${smtpProviderLabel} (via SendGrid)`;
-
-        // best-effort log
         try {
-          await SendGridLog.create({
-            email: E,
-            domain,
-            status: sgResult.status,
-            sub_status: sgResult.sub_status,
-            category: sgResult.category,
-            confidence: sgResult.confidence || 0.5,
-            score: sgTrueSendrResult.score || 50,
-            reason: sgResult.reason,
-            messageId: sgResult.messageId,
-            statusCode: sgResult.statusCode,
-            method: sgResult.method || "web_api",
-            isProofpoint: false,
+          final = await doSendGrid({
+            providerLabel: "SendGrid (stable fallback)",
             isFallback: true,
-            smtpCategory: stableRaw.category,
-            smtpSubStatus: stableRaw.sub_status,
-            provider: sgTrueSendrResult.provider,
-            elapsed_ms: sgResult.elapsed_ms,
-            error: sgResult.error,
-            username,
-            sessionId: null,
-            bulkId: null,
-            isDisposable: sgTrueSendrResult.isDisposable,
-            isFree: sgTrueSendrResult.isFree,
-            isRoleBased: sgTrueSendrResult.isRoleBased,
-            rawResponse: sgResult,
-            elapsed_client_ms: elapsed,
+            smtpRawForLog: stableRaw,
           });
-        } catch (logErr) {
-          logger("sendgrid_log_error", logErr.message, "warn");
+        } catch (sgError) {
+          logger("sendgrid_stable_fallback_error", sgError.message, "warn");
         }
+      }
 
-        const out = await finalize(sgTrueSendrResult, sgTrueSendrResult.provider);
-        return { ok: isDeliverable(out), out, source: "Live" };
-      } catch (e) {
-        logger("sendgrid_stable_fallback_error", e.message, "warn");
+      if (cancel?.isStopped?.())
+        return { ok: false, out: null, source: "Live" };
+
+      if (!final) {
+        final = await finalize(
+          {
+            ...stableRaw,
+            category:
+              stableRaw.category || categoryFromStatus(stableRaw.status || ""),
+          },
+          stableRaw.provider || "Unavailable",
+        );
       }
     }
-
-    const stableOut = await finalize(
-      {
-        ...stableRaw,
-        category: stableRaw.category || categoryFromStatus(stableRaw.status || ""),
-      },
-      stableRaw.provider || "Unavailable",
-    );
-
-    return { ok: isDeliverable(stableOut), out: stableOut, source: "Live" };
   } catch (e) {
     logger("smtp_error", e?.message || "SMTP error", "warn");
     const builtUnknown = buildReasonAndMessage("❔ Unknown", null, {});
-    const out = {
+    final = {
       email: E,
       status: "❔ Unknown",
       subStatus: null,
@@ -1757,67 +1922,110 @@ async function validateCandidateAccurate({
       isFree: false,
       isRoleBased: false,
       score: 0,
+      isCatchAll: false,
+      timestamp: new Date(),
     };
-    return { ok: false, out, source: "Live" };
   }
+
+  if (cancel?.isStopped?.()) return { ok: false, out: null, source: "Live" };
+
+  // ✅ Bulk rule: always trust SMTP Valid over history downgrade to Risky
+  if (final) {
+    const smtpCat = String(smtpStableCat || smtpPrimaryCat || "")
+      .trim()
+      .toLowerCase();
+    const finalCat = String(getOutcomeCategory(final)).toLowerCase();
+
+    if (smtpCat === "valid" && finalCat === "risky") {
+      final.category = "valid";
+      final.status = "✅ Valid";
+    }
+  }
+
+  return {
+    ok: isDeliverable(final),
+    out: final,
+    source: "Live",
+  };
 }
 
 /* ───────────────────────────────────────────────────────────────
-   FIND deliverable among candidates (same "first valid wins")
+   FIND deliverable among candidates (first valid wins)
+   ✅ worker-pool + cooperative stop
 ─────────────────────────────────────────────────────────────── */
 
 async function findDeliverableParallelEnhanced(
   candidates,
-  { concurrency = FINDER_CONCURRENCY, username, jobId, domainLC, nameParts },
+  { concurrency = FINDER_CONCURRENCY, username, jobId, domainLC },
 ) {
-  for (let i = 0; i < candidates.length; i += concurrency) {
-    const slice = candidates.slice(i, i + concurrency);
+  let nextIndex = 0;
+  let winner = null;
+  let stopped = false;
 
-    const results = await Promise.all(
-      slice.map(async (cObj) => {
-        try {
-          const r = await validateCandidateAccurate({
-            email: cObj.email,
-            username,
-            jobId,
-            domainLC,
-            nameParts,
-          });
-          return {
-            code: cObj.code,
-            email: cObj.email,
-            out: r?.out || null,
-            ok: !!r?.ok,
-          };
-        } catch {
-          return { code: cObj.code, email: cObj.email, out: null, ok: false };
-        }
-      }),
-    );
+  const cancel = {
+    isStopped: () => stopped,
+    stop: () => {
+      stopped = true;
+    },
+  };
 
-    const deliverables = results.filter((r) => r.ok);
-    if (deliverables.length) {
-      // pick earliest in the original candidate order
-      let best = deliverables[0];
-      let bestIdx = candidates.findIndex((c) => c.email === best.email);
+  async function runOne(cObj) {
+    if (cancel.isStopped()) return null;
 
-      for (const d of deliverables) {
-        const idx = candidates.findIndex((c) => c.email === d.email);
-        if (idx >= 0 && idx < bestIdx) {
-          best = d;
-          bestIdx = idx;
-        }
-      }
+    const r = await validateCandidateBulkLike({
+      email: cObj.email,
+      username,
+      jobId,
+      domainLC,
+      cancel,
+    });
 
+    if (cancel.isStopped()) return null;
+
+    if (r?.ok) {
+      cancel.stop();
       return {
-        email: best.email,
-        final: best.out, // ✅ merged final object
-        code: best.code,
-        index: bestIdx,
+        code: cObj.code,
+        email: cObj.email,
+        out: r.out,
+        source: r.source || "Live",
       };
     }
+
+    return null;
   }
-  return null;
+
+  async function worker() {
+    while (!cancel.isStopped()) {
+      const i = nextIndex++;
+      if (i >= candidates.length) return;
+
+      const cObj = candidates[i];
+      try {
+        const got = await runOne(cObj);
+        if (got && !winner) {
+          winner = { ...got, index: i };
+          cancel.stop();
+          return;
+        }
+      } catch {
+        // ignore
+      }
+    }
+  }
+
+  const n = Math.max(1, Math.min(concurrency, candidates.length));
+  await Promise.all(Array.from({ length: n }, () => worker()));
+
+  if (!winner) return null;
+
+  return {
+    email: winner.email,
+    final: winner.out,
+    code: winner.code,
+    index: winner.index,
+    source: winner.source,
+  };
 }
 
 /* ───────────────────────────────────────────────────────────────
@@ -1875,9 +2083,7 @@ module.exports = function EmailFinderRouter() {
           const { base, tld } = splitBaseAndTld(domain);
           const sampleEmail = rawEmail ? String(rawEmail).trim() : null;
 
-          const update = {
-            $setOnInsert: { domain, base, tld, sampleEmail },
-          };
+          const update = { $setOnInsert: { domain, base, tld, sampleEmail } };
           if (sampleEmail) update.$inc = { emailsCount: 1 };
 
           bulkOps.push({
@@ -1897,9 +2103,7 @@ module.exports = function EmailFinderRouter() {
         }
 
         if (bulkOps.length > 0) {
-          const bulkResult = await Domain.bulkWrite(bulkOps, {
-            ordered: false,
-          });
+          const bulkResult = await Domain.bulkWrite(bulkOps, { ordered: false });
           affectedDomains +=
             (bulkResult.upsertedCount || 0) + (bulkResult.modifiedCount || 0);
         }
@@ -1990,7 +2194,9 @@ module.exports = function EmailFinderRouter() {
 
       const baseFilter = { userId, domain: domainLC, first, last };
 
-      /* ✅ 0) GLOBAL CACHE CHECK FIRST (BEFORE touching user record) */
+      /* ✅ 0) GLOBAL FINDER CACHE CHECK FIRST (NO EmailLog)
+         Trust global cache ONLY if FinderGlobal is fresh + Valid.
+      */
       const globalHit = await FinderGlobal.findOne({
         domain: domainLC,
         first,
@@ -1999,55 +2205,68 @@ module.exports = function EmailFinderRouter() {
       }).lean();
 
       if (globalHit?.email) {
-        await FinderGlobal.updateOne(
-          { _id: globalHit._id },
-          { $set: { updatedAt: new Date() } },
-        );
+        const gUpdated = new Date(
+          globalHit.updatedAt || globalHit.createdAt || 0,
+        ).getTime();
+        const gFresh = gUpdated ? Date.now() - gUpdated <= FRESH_FINDER_MS : false;
 
-        const userDoc = await Finder.findOneAndUpdate(
-          baseFilter,
-          {
-            $set: {
-              userId,
-              domain: domainLC,
-              first,
-              last,
-              nameInput: fullName.trim(),
-              state: "done",
-              status: globalHit.status || "Valid",
-              confidence: globalHit.confidence || "Med",
-              reason: globalHit.reason || "",
-              error: "",
-              email: globalHit.email,
-              updatedAt: new Date(),
+        const gStatus = String(globalHit.status || "").toLowerCase();
+        const gValid = gStatus === "valid";
+
+        if (gFresh && gValid) {
+          await FinderGlobal.updateOne(
+            { _id: globalHit._id },
+            { $set: { updatedAt: new Date() } },
+          );
+
+          const userDoc = await Finder.findOneAndUpdate(
+            baseFilter,
+            {
+              $set: {
+                userId,
+                domain: domainLC,
+                first,
+                last,
+                nameInput: fullName.trim(),
+                state: "done",
+                status: "Valid",
+                confidence: globalHit.confidence || "Med",
+                reason: globalHit.reason || "",
+                error: "",
+                email: globalHit.email, // valid only
+                updatedAt: new Date(),
+              },
+              $setOnInsert: { createdAt: new Date() },
             },
-            $setOnInsert: { createdAt: new Date() },
-          },
-          { upsert: true, new: true },
-        ).lean();
+            { upsert: true, new: true },
+          ).lean();
 
-        const quickPairs = buildFixedPairs(nameParts, domainLC);
-        const hit = quickPairs.find(
-          (p) => p.email.toLowerCase() === String(globalHit.email).toLowerCase(),
-        );
-        if (hit?.code) await recordPatternSuccessFromCache(domainLC, hit.code);
+          const quickPairs = buildFixedPairs(nameParts, domainLC);
+          const hit = quickPairs.find(
+            (p) => p.email.toLowerCase() === String(globalHit.email).toLowerCase(),
+          );
+          if (hit?.code) await recordPatternSuccessFromCache(domainLC, hit.code);
 
-        await User.findOneAndUpdate(
-          { _id: userId, credits: { $gt: 0 } },
-          { $inc: { credits: -1 } },
-          { new: true },
-        ).lean();
+          await User.findOneAndUpdate(
+            { _id: userId, credits: { $gt: 0 } },
+            { $inc: { credits: -1 } },
+            { new: true },
+          ).lean();
 
-        return res.json({ ok: true, jobId: String(userDoc._id) });
+          return res.json({ ok: true, jobId: String(userDoc._id) });
+        }
       }
 
-      /* ✅ 1) USER CACHE CHECK SECOND (BEFORE resetting) */
+      /* ✅ 1) USER FINDER CACHE CHECK SECOND (ONLY if stored result is Valid) */
       const userHit = await Finder.findOne({
         ...baseFilter,
         email: { $ne: null },
       }).lean();
 
-      if (userHit?.email) {
+      if (
+        userHit?.email &&
+        String(userHit.status || "").toLowerCase() === "valid"
+      ) {
         await Finder.updateOne(
           { _id: userHit._id, userId },
           { $set: { updatedAt: new Date() } },
@@ -2061,7 +2280,7 @@ module.exports = function EmailFinderRouter() {
               first,
               last,
               email: userHit.email,
-              status: userHit.status || "Valid",
+              status: "Valid",
               confidence: userHit.confidence || "Med",
               reason: userHit.reason || "",
               updatedAt: new Date(),
@@ -2109,7 +2328,6 @@ module.exports = function EmailFinderRouter() {
       // Background execution
       setImmediate(async () => {
         try {
-          // Domain patterns (unchanged)
           await bumpAttempts(domainLC);
           const preferredCodes = await getPreferredCodesForDomain(domainLC);
 
@@ -2119,13 +2337,11 @@ module.exports = function EmailFinderRouter() {
             preferredCodes,
           );
 
-          // ✅ enhanced, bulk-like per candidate
           const found = await findDeliverableParallelEnhanced(candidates, {
             concurrency: FINDER_CONCURRENCY,
             username,
             jobId: String(doc._id),
             domainLC,
-            nameParts,
           });
 
           if (!found) {
@@ -2150,23 +2366,26 @@ module.exports = function EmailFinderRouter() {
           const bestFinal = found.final || {};
           const bestCode = found.code;
 
-          // keep Finder contract: return only "Valid" result
           const confidence = deriveConfidence({
-            category: "valid",
+            category: bestFinal.category || "valid",
             reason: bestFinal.reason || "",
             subStatus: bestFinal.subStatus || bestFinal.sub_status || "",
             isCatchAll: bestFinal.isCatchAll,
-            smtpAccepted: true,
+            smtpAccepted: bestFinal.category === "valid",
           });
 
+          const finalIsValid =
+            String(bestFinal?.category || "").toLowerCase() === "valid";
+
+          // ✅ Store ONLY if final is Valid, else store null email
           await Finder.updateOne(
             { _id: doc._id, userId },
             {
               $set: {
                 state: "done",
-                status: "Valid",
+                status: finalIsValid ? "Valid" : "Unknown",
                 confidence,
-                email: bestEmail,
+                email: finalIsValid ? bestEmail : null,
                 reason: bestFinal?.reason || bestFinal?.message || "",
                 error: "",
                 updatedAt: new Date(),
@@ -2183,9 +2402,9 @@ module.exports = function EmailFinderRouter() {
                 last,
                 nameInput: fullName.trim(),
                 state: "done",
-                status: "Valid",
+                status: finalIsValid ? "Valid" : "Unknown",
                 confidence,
-                email: bestEmail,
+                email: finalIsValid ? bestEmail : null,
                 reason: bestFinal?.reason || bestFinal?.message || "",
                 error: "",
                 updatedAt: new Date(),
@@ -2195,9 +2414,12 @@ module.exports = function EmailFinderRouter() {
             { upsert: true },
           );
 
-          if (bestCode) await recordPatternSuccess(domainLC, bestCode);
+          if (finalIsValid && bestCode) await recordPatternSuccess(domainLC, bestCode);
 
-          await upsertDomainSample(domainLC, bestEmail);
+          // domain sample only if valid
+          if (finalIsValid) {
+            await upsertDomainSample(domainLC, bestEmail);
+          }
 
           await User.findOneAndUpdate(
             { _id: userId, credits: { $gt: 0 } },
