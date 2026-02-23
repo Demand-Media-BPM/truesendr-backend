@@ -551,6 +551,43 @@ function hasBankKeywords(domain) {
 }
 
 /**
+ * Check if domain contains the word "bank" as a substring (case-insensitive).
+ * Used to override Valid results to Risky for banking domains.
+ */
+function hasBankWordInDomain(domain) {
+  const d = String(domain || '').toLowerCase().trim();
+  if (!d || d === 'n/a') return false;
+  return d.includes('bank');
+}
+
+/**
+ * Check if domain ends with .org, .edu, .gov, or .mx (case-insensitive).
+ * These are organizational, educational, government, and Mexican TLD domains
+ * that are high-risk for cold email sending and should be marked Risky after validation.
+ */
+function isOrgEduGovDomain(domain) {
+  const d = String(domain || '').toLowerCase().trim();
+  if (!d || d === 'n/a') return false;
+  return (
+    d.endsWith('.org') ||
+    d.endsWith('.edu') ||
+    d.endsWith('.gov') ||
+    d.endsWith('.mx')
+  );
+}
+
+/**
+ * Check if domain ends with .tw (Taiwan ccTLD, case-insensitive).
+ * .tw domains are handled with a direct Risky override — no SMTP/SendGrid
+ * validation is attempted since these domains are unreachable via SMTP probing.
+ */
+function isTwDomain(domain) {
+  const d = String(domain || '').toLowerCase().trim();
+  if (!d || d === 'n/a') return false;
+  return d.endsWith('.tw');
+}
+
+/**
  * Check if domain contains healthcare-related keywords
  */
 function hasHealthcareKeywords(domain) {
@@ -619,6 +656,9 @@ module.exports = {
   isKnownBankDomain,
   isKnownHealthcareDomain,
   hasBankKeywords,
+  hasBankWordInDomain,
+  isOrgEduGovDomain,
+  isTwDomain,
   hasHealthcareKeywords,
   
   // Lists (for reference/extension)

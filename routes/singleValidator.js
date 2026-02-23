@@ -24,7 +24,7 @@ const {
 const SendGridLog = require("../models/SendGridLog");
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
-const { classifyDomain, getDomainCategory } = require("../utils/domainClassifier");
+const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain } = require("../utils/domainClassifier");
 
 module.exports = function singleValidatorRouter(deps) {
   const {
@@ -242,6 +242,38 @@ module.exports = function singleValidatorRouter(deps) {
       timestamp: rawResult.timestamp instanceof Date ? rawResult.timestamp : new Date(),
       section: "single",
     };
+
+    // ─────────────────────────────────────────────────────────
+    // 🏦 Bank domain override: if validation returned Valid AND
+    //    the domain contains "bank" → downgrade to Risky.
+    //    (Domain is good and mailbox exists, but banking domains
+    //     are high-risk for cold email sending.)
+    // ─────────────────────────────────────────────────────────
+    if (payload.category === "valid" && hasBankWordInDomain(payload.domain)) {
+      console.log(`[single][bank_override] ${E} → domain "${payload.domain}" contains "bank", overriding Valid → Risky`);
+      payload.status = "Risky";
+      payload.category = "risky";
+      payload.subStatus = "bank_domain";
+      payload.score = Math.min(payload.score, 45);
+      payload.reason = "Banking Domain";
+      payload.message = "This address belongs to a banking/financial domain. Sending cold emails to banking domains is risky and may result in blocks or bounces.";
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 🏛️ .org / .edu / .gov domain override: if validation returned
+    //    Valid AND domain ends with .org, .edu, or .gov → downgrade
+    //    to Risky. These are organizational, educational, and
+    //    government domains that are high-risk for cold email sending.
+    // ─────────────────────────────────────────────────────────
+    if (payload.category !== "invalid" && isOrgEduGovDomain(payload.domain)) {
+      console.log(`[single][org_edu_gov_override] ${E} → domain "${payload.domain}" ends with .org/.edu/.gov/.mx/.tw, overriding ${payload.category} → Risky`);
+      payload.status = "Risky";
+      payload.category = "risky";
+      payload.subStatus = "org_edu_gov_domain";
+      payload.score = Math.min(payload.score, 45);
+      payload.reason = "Restricted Domain TLD";
+      payload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
+    }
 
     // persist in both global + user DB
     await replaceLatest(EmailLogModel, E, payload);
@@ -845,6 +877,34 @@ module.exports = function singleValidatorRouter(deps) {
         if (!alreadyPaid) return res.status(400).json({ error: "You don't have credits" });
       }
 
+      // ─────────────────────────────────────────────────────────
+      // 🇹🇼 .tw domain direct Risky: skip all validation entirely.
+      //    SMTP cannot probe .tw domains reliably — return Risky immediately.
+      // ─────────────────────────────────────────────────────────
+      if (isTwDomain(extractDomain(E))) {
+        const twDomain = extractDomain(E);
+        console.log(`[single][tw_direct_risky] ${E} → domain "${twDomain}" ends with .tw, returning Risky directly (no SMTP/SendGrid)`);
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        const twPayload = {
+          email: E, status: "Risky", subStatus: "tw_domain", confidence: 0.9,
+          category: "risky", reason: "Restricted Country TLD",
+          message: "This address belongs to a Taiwanese domain (.tw). SMTP probing is unreliable for .tw domains and sending cold emails is risky.",
+          domain: twDomain, domainProvider: "Taiwan (.tw)", isDisposable: false,
+          isFree: false, isRoleBased: false, score: 30, timestamp: new Date(), section: "single",
+        };
+        await replaceLatest(EmailLog, E, twPayload);
+        await replaceLatest(UserEmailLog2, E, twPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: twPayload });
+        const credits = await debitOneCreditIfNeeded(username, twPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, twPayload.status, twPayload.timestamp, {
+          domain: twPayload.domain, provider: twPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: twPayload.score,
+          subStatus: twPayload.subStatus, confidence: twPayload.confidence,
+          category: twPayload.category, message: twPayload.message, reason: twPayload.reason,
+        }, sessionId, true, username, "single");
+        return res.json({ ...twPayload, via: "tw-direct", cached: false, credits });
+      }
+
       // Freshest cache (global + user)
       const { best: cachedDb, UserEmailLog } = await getFreshestFromDBs(
         mongoose,
@@ -1069,6 +1129,34 @@ module.exports = function singleValidatorRouter(deps) {
       if (user.credits <= 0) {
         const alreadyPaid = idemKey && idempoGet(username, E, idemKey);
         if (!alreadyPaid) return res.status(400).json({ error: "You don't have credits" });
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // 🇹🇼 .tw domain direct Risky (verify-smart): skip all validation.
+      // ─────────────────────────────────────────────────────────
+      if (isTwDomain(extractDomain(E))) {
+        const twDomain = extractDomain(E);
+        console.log(`[single][tw_direct_risky][verify-smart] ${E} → domain "${twDomain}" ends with .tw, returning Risky directly`);
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        const twPayload = {
+          email: E, status: "Risky", subStatus: "tw_domain", confidence: 0.9,
+          category: "risky", reason: "Restricted Country TLD",
+          message: "This address belongs to a Taiwanese domain (.tw). SMTP probing is unreliable for .tw domains and sending cold emails is risky.",
+          domain: twDomain, domainProvider: "Taiwan (.tw)", isDisposable: false,
+          isFree: false, isRoleBased: false, score: 30, timestamp: new Date(), section: "single",
+        };
+        await replaceLatest(EmailLog, E, twPayload);
+        await replaceLatest(UserEmailLog2, E, twPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: twPayload });
+        const twCredits = await debitOneCreditIfNeeded(username, twPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, twPayload.status, twPayload.timestamp, {
+          domain: twPayload.domain, provider: twPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: twPayload.score,
+          subStatus: twPayload.subStatus, confidence: twPayload.confidence,
+          category: twPayload.category, message: twPayload.message, reason: twPayload.reason,
+        }, sessionId, true, username, "single");
+        await markPendingDone(username, E);
+        return res.json({ ...twPayload, via: "tw-direct", cached: false, inProgress: false, credits: twCredits });
       }
 
       // OPTIONAL UI pending (does not affect validation logic)
@@ -1428,6 +1516,32 @@ module.exports = function singleValidatorRouter(deps) {
         section: "single",
       };
 
+      // ─────────────────────────────────────────────────────────
+      // 🏦 Bank domain override (prelim stage)
+      // ─────────────────────────────────────────────────────────
+      if (prelimPayload.category === "valid" && hasBankWordInDomain(prelimPayload.domain)) {
+        console.log(`[single][bank_override][prelim] ${E} → domain "${prelimPayload.domain}" contains "bank", overriding Valid → Risky`);
+        prelimPayload.status = "Risky";
+        prelimPayload.category = "risky";
+        prelimPayload.subStatus = "bank_domain";
+        prelimPayload.score = Math.min(prelimPayload.score, 45);
+        prelimPayload.reason = "Banking Domain";
+        prelimPayload.message = "This address belongs to a banking/financial domain. Sending cold emails to banking domains is risky and may result in blocks or bounces.";
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // 🏛️ .org / .edu / .gov domain override (prelim stage)
+      // ─────────────────────────────────────────────────────────
+      if (prelimPayload.category !== "invalid" && isOrgEduGovDomain(prelimPayload.domain)) {
+        console.log(`[single][org_edu_gov_override][prelim] ${E} → domain "${prelimPayload.domain}" ends with .org/.edu/.gov/.mx/.tw, overriding ${prelimPayload.category} → Risky`);
+        prelimPayload.status = "Risky";
+        prelimPayload.category = "risky";
+        prelimPayload.subStatus = "org_edu_gov_domain";
+        prelimPayload.score = Math.min(prelimPayload.score, 45);
+        prelimPayload.reason = "Restricted Domain TLD";
+        prelimPayload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
+      }
+
       await replaceLatest(EmailLog, E, prelimPayload);
       await replaceLatest(UserEmailLog, E, prelimPayload);
 
@@ -1539,6 +1653,32 @@ module.exports = function singleValidatorRouter(deps) {
             timestamp: new Date(),
             section: "single",
           };
+
+          // ─────────────────────────────────────────────────────────
+          // 🏦 Bank domain override (stable background stage)
+          // ─────────────────────────────────────────────────────────
+          if (finalPayload.category === "valid" && hasBankWordInDomain(finalPayload.domain)) {
+            console.log(`[single][bank_override][stable] ${E} → domain "${finalPayload.domain}" contains "bank", overriding Valid → Risky`);
+            finalPayload.status = "Risky";
+            finalPayload.category = "risky";
+            finalPayload.subStatus = "bank_domain";
+            finalPayload.score = Math.min(finalPayload.score, 45);
+            finalPayload.reason = "Banking Domain";
+            finalPayload.message = "This address belongs to a banking/financial domain. Sending cold emails to banking domains is risky and may result in blocks or bounces.";
+          }
+
+          // ─────────────────────────────────────────────────────────
+          // 🏛️ .org / .edu / .gov domain override (stable background stage)
+          // ─────────────────────────────────────────────────────────
+          if (finalPayload.category !== "invalid" && isOrgEduGovDomain(finalPayload.domain)) {
+            console.log(`[single][org_edu_gov_override][stable] ${E} → domain "${finalPayload.domain}" ends with .org/.edu/.gov/.mx/.tw, overriding ${finalPayload.category} → Risky`);
+            finalPayload.status = "Risky";
+            finalPayload.category = "risky";
+            finalPayload.subStatus = "org_edu_gov_domain";
+            finalPayload.score = Math.min(finalPayload.score, 45);
+            finalPayload.reason = "Restricted Domain TLD";
+            finalPayload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
+          }
 
           await replaceLatest(EmailLog, E, finalPayload);
           await replaceLatest(UserEmailLog, E, finalPayload);
