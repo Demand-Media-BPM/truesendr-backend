@@ -15,6 +15,7 @@ const TrainingSample = require("../models/TrainingSample");
 const {
   verifySendGrid,
   isProofpointDomain,
+  isMimecastDomain,
   toTrueSendrFormat,
 } = require("../utils/sendgridVerifier");
 
@@ -1279,6 +1280,14 @@ module.exports = function bulkValidatorRouter(deps) {
           logger("proofpoint_check_error", e.message || "failed", "warn");
         }
 
+        let isMimecast = false;
+        try {
+          isMimecast = await isMimecastDomain(domain);
+        } catch (e) {
+          isMimecast = false;
+          logger("mimecast_check_error", e.message || "failed", "warn");
+        }
+
         // Yash-style domain logs
         console.log(`🔵 [BULK][${E}] Extracted domain: ${domain}`);
         console.log(
@@ -1286,6 +1295,9 @@ module.exports = function bulkValidatorRouter(deps) {
         );
         console.log(
           `🔵 [BULK][${E}] Proofpoint: ${isProofpoint ? "YES" : "NO"}`,
+        );
+        console.log(
+          `🔵 [BULK][${E}] Mimecast: ${isMimecast ? "YES" : "NO"}`,
         );
         if (isBankOrHealthcare) {
           console.log(
@@ -1307,7 +1319,7 @@ module.exports = function bulkValidatorRouter(deps) {
             FRESH_DB_MS
           : false;
 
-        // If cached is UNKNOWN & bank/healthcare or proofpoint → force live
+        // If cached is UNKNOWN & bank/healthcare, proofpoint, or mimecast → force live
         const cachedCatForDecision = cached
           ? String(
               cached.category ||
@@ -1320,7 +1332,7 @@ module.exports = function bulkValidatorRouter(deps) {
           !!cached &&
           fresh &&
           cachedCatForDecision === "unknown" &&
-          (isBankOrHealthcare || isProofpoint);
+          (isBankOrHealthcare || isProofpoint || isMimecast);
 
         if (cached && fresh && !forceLiveBecauseCachedUnknown) {
           usedCache = true;
@@ -1385,18 +1397,23 @@ module.exports = function bulkValidatorRouter(deps) {
           };
         } else {
           // ───────────────────────────────────────────────────────
-          // 1) BANK/HEALTHCARE OR PROOFPOINT → SENDGRID FIRST (Yash)
+          // 1) BANK/HEALTHCARE OR PROOFPOINT OR MIMECAST → SENDGRID FIRST (Yash)
           // ───────────────────────────────────────────────────────
-          if (isBankOrHealthcare || isProofpoint) {
+          if (isBankOrHealthcare || isProofpoint || isMimecast) {
             const domainCategory = isBankOrHealthcare
               ? getDomainCategory(domain)
-              : "Proofpoint Email Protection";
+              : isMimecast
+                ? "Mimecast Email Security"
+                : "Proofpoint Email Protection";
 
             console.log(`\n${"=".repeat(60)}`);
-            if (isBankOrHealthcare && isProofpoint) {
-              console.log(`🏦🛡️  [BULK] BANK/HEALTHCARE + PROOFPOINT`);
+            if (isBankOrHealthcare && (isProofpoint || isMimecast)) {
+              const gatewayLabel = isProofpoint ? "PROOFPOINT" : "MIMECAST";
+              console.log(`[BULK] BANK/HEALTHCARE + ${gatewayLabel}`);
             } else if (isBankOrHealthcare) {
               console.log(`🏦 [BULK] BANK/HEALTHCARE DOMAIN`);
+            } else if (isMimecast) {
+              console.log(`🛡️  [BULK] MIMECAST DOMAIN`);
             } else {
               console.log(`🛡️  [BULK] PROOFPOINT DOMAIN`);
             }
@@ -1529,8 +1546,68 @@ module.exports = function bulkValidatorRouter(deps) {
               }
             }
 
-            // Reputation ok → SendGrid
-            console.log(`✅ [BULK][${E}] Reputation OK - Using SendGrid\n`);
+            // ─────────────────────────────────────────────────────────
+            // 🔍 SMTP existence check: only for bank/healthcare domains.
+            //    Proofpoint and Mimecast gateways block SMTP probes by
+            //    design (greylisting) — skip SMTP for them and go
+            //    directly to SendGrid to avoid multi-minute delays.
+            // ─────────────────────────────────────────────────────────
+            if (isBankOrHealthcare) {
+              console.log(`✅ [BULK][${E}] Reputation OK - Running SMTP existence check before SendGrid\n`);
+              try {
+                const smtpExistResult = await validateSMTP(E, { logger, trainingTag: "bulk" });
+                const smtpExistCat = smtpExistResult.category || categoryFromStatus(smtpExistResult.status || "");
+
+                if (smtpExistCat === "invalid") {
+                  logger("smtp_existence_check", `SMTP check: mailbox does not exist → returning Invalid (skipping SendGrid)`, "warn");
+                  const invalidFinal = {
+                    email: E,
+                    status: "Invalid",
+                    subStatus: smtpExistResult.sub_status || "mailbox_not_found",
+                    confidence: 0.95,
+                    category: "invalid",
+                    reason: "Invalid Mailbox",
+                    message: "SMTP check confirmed this mailbox does not exist on the server.",
+                    domain,
+                    domainProvider: domainCategory,
+                    isDisposable: false,
+                    isFree: false,
+                    isRoleBased: false,
+                    score: 0,
+                    timestamp: new Date(),
+                    section: "bulk",
+                  };
+                  await replaceLatest(EmailLog, E, { email: E, ...invalidFinal });
+                  await replaceLatest(UserEmailLog, E, { email: E, ...invalidFinal });
+                  const invalidCat = getOutcomeCategory(invalidFinal);
+                  await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, invalidCat);
+                  try {
+                    sendStatusToFrontend(E, invalidFinal.status, invalidFinal.timestamp, {
+                      domain: invalidFinal.domain, provider: invalidFinal.domainProvider,
+                      isDisposable: false, isFree: false, isRoleBased: false, score: 0,
+                      subStatus: invalidFinal.subStatus, confidence: invalidFinal.confidence,
+                      category: invalidFinal.category, message: invalidFinal.message, reason: invalidFinal.reason,
+                    }, sessionId, true, username);
+                  } catch {}
+                  return {
+                    Email: E, Status: "Invalid", Timestamp: new Date(invalidFinal.timestamp).toLocaleString(),
+                    Domain: domain, Provider: domainCategory, Disposable: "No", Free: "No",
+                    RoleBased: "No", Score: 0, SubStatus: invalidFinal.subStatus, Confidence: 0.95,
+                    Category: "invalid", Message: invalidFinal.message, Reason: invalidFinal.reason, Source: "Live",
+                  };
+                }
+
+                logger("smtp_existence_check", `SMTP check: mailbox exists (${smtpExistCat}) → proceeding to SendGrid`, "info");
+              } catch (smtpExistErr) {
+                // If SMTP existence check fails (timeout, connection error), proceed to SendGrid anyway
+                logger("smtp_existence_check", `SMTP existence check failed: ${smtpExistErr.message} → proceeding to SendGrid`, "warn");
+              }
+            } else {
+              // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
+              logger("smtp_existence_check", `Skipping SMTP check for ${domainCategory} (gateway blocks SMTP probes) → going directly to SendGrid`, "info");
+            }
+
+            console.log(`✅ [BULK][${E}] Proceeding to SendGrid\n`);
 
             try {
               console.log(`🚀 [BULK][${E}] Starting SendGrid verification...`);

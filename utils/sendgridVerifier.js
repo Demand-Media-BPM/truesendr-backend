@@ -35,6 +35,23 @@ async function isProofpointDomain(domain) {
 }
 
 /**
+ * Detect if domain uses Mimecast email security gateway
+ * @param {string} domain - Email domain to check
+ * @returns {Promise<boolean>} - True if Mimecast detected
+ */
+async function isMimecastDomain(domain) {
+  try {
+    const records = await dns.resolveMx(domain);
+    const mxHosts = records.map(r => r.exchange.toLowerCase()).join(',');
+    
+    // Check for Mimecast MX patterns
+    return /mimecast\.com|mimecast\.co\.za|mimecast\.co\.uk/i.test(mxHosts);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Send verification email via SendGrid
  * @param {string} email - Email address to verify
  * @param {object} options - Additional options
@@ -358,5 +375,6 @@ module.exports = {
   verifySendGrid,
   sendVerificationEmail,
   isProofpointDomain,
+  isMimecastDomain,
   toTrueSendrFormat
 };

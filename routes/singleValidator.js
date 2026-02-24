@@ -19,6 +19,7 @@ const TrainingSample = require("../models/TrainingSample");
 const {
   verifySendGrid,
   isProofpointDomain,
+  isMimecastDomain,
   toTrueSendrFormat,
 } = require("../utils/sendgridVerifier");
 const SendGridLog = require("../models/SendGridLog");
@@ -497,12 +498,15 @@ module.exports = function singleValidatorRouter(deps) {
       !!domainClassification?.isBank || !!domainClassification?.isHealthcare;
 
     const isProofpoint = await isProofpointDomain(domain);
+    const isMimecast = await isMimecastDomain(domain);
 
-    if (!isBankOrHealthcare && !isProofpoint) return null;
+    if (!isBankOrHealthcare && !isProofpoint && !isMimecast) return null;
 
     const domainCategory = isBankOrHealthcare
       ? getDomainCategory(domain)
-      : "Proofpoint Email Protection";
+      : isMimecast
+        ? "Mimecast Email Security"
+        : "Proofpoint Email Protection";
 
     const logger = mkLogger(sessionId, E, username);
 
@@ -598,6 +602,61 @@ module.exports = function singleValidatorRouter(deps) {
           });
         }
       }
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // 🔍 SMTP existence check: only for bank/healthcare domains.
+    //    Proofpoint and Mimecast gateways block SMTP probes by
+    //    design (greylisting) — skip SMTP for them and go
+    //    directly to SendGrid to avoid multi-minute delays.
+    // ─────────────────────────────────────────────────────────
+    if (isBankOrHealthcare) {
+      logger("smtp_existence_check", `Running SMTP existence check before SendGrid for ${domainCategory} domain`, "info");
+      try {
+        const smtpExistResult = await validateSMTP(E, { logger });
+        const smtpExistCat = smtpExistResult.category || categoryFromStatus(smtpExistResult.status || "");
+
+        if (smtpExistCat === "invalid") {
+          // Mailbox does not exist — return Invalid immediately, skip SendGrid
+          logger("smtp_existence_check", `SMTP check: mailbox does not exist → returning Invalid (skipping SendGrid)`, "warn");
+          const invalidPayload = {
+            email: E,
+            status: "Invalid",
+            subStatus: smtpExistResult.sub_status || "mailbox_not_found",
+            confidence: 0.95,
+            category: "invalid",
+            reason: "Invalid Mailbox",
+            message: "SMTP check confirmed this mailbox does not exist on the server.",
+            domain,
+            domainProvider: domainCategory,
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            score: 0,
+            timestamp: new Date(),
+            section: "single",
+          };
+          await replaceLatest(EmailLog, E, invalidPayload);
+          await replaceLatest(UserEmailLog2, E, invalidPayload);
+          sendStatusToFrontend(E, invalidPayload.status, invalidPayload.timestamp, {
+            domain: invalidPayload.domain, provider: invalidPayload.domainProvider,
+            isDisposable: false, isFree: false, isRoleBased: false, score: 0,
+            subStatus: invalidPayload.subStatus, confidence: invalidPayload.confidence,
+            category: invalidPayload.category, message: invalidPayload.message, reason: invalidPayload.reason,
+          }, sessionId, true, username, "single");
+          const userCredits = await debitOneCreditIfNeeded(username, invalidPayload.status, E, idemKey, "single");
+          if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: invalidPayload });
+          return res.json({ ...invalidPayload, via: "smtp-existence-check", cached: false, inProgress: false, credits: userCredits });
+        }
+
+        logger("smtp_existence_check", `SMTP check: mailbox exists (${smtpExistCat}) → proceeding to SendGrid`, "info");
+      } catch (smtpExistErr) {
+        // If SMTP existence check fails (timeout, connection error), proceed to SendGrid anyway
+        logger("smtp_existence_check", `SMTP existence check failed: ${smtpExistErr.message} → proceeding to SendGrid`, "warn");
+      }
+    } else {
+      // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
+      logger("smtp_existence_check", `Skipping SMTP check for ${domainCategory} (gateway blocks SMTP probes) → going directly to SendGrid`, "info");
     }
 
     logger(

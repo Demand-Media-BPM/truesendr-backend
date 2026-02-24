@@ -2620,33 +2620,37 @@ async function checkMailbox(mxHost, sender, rcpt, provider, domain, gatewayName,
       }
     }
 
-    // FAST EXIT: clean deliverable and we don't insist on catch-all probing
-    if (base.status === 'deliverable' && base.sub_status !== 'catch_all' && !STRICT_CATCHALL) {
-      try {
-        socket.write('QUIT\r\n');
-      } catch {}
-      return { result: base, signals };
-    }
+    // NOTE: FAST EXIT removed — we always probe a random address on the domain
+    // to detect catch-all behaviour. If a bogus address is also accepted (2xx),
+    // the domain is catch-all and the email must be marked risky.
 
-    // ───────────────── NULL-SENDER RE-CHECK (all providers) ─────────────────
-    await sendCmd(socket, 'RSET');
-    await sendCmd(socket, 'MAIL FROM:<>');
-    const realNull = await sendCmd(socket, `RCPT TO:<${rcpt}>`);
-    const codeNull = parseCode(realNull);
-    signals.realNullEnh = parseEnhanced(realNull);
+    // ───────────────── NULL-SENDER RE-CHECK (non-deliverable only) ──────────
+    // OPTIMIZATION: Skip null-sender re-check when real email is already
+    // deliverable (2xx). The null-sender re-check is only useful for:
+    //   - 5xx responses: detecting policy blocks (SPF/DMARC rejecting our sender)
+    //   - 4xx responses: greylisting confirmation
+    // For a 2xx deliverable result, it adds no value for catch-all detection
+    // and wastes ~500-1500ms per validation.
+    if (base.status !== 'deliverable') {
+      await sendCmd(socket, 'RSET');
+      await sendCmd(socket, 'MAIL FROM:<>');
+      const realNull = await sendCmd(socket, `RCPT TO:<${rcpt}>`);
+      const codeNull = parseCode(realNull);
+      signals.realNullEnh = parseEnhanced(realNull);
 
-    if (codeReal >= 500 && codeNull >= 200 && codeNull < 300) {
-      const eh = signals.realEnh || '';
-      if (isAccessDeniedPolicy(real1, eh) || isPolicyBlock(real1) || /^5\.7\./.test(eh)) {
-        signals.nullSenderAgreesDeliverable = true;
-        base = { status: 'deliverable', sub_status: 'accepted' };
+      if (codeReal >= 500 && codeNull >= 200 && codeNull < 300) {
+        const eh = signals.realEnh || '';
+        if (isAccessDeniedPolicy(real1, eh) || isPolicyBlock(real1) || /^5\.7\./.test(eh)) {
+          signals.nullSenderAgreesDeliverable = true;
+          base = { status: 'deliverable', sub_status: 'accepted' };
+        }
+      } else {
+        if (codeNull >= 200 && codeNull < 300 && codeReal >= 200 && codeReal < 300) {
+          if (betterThan(signals.realNullEnh, signals.realEnh)) signals.realEnh = signals.realNullEnh;
+          signals.nullSenderAgreesDeliverable = true;
+        }
+        if (codeNull >= 500 && codeReal >= 500) signals.nullSenderAgreesUndeliverable = true;
       }
-    } else {
-      if (codeNull >= 200 && codeNull < 300 && codeReal >= 200 && codeReal < 300) {
-        if (betterThan(signals.realNullEnh, signals.realEnh)) signals.realEnh = signals.realNullEnh;
-        signals.nullSenderAgreesDeliverable = true;
-      }
-      if (codeNull >= 500 && codeReal >= 500) signals.nullSenderAgreesUndeliverable = true;
     }
 
     // ───────────────── ALT SENDER RETRY (policy / SPF issues) ─────────────────
@@ -2690,9 +2694,16 @@ async function checkMailbox(mxHost, sender, rcpt, provider, domain, gatewayName,
     };
 
     const b1 = await bogusProbe(`MAIL FROM:<${sender}>`);
-    const b2 = await bogusProbe('MAIL FROM:<>');
-    const isCatchAll = (b1.code >= 200 && b1.code < 300) || (b2.code >= 200 && b2.code < 300);
+    // OPTIMIZATION: Short-circuit — if b1 already confirms catch-all (2xx),
+    // skip b2 entirely. Running b2 would be redundant and wastes ~500-1000ms.
+    const b1IsCatchAll = b1.code >= 200 && b1.code < 300;
+    const b2 = b1IsCatchAll ? { code: b1.code, enh: b1.enh } : await bogusProbe('MAIL FROM:<>');
+    const isCatchAll = b1IsCatchAll || (b2.code >= 200 && b2.code < 300);
     signals.bogusEnh = b1.enh || b2.enh || null;
+
+    // ── CACHE catch-all result for this domain ──────────────────────────────
+    // Subsequent emails on the same domain will be served from cache instantly.
+    catchAllCache.set(domain, { isCatchAll, until: Date.now() + CATCHALL_TTL_MS });
 
     const providerIsMimecast = /mimecast/i.test(provider || '');
     const isBigProvider = /google|mail\.protection\.outlook\.com|protection\.outlook\.com|outlook|yahoodns|protonmail|amazonses|awsapps/i.test(
@@ -3014,6 +3025,31 @@ async function validateSMTP(email, opts = {}) {
 
   const probeProfiles = buildProbeProfiles();
   const enterpriseProvider = isEnterpriseProvider(provider);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // CATCH-ALL DOMAIN CACHE CHECK
+  // If this domain was already probed and confirmed as catch-all, skip SMTP
+  // entirely and return risky immediately. This avoids redundant SMTP probing
+  // for every email on a known catch-all domain.
+  // ─────────────────────────────────────────────────────────────────────────
+  const cachedCatchAll = catchAllCache.get(domainLower);
+  if (cachedCatchAll && cachedCatchAll.until > Date.now() && cachedCatchAll.isCatchAll) {
+    result.status = 'risky';
+    result.sub_status = 'catch_all';
+    result.score = scoreFrom(result, result.flags);
+    logger('catchall_cache', `Domain ${domainLower} is a known catch-all (cached) → risky`);
+    const catchAllExtras = {
+      confidence: 0.75,
+      reason: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
+      provisional: true
+    };
+    const catchAllShaped = toServerShape(result, catchAllExtras);
+    catchAllShaped._stabilized = {
+      rounds: [{ category: catchAllShaped.category, sub_status: catchAllShaped.sub_status, confidence: catchAllShaped.confidence }],
+      elapsed_ms: 0
+    };
+    return catchAllShaped;
+  }
 
   // PROBING across MX hosts with our core checkMailboxWithEscalation
   let probe;
@@ -3465,11 +3501,12 @@ async function validateSMTPStable(email, opts = {}) {
     const r = await validateSMTP(email, opts);
     rounds.push(r);
 
-    // if policy already decided (bank/high-risk/government), no need for more rounds
+    // if policy already decided (bank/high-risk/government/catch-all), no need for more rounds
     if (
       r.sub_status === 'bank_domain_policy' ||
       r.sub_status === 'high_risk_domain_policy' ||
-      r.sub_status === 'government_domain_policy'
+      r.sub_status === 'government_domain_policy' ||
+      r.sub_status === 'catch_all'
     ) {
       logger(
         'policy_stable_loop',
