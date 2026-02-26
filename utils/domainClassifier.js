@@ -187,6 +187,7 @@ const BANK_DOMAINS = [
   // Investment/Corporate Banks
   'bny.com',
   'us.bny.com',
+  'bnymellon.com',
   'townebank.com',
   'citigroup.com',
   'jefferies.com',
@@ -503,6 +504,7 @@ const BANK_KEYWORDS = [
  * Keywords that indicate healthcare domains
  */
 const HEALTHCARE_KEYWORDS = [
+  'med',
   'health',
   'healthcare',
   'medical',
@@ -588,6 +590,24 @@ function isTwDomain(domain) {
 }
 
 /**
+ * Check if domain ends with a 2-letter country code TLD (ccTLD).
+ * Country-specific domains are high-risk for cold email sending — they are
+ * typically protected by strict national/corporate mail policies and should
+ * be marked Risky directly without SMTP/SendGrid validation.
+ * Examples: .es, .it, .br, .de, .fr, .uk, .cn, .jp, .au, .in, .nl, .pl
+ *
+ * @param {string} domain
+ * @returns {boolean}
+ */
+function isCcTLDDomain(domain) {
+  const d = String(domain || '').toLowerCase().trim();
+  if (!d || d === 'n/a') return false;
+  const parts = d.split('.');
+  const tld = parts[parts.length - 1];
+  return tld.length === 2;
+}
+
+/**
  * Check if domain contains healthcare-related keywords
  */
 function hasHealthcareKeywords(domain) {
@@ -659,6 +679,7 @@ module.exports = {
   hasBankWordInDomain,
   isOrgEduGovDomain,
   isTwDomain,
+  isCcTLDDomain,
   hasHealthcareKeywords,
   
   // Lists (for reference/extension)

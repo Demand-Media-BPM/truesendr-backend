@@ -87,27 +87,87 @@ async function sendVerificationEmail(email, options = {}) {
 
   logger('sendgrid', `Sending verification email to ${email}${isBulkMode ? ' (bulk mode)' : ''}`);
 
+  // ── Pick a random natural-looking subject + body so the email passes
+  // ── enterprise security gateways (Mimecast, Proofpoint) without being
+  // ── flagged as automated/verification mail.
+  const SUBJECTS = [
+    'Quick question',
+    'Following up',
+    'Checking in',
+    'Touching base',
+    'A quick note',
+    'Just reaching out',
+    'Hope this finds you well',
+    'Wanted to connect',
+    'Brief question for you',
+    'One quick thing',
+  ];
+
+  const BODIES = [
+    {
+      text: `Hi,\n\nI hope you're doing well. I wanted to reach out and see if you'd be open to a quick conversation about how we might be able to help your team.\n\nLooking forward to hearing from you.\n\nBest regards,\nJenny`,
+      html: `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.6;max-width:600px;padding:20px;">
+        <p>Hi,</p>
+        <p>I hope you're doing well. I wanted to reach out and see if you'd be open to a quick conversation about how we might be able to help your team.</p>
+        <p>Looking forward to hearing from you.</p>
+        <p>Best regards,<br><strong>Jenny</strong></p>
+      </div>`
+    },
+    {
+      text: `Hi,\n\nJust following up on my previous note — I'd love to connect when you have a moment. No pressure at all, just wanted to make sure this didn't get lost in your inbox.\n\nThanks,\nJenny`,
+      html: `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.6;max-width:600px;padding:20px;">
+        <p>Hi,</p>
+        <p>Just following up on my previous note — I'd love to connect when you have a moment. No pressure at all, just wanted to make sure this didn't get lost in your inbox.</p>
+        <p>Thanks,<br><strong>Jenny</strong></p>
+      </div>`
+    },
+    {
+      text: `Hi,\n\nHope your week is going well! I had a quick question I was hoping you could help me with — would you have 10 minutes for a brief call this week?\n\nAppreciate your time.\n\nWarm regards,\nJenny`,
+      html: `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.6;max-width:600px;padding:20px;">
+        <p>Hi,</p>
+        <p>Hope your week is going well! I had a quick question I was hoping you could help me with — would you have 10 minutes for a brief call this week?</p>
+        <p>Appreciate your time.</p>
+        <p>Warm regards,<br><strong>Jenny</strong></p>
+      </div>`
+    },
+    {
+      text: `Hi,\n\nI came across your contact and thought it would be worth reaching out. We've been working with a number of teams in your space and I think there could be a good fit.\n\nWould love to share more — let me know if you're open to it.\n\nBest,\nJenny`,
+      html: `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.6;max-width:600px;padding:20px;">
+        <p>Hi,</p>
+        <p>I came across your contact and thought it would be worth reaching out. We've been working with a number of teams in your space and I think there could be a good fit.</p>
+        <p>Would love to share more — let me know if you're open to it.</p>
+        <p>Best,<br><strong>Jenny</strong></p>
+      </div>`
+    },
+    {
+      text: `Hi,\n\nI wanted to check in and see how things are going on your end. If there's anything I can help with or if you'd like to reconnect, I'm happy to find a time that works.\n\nTake care,\nJenny`,
+      html: `<div style="font-family:Arial,sans-serif;font-size:14px;color:#222;line-height:1.6;max-width:600px;padding:20px;">
+        <p>Hi,</p>
+        <p>I wanted to check in and see how things are going on your end. If there's anything I can help with or if you'd like to reconnect, I'm happy to find a time that works.</p>
+        <p>Take care,<br><strong>Jenny</strong></p>
+      </div>`
+    },
+  ];
+
+  const randomSubject = SUBJECTS[Math.floor(Math.random() * SUBJECTS.length)];
+  const randomBody   = BODIES[Math.floor(Math.random() * BODIES.length)];
+
   const msg = {
     to: email,
     from: {
       email: SENDGRID_VERIFIED_SENDER,
-      name: 'TrueSendr Verification'
+      name: 'Jenny J'
     },
-    subject: 'Email Verification',
-    text: 'This is an automated email verification. No action required.',
-    html: `
-      <div style="font-family: Arial, sans-serif; padding: 20px; color: #333;">
-        <p>This is an automated email verification.</p>
-        <p style="color: #666; font-size: 12px;">No action required. This email confirms your address is active.</p>
-      </div>
-    `,
-    // Custom args for tracking
+    subject: randomSubject,
+    text: randomBody.text,
+    html: randomBody.html,
+    // Custom args for internal tracking (not visible to recipient)
     customArgs: {
-      verification: 'true',
-      email: email,
-      timestamp: new Date().toISOString()
+      ts_verify: '1',
+      ts_email: email,
+      ts_ts: new Date().toISOString()
     },
-    // Track clicks and opens
+    // Disable click tracking; keep open tracking for deliverability signal
     trackingSettings: {
       clickTracking: { enable: false },
       openTracking: { enable: true }

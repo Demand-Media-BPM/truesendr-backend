@@ -3539,7 +3539,87 @@ async function validateSMTPStable(email, opts = {}) {
   return final;
 }
 
-module.exports = { validateSMTP, validateSMTPStable };
+/* ────────────────────────────────────────────────────────────────────────────
+ *  CATCH-ALL DOMAIN PROBE (exported utility)
+ *
+ *  Checks whether a domain accepts any randomly generated email address.
+ *  Uses the in-memory catchAllCache for efficiency — no extra SMTP connection
+ *  if the domain was already probed during a previous validation.
+ *
+ *  If the domain is NOT in the cache, a quick SMTP probe is performed using a
+ *  randomly generated local-part. The result is cached for CATCHALL_TTL_MS.
+ *
+ *  @param {string} domain  - e.g. "changeagents.in"
+ *  @param {object} opts    - { logger }
+ *  @returns {Promise<boolean>} true if catch-all, false otherwise
+ * ──────────────────────────────────────────────────────────────────────────── */
+/**
+ * Check if a domain is a catch-all (accepts any randomly generated address).
+ *
+ * @param {string} domain
+ * @param {object} opts
+ *   - logger: function
+ *   - probeIfNotCached: boolean (default true)
+ *       When false, only the in-memory cache is checked. No SMTP probe is
+ *       performed if the domain is not cached. Use this for Proofpoint/Mimecast
+ *       domains where SMTP probes are meaningless (gateway accepts all) and
+ *       extremely slow (multiple MX hosts × profiles × retries = 60-90s).
+ * @returns {Promise<boolean>} true if catch-all, false otherwise
+ */
+async function checkDomainCatchAll(domain, opts = {}) {
+  const logger = typeof opts.logger === 'function' ? opts.logger : () => {};
+  const probeIfNotCached = opts.probeIfNotCached !== false; // default: true
+  const domainLower = String(domain || '').toLowerCase().trim();
+
+  // ── 1. Cache hit ──────────────────────────────────────────────────────────
+  const cached = catchAllCache.get(domainLower);
+  if (cached && cached.until > Date.now()) {
+    logger('catchall_cache', `Domain ${domainLower} catch-all (cached): ${cached.isCatchAll}`);
+    return cached.isCatchAll;
+  }
+
+  // ── 2. Skip probe if caller opted out ────────────────────────────────────
+  // Proofpoint/Mimecast gateways always accept emails at SMTP level regardless
+  // of whether the mailbox exists. An SMTP probe is therefore meaningless AND
+  // very slow (60-90s across multiple MX hosts). Skip it and return false so
+  // the caller can proceed to SendGrid for the real verification.
+  if (!probeIfNotCached) {
+    logger('catchall_cache', `Domain ${domainLower} not in cache; skipping SMTP probe (probeIfNotCached=false)`);
+    return false;
+  }
+
+  // ── 3. Probe a random address on the domain ───────────────────────────────
+  const randomLocal = `probe_${Math.random().toString(36).slice(2, 10)}`;
+  const randomEmail = `${randomLocal}@${domainLower}`;
+
+  logger('catchall_probe', `Probing random address ${randomEmail} to detect catch-all on ${domainLower}`);
+
+  try {
+    const result = await validateSMTP(randomEmail, { logger });
+
+    // validateSMTP populates catchAllCache inside checkMailbox with the correct
+    // isCatchAll value. Read it back so we get the right answer even for
+    // gateway domains where the shaped result may say 'gateway_accepted'
+    // instead of 'catch_all' (e.g. Proofpoint trusted-gateway path).
+    const cachedAfterProbe = catchAllCache.get(domainLower);
+    const isCatchAll = (cachedAfterProbe && cachedAfterProbe.until > Date.now())
+      ? cachedAfterProbe.isCatchAll
+      : result.sub_status === 'catch_all';
+
+    // Write to cache if not already written (e.g. early-return paths)
+    if (!catchAllCache.has(domainLower)) {
+      catchAllCache.set(domainLower, { isCatchAll, until: Date.now() + CATCHALL_TTL_MS });
+    }
+
+    logger('catchall_probe', `Domain ${domainLower} is${isCatchAll ? '' : ' NOT'} catch-all`);
+    return isCatchAll;
+  } catch (e) {
+    logger('catchall_probe_error', `Catch-all probe failed for ${domainLower}: ${e.message}`);
+    return false; // assume not catch-all on error → proceed normally
+  }
+}
+
+module.exports = { validateSMTP, validateSMTPStable, checkDomainCatchAll };
 
 
 

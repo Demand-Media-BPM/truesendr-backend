@@ -19,6 +19,9 @@ const {
   toTrueSendrFormat,
 } = require("../utils/sendgridVerifier");
 
+// Catch-all domain probe (used before Proofpoint/Mimecast SendGrid path)
+const { checkDomainCatchAll } = require("../utils/smtpValidator");
+
 const SendGridLog = require("../models/SendGridLog");
 
 const {
@@ -27,6 +30,7 @@ const {
   hasBankWordInDomain,
   isOrgEduGovDomain,
   isTwDomain,
+  isCcTLDDomain,
   // isHighRiskDomain, // (optional) not required, Yash also doesn't actually use it in worker
 } = require("../utils/domainClassifier");
 
@@ -1272,6 +1276,59 @@ module.exports = function bulkValidatorRouter(deps) {
           !!domainClassification &&
           (domainClassification.isBank || domainClassification.isHealthcare);
 
+        // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare → Risky directly ──────
+        // These domains are high-risk for cold email sending regardless of whether
+        // they use Proofpoint/Mimecast. Skip all validation and return Risky.
+        if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTLDDomain(domain)) {
+          const subStatus = isOrgEduGovDomain(domain) ? 'org_edu_gov_domain'
+            : isCcTLDDomain(domain) ? 'cctld_domain'
+            : 'bank_healthcare_domain';
+          const message = isOrgEduGovDomain(domain)
+            ? 'This address belongs to an organizational, educational, or government domain (.org/.edu/.gov). Sending cold emails to these domains is risky.'
+            : isCcTLDDomain(domain)
+            ? 'This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.'
+            : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
+
+          console.log(`[BULK][early_risky] ${E} → domain "${domain}" is ${subStatus} → returning Risky directly`);
+
+          const earlyRiskyFinal = {
+            email: E,
+            status: 'Risky',
+            subStatus,
+            confidence: 0.9,
+            category: 'risky',
+            reason: 'High-Risk Domain',
+            message,
+            domain,
+            domainProvider: 'N/A',
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            score: 30,
+            timestamp: new Date(),
+            section: 'bulk',
+          };
+
+          await replaceLatest(EmailLog, E, { email: E, ...earlyRiskyFinal });
+          await replaceLatest(UserEmailLog, E, { email: E, ...earlyRiskyFinal });
+          const earlyRiskyCat = getOutcomeCategory(earlyRiskyFinal);
+          await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, earlyRiskyCat);
+          try {
+            sendStatusToFrontend(E, earlyRiskyFinal.status, earlyRiskyFinal.timestamp, {
+              domain: earlyRiskyFinal.domain, provider: earlyRiskyFinal.domainProvider,
+              isDisposable: false, isFree: false, isRoleBased: false, score: earlyRiskyFinal.score,
+              subStatus: earlyRiskyFinal.subStatus, confidence: earlyRiskyFinal.confidence,
+              category: earlyRiskyFinal.category, message: earlyRiskyFinal.message, reason: earlyRiskyFinal.reason,
+            }, sessionId, true, username);
+          } catch {}
+          return {
+            Email: E, Status: 'Risky', Timestamp: new Date(earlyRiskyFinal.timestamp).toLocaleString(),
+            Domain: domain, Provider: 'N/A', Disposable: 'No', Free: 'No',
+            RoleBased: 'No', Score: 30, SubStatus: subStatus, Confidence: 0.9,
+            Category: 'risky', Message: message, Reason: 'High-Risk Domain', Source: 'Live',
+          };
+        }
+
         let isProofpoint = false;
         try {
           isProofpoint = await isProofpointDomain(domain);
@@ -1299,11 +1356,6 @@ module.exports = function bulkValidatorRouter(deps) {
         console.log(
           `🔵 [BULK][${E}] Mimecast: ${isMimecast ? "YES" : "NO"}`,
         );
-        if (isBankOrHealthcare) {
-          console.log(
-            `🔵 [BULK][${E}] Domain type: ${getDomainCategory(domain)}`,
-          );
-        }
 
         // Cache read (GLOBAL EmailLog)
         const cached = await EmailLog.findOne({ email: E }).sort({
@@ -1328,11 +1380,11 @@ module.exports = function bulkValidatorRouter(deps) {
             ).toLowerCase()
           : null;
 
+        // Never serve unknown results from cache — always re-validate
         const forceLiveBecauseCachedUnknown =
           !!cached &&
           fresh &&
-          cachedCatForDecision === "unknown" &&
-          (isBankOrHealthcare || isProofpoint || isMimecast);
+          cachedCatForDecision === "unknown";
 
         if (cached && fresh && !forceLiveBecauseCachedUnknown) {
           usedCache = true;
@@ -1546,66 +1598,59 @@ module.exports = function bulkValidatorRouter(deps) {
               }
             }
 
-            // ─────────────────────────────────────────────────────────
-            // 🔍 SMTP existence check: only for bank/healthcare domains.
-            //    Proofpoint and Mimecast gateways block SMTP probes by
-            //    design (greylisting) — skip SMTP for them and go
-            //    directly to SendGrid to avoid multi-minute delays.
-            // ─────────────────────────────────────────────────────────
-            if (isBankOrHealthcare) {
-              console.log(`✅ [BULK][${E}] Reputation OK - Running SMTP existence check before SendGrid\n`);
-              try {
-                const smtpExistResult = await validateSMTP(E, { logger, trainingTag: "bulk" });
-                const smtpExistCat = smtpExistResult.category || categoryFromStatus(smtpExistResult.status || "");
-
-                if (smtpExistCat === "invalid") {
-                  logger("smtp_existence_check", `SMTP check: mailbox does not exist → returning Invalid (skipping SendGrid)`, "warn");
-                  const invalidFinal = {
-                    email: E,
-                    status: "Invalid",
-                    subStatus: smtpExistResult.sub_status || "mailbox_not_found",
-                    confidence: 0.95,
-                    category: "invalid",
-                    reason: "Invalid Mailbox",
-                    message: "SMTP check confirmed this mailbox does not exist on the server.",
-                    domain,
-                    domainProvider: domainCategory,
-                    isDisposable: false,
-                    isFree: false,
-                    isRoleBased: false,
-                    score: 0,
-                    timestamp: new Date(),
-                    section: "bulk",
-                  };
-                  await replaceLatest(EmailLog, E, { email: E, ...invalidFinal });
-                  await replaceLatest(UserEmailLog, E, { email: E, ...invalidFinal });
-                  const invalidCat = getOutcomeCategory(invalidFinal);
-                  await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, invalidCat);
-                  try {
-                    sendStatusToFrontend(E, invalidFinal.status, invalidFinal.timestamp, {
-                      domain: invalidFinal.domain, provider: invalidFinal.domainProvider,
-                      isDisposable: false, isFree: false, isRoleBased: false, score: 0,
-                      subStatus: invalidFinal.subStatus, confidence: invalidFinal.confidence,
-                      category: invalidFinal.category, message: invalidFinal.message, reason: invalidFinal.reason,
-                    }, sessionId, true, username);
-                  } catch {}
-                  return {
-                    Email: E, Status: "Invalid", Timestamp: new Date(invalidFinal.timestamp).toLocaleString(),
-                    Domain: domain, Provider: domainCategory, Disposable: "No", Free: "No",
-                    RoleBased: "No", Score: 0, SubStatus: invalidFinal.subStatus, Confidence: 0.95,
-                    Category: "invalid", Message: invalidFinal.message, Reason: invalidFinal.reason, Source: "Live",
-                  };
-                }
-
-                logger("smtp_existence_check", `SMTP check: mailbox exists (${smtpExistCat}) → proceeding to SendGrid`, "info");
-              } catch (smtpExistErr) {
-                // If SMTP existence check fails (timeout, connection error), proceed to SendGrid anyway
-                logger("smtp_existence_check", `SMTP existence check failed: ${smtpExistErr.message} → proceeding to SendGrid`, "warn");
+            // ── CATCH-ALL CHECK for Proofpoint/Mimecast domains ──────────────────
+            // Before sending via SendGrid, probe a random address on the domain.
+            // If the domain is catch-all → return Risky immediately (skip SendGrid).
+            logger('catchall_check', `Checking if ${domain} is catch-all before SendGrid`, 'info');
+            try {
+              // probeIfNotCached: false — Proofpoint/Mimecast gateways always accept
+              // emails at SMTP level, so an SMTP probe is meaningless AND very slow
+              // (60-90s across multiple MX hosts). Only check the in-memory cache here.
+              const isCatchAll = await checkDomainCatchAll(domain, { logger, probeIfNotCached: false });
+              if (isCatchAll) {
+                logger('catchall_check', `Domain ${domain} is catch-all → returning Risky directly`, 'warn');
+                const catchAllFinal = {
+                  email: E,
+                  status: 'Risky',
+                  subStatus: 'catch_all',
+                  confidence: 0.75,
+                  category: 'risky',
+                  reason: 'Catch-All Domain',
+                  message: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
+                  domain,
+                  domainProvider: domainCategory,
+                  isDisposable: false,
+                  isFree: false,
+                  isRoleBased: false,
+                  score: 30,
+                  timestamp: new Date(),
+                  section: 'bulk',
+                };
+                await replaceLatest(EmailLog, E, { email: E, ...catchAllFinal });
+                await replaceLatest(UserEmailLog, E, { email: E, ...catchAllFinal });
+                const catchAllCat = getOutcomeCategory(catchAllFinal);
+                await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, catchAllCat);
+                try {
+                  sendStatusToFrontend(E, catchAllFinal.status, catchAllFinal.timestamp, {
+                    domain: catchAllFinal.domain, provider: catchAllFinal.domainProvider,
+                    isDisposable: false, isFree: false, isRoleBased: false, score: catchAllFinal.score,
+                    subStatus: catchAllFinal.subStatus, confidence: catchAllFinal.confidence,
+                    category: catchAllFinal.category, message: catchAllFinal.message, reason: catchAllFinal.reason,
+                  }, sessionId, true, username);
+                } catch {}
+                return {
+                  Email: E, Status: 'Risky', Timestamp: new Date(catchAllFinal.timestamp).toLocaleString(),
+                  Domain: domain, Provider: domainCategory, Disposable: 'No', Free: 'No',
+                  RoleBased: 'No', Score: 30, SubStatus: 'catch_all', Confidence: 0.75,
+                  Category: 'risky', Message: catchAllFinal.message, Reason: catchAllFinal.reason, Source: 'Live',
+                };
               }
-            } else {
-              // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
-              logger("smtp_existence_check", `Skipping SMTP check for ${domainCategory} (gateway blocks SMTP probes) → going directly to SendGrid`, "info");
+            } catch (catchAllErr) {
+              logger('catchall_check_error', `Catch-all check failed: ${catchAllErr.message} → proceeding with SendGrid`, 'warn');
             }
+
+            // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
+            logger("smtp_existence_check", `Skipping SMTP check for ${domainCategory} (gateway blocks SMTP probes) → going directly to SendGrid`, "info");
 
             console.log(`✅ [BULK][${E}] Proceeding to SendGrid\n`);
 
@@ -2223,13 +2268,29 @@ module.exports = function bulkValidatorRouter(deps) {
         //    government domains that are high-risk for cold email sending.
         // ─────────────────────────────────────────────────────────
         if (final && final.category !== "invalid" && categoryFromStatus(final.status || "") !== "invalid" && isOrgEduGovDomain(domain)) {
-          console.log(`[BULK][org_edu_gov_override] ${E} → domain "${domain}" ends with .org/.edu/.gov/.mx/.tw, overriding ${final.category} → Risky`);
+          console.log(`[BULK][org_edu_gov_override] ${E} → domain "${domain}" ends with .org/.edu/.gov/.mx, overriding ${final.category} → Risky`);
           final.status = "Risky";
           final.category = "risky";
           final.subStatus = "org_edu_gov_domain";
           final.score = Math.min(typeof final.score === "number" ? final.score : 50, 45);
           final.reason = "Restricted Domain TLD";
           final.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
+          // Persist the overridden result
+          await replaceLatest(EmailLog, E, { email: E, ...final });
+          await replaceLatest(UserEmailLog, E, { email: E, ...final });
+        }
+
+        // ─────────────────────────────────────────────────────────
+        // 🌍 ccTLD domain override: any 2-letter country code TLD
+        // ─────────────────────────────────────────────────────────
+        if (final && final.category !== "invalid" && categoryFromStatus(final.status || "") !== "invalid" && isCcTLDDomain(domain)) {
+          console.log(`[BULK][cctld_override] ${E} → domain "${domain}" has 2-letter ccTLD, overriding ${final.category} → Risky`);
+          final.status = "Risky";
+          final.category = "risky";
+          final.subStatus = "cctld_domain";
+          final.score = Math.min(typeof final.score === "number" ? final.score : 50, 45);
+          final.reason = "Country-Specific Domain";
+          final.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
           // Persist the overridden result
           await replaceLatest(EmailLog, E, { email: E, ...final });
           await replaceLatest(UserEmailLog, E, { email: E, ...final });

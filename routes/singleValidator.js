@@ -22,10 +22,13 @@ const {
   isMimecastDomain,
   toTrueSendrFormat,
 } = require("../utils/sendgridVerifier");
+
+// Catch-all domain probe (used before Proofpoint/Mimecast SendGrid path)
+const { checkDomainCatchAll } = require("../utils/smtpValidator");
 const SendGridLog = require("../models/SendGridLog");
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
-const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain } = require("../utils/domainClassifier");
+const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain, isCcTLDDomain } = require("../utils/domainClassifier");
 
 module.exports = function singleValidatorRouter(deps) {
   const {
@@ -261,13 +264,10 @@ module.exports = function singleValidatorRouter(deps) {
     }
 
     // ─────────────────────────────────────────────────────────
-    // 🏛️ .org / .edu / .gov domain override: if validation returned
-    //    Valid AND domain ends with .org, .edu, or .gov → downgrade
-    //    to Risky. These are organizational, educational, and
-    //    government domains that are high-risk for cold email sending.
+    // 🏛️ .org / .edu / .gov domain override
     // ─────────────────────────────────────────────────────────
     if (payload.category !== "invalid" && isOrgEduGovDomain(payload.domain)) {
-      console.log(`[single][org_edu_gov_override] ${E} → domain "${payload.domain}" ends with .org/.edu/.gov/.mx/.tw, overriding ${payload.category} → Risky`);
+      console.log(`[single][org_edu_gov_override] ${E} → domain "${payload.domain}" ends with .org/.edu/.gov/.mx, overriding ${payload.category} → Risky`);
       payload.status = "Risky";
       payload.category = "risky";
       payload.subStatus = "org_edu_gov_domain";
@@ -276,12 +276,25 @@ module.exports = function singleValidatorRouter(deps) {
       payload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
     }
 
+    // ─────────────────────────────────────────────────────────
+    // 🌍 ccTLD domain override: any 2-letter country code TLD
+    // ─────────────────────────────────────────────────────────
+    if (payload.category !== "invalid" && isCcTLDDomain(payload.domain)) {
+      console.log(`[single][cctld_override] ${E} → domain "${payload.domain}" has 2-letter ccTLD, overriding ${payload.category} → Risky`);
+      payload.status = "Risky";
+      payload.category = "risky";
+      payload.subStatus = "cctld_domain";
+      payload.score = Math.min(payload.score, 45);
+      payload.reason = "Country-Specific Domain";
+      payload.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
+    }
+
     // persist in both global + user DB
     await replaceLatest(EmailLogModel, E, payload);
     await replaceLatest(UserEmailLogModel, E, payload);
 
-    // memory cache
-    if (shouldCache && stableCache) {
+    // memory cache — never cache unknown results; they must be re-validated every time
+    if (shouldCache && stableCache && payload.category !== 'unknown') {
       stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
     }
 
@@ -497,16 +510,62 @@ module.exports = function singleValidatorRouter(deps) {
     const isBankOrHealthcare =
       !!domainClassification?.isBank || !!domainClassification?.isHealthcare;
 
+    // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare → Risky directly ────────
+    // These domains are high-risk for cold email sending regardless of whether
+    // they use Proofpoint/Mimecast. Skip all validation and return Risky.
+    if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTLDDomain(domain)) {
+      const earlyLogger = mkLogger(sessionId, E, username);
+      const subStatus = isOrgEduGovDomain(domain) ? 'org_edu_gov_domain'
+        : isCcTLDDomain(domain) ? 'cctld_domain'
+        : 'bank_healthcare_domain';
+      const message = isOrgEduGovDomain(domain)
+        ? 'This address belongs to an organizational, educational, or government domain (.org/.edu/.gov). Sending cold emails to these domains is risky.'
+        : isCcTLDDomain(domain)
+        ? 'This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.'
+        : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
+
+      earlyLogger('early_risky', `Domain ${domain} is ${subStatus} → returning Risky directly`, 'info');
+
+      const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+      const riskyEarlyPayload = {
+        email: E,
+        status: 'Risky',
+        subStatus,
+        confidence: 0.9,
+        category: 'risky',
+        reason: 'High-Risk Domain',
+        message,
+        domain,
+        domainProvider: 'N/A',
+        isDisposable: false,
+        isFree: false,
+        isRoleBased: false,
+        score: 30,
+        timestamp: new Date(),
+        section: 'single',
+      };
+
+      await replaceLatest(EmailLog, E, riskyEarlyPayload);
+      await replaceLatest(UserEmailLog2, E, riskyEarlyPayload);
+      if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: riskyEarlyPayload });
+      const earlyCredits = await debitOneCreditIfNeeded(username, riskyEarlyPayload.status, E, idemKey, 'single');
+      sendStatusToFrontend(E, riskyEarlyPayload.status, riskyEarlyPayload.timestamp, {
+        domain: riskyEarlyPayload.domain, provider: riskyEarlyPayload.domainProvider,
+        isDisposable: false, isFree: false, isRoleBased: false, score: riskyEarlyPayload.score,
+        subStatus: riskyEarlyPayload.subStatus, confidence: riskyEarlyPayload.confidence,
+        category: riskyEarlyPayload.category, message: riskyEarlyPayload.message, reason: riskyEarlyPayload.reason,
+      }, sessionId, true, username, 'single');
+      return res.json({ ...riskyEarlyPayload, via: 'early-risky', cached: false, inProgress: false, credits: earlyCredits });
+    }
+
     const isProofpoint = await isProofpointDomain(domain);
     const isMimecast = await isMimecastDomain(domain);
 
-    if (!isBankOrHealthcare && !isProofpoint && !isMimecast) return null;
+    if (!isProofpoint && !isMimecast) return null;
 
-    const domainCategory = isBankOrHealthcare
-      ? getDomainCategory(domain)
-      : isMimecast
-        ? "Mimecast Email Security"
-        : "Proofpoint Email Protection";
+    const domainCategory = isMimecast
+      ? "Mimecast Email Security"
+      : "Proofpoint Email Protection";
 
     const logger = mkLogger(sessionId, E, username);
 
@@ -519,152 +578,55 @@ module.exports = function singleValidatorRouter(deps) {
       username,
     );
 
-    // Bank/Healthcare: optional domain reputation short-circuit
-    if (isBankOrHealthcare) {
-      const domainStats = await DomainReputation.findOne({ domain }).lean();
-      if (domainStats && domainStats.sent >= 5) {
-        const bounceRate = domainStats.sent > 0 ? domainStats.invalid / domainStats.sent : 0;
-
-        if (bounceRate >= 0.6) {
-          logger(
-            "high_risk_domain",
-            `${domainCategory} domain high bounce (${(bounceRate * 100).toFixed(1)}%) → Risky`,
-            "warn",
-          );
-
-          const riskyPayload = {
-            email: E,
-            status: "Risky",
-            subStatus: "high_bounce_bank_healthcare",
-            confidence: 0.85,
-            category: "risky",
-            reason: "High Bounce Domain",
-            message: `This ${domainCategory} domain has a high bounce rate (${(
-              bounceRate * 100
-            ).toFixed(1)}%). Sending is risky.`,
-            domain,
-            domainProvider: domainCategory,
-            isDisposable: false,
-            isFree: false,
-            isRoleBased: false,
-            score: 20,
-            timestamp: new Date(),
-            section: "single",
-          };
-
-          await replaceLatest(EmailLog, E, riskyPayload);
-          await replaceLatest(UserEmailLog2, E, riskyPayload);
-
-          sendStatusToFrontend(
-            E,
-            riskyPayload.status,
-            riskyPayload.timestamp,
-            {
-              domain: riskyPayload.domain,
-              provider: riskyPayload.domainProvider,
-              isDisposable: riskyPayload.isDisposable,
-              isFree: riskyPayload.isFree,
-              isRoleBased: riskyPayload.isRoleBased,
-              score: riskyPayload.score,
-              subStatus: riskyPayload.subStatus,
-              confidence: riskyPayload.confidence,
-              category: riskyPayload.category,
-              message: riskyPayload.message,
-              reason: riskyPayload.reason,
-            },
-            sessionId,
-            true,
-            username,
-            "single"
-          );
-
-          const userCredits = await debitOneCreditIfNeeded(
-            username,
-            riskyPayload.status,
-            E,
-            idemKey,
-            "single",
-          );
-
-          if (stableCache) {
-            stableCache.set(E, {
-              until: Date.now() + (CACHE_TTL_MS || 0),
-              result: riskyPayload,
-            });
-          }
-
-          return res.json({
-            ...riskyPayload,
-            via: "domain-reputation",
-            cached: false,
-            inProgress: false,
-            credits: userCredits,
-          });
-        }
+    // ── CATCH-ALL CHECK for Proofpoint/Mimecast domains ──────────────────────
+    // Before sending via SendGrid, probe a random address on the domain.
+    // If the domain is catch-all → return Risky immediately (skip SendGrid).
+    logger('catchall_check', `Checking if ${domain} is catch-all before SendGrid`, 'info');
+    try {
+      // probeIfNotCached: false — Proofpoint/Mimecast gateways always accept
+      // emails at SMTP level, so an SMTP probe is meaningless AND very slow
+      // (60-90s across multiple MX hosts). Only check the in-memory cache here.
+      const isCatchAll = await checkDomainCatchAll(domain, { logger, probeIfNotCached: false });
+      if (isCatchAll) {
+        logger('catchall_check', `Domain ${domain} is catch-all → returning Risky directly`, 'warn');
+        const catchAllPayload = {
+          email: E,
+          status: 'Risky',
+          subStatus: 'catch_all',
+          confidence: 0.75,
+          category: 'risky',
+          reason: 'Catch-All Domain',
+          message: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
+          domain,
+          domainProvider: domainCategory,
+          isDisposable: false,
+          isFree: false,
+          isRoleBased: false,
+          score: 30,
+          timestamp: new Date(),
+          section: 'single',
+        };
+        await replaceLatest(EmailLog, E, catchAllPayload);
+        await replaceLatest(UserEmailLog2, E, catchAllPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: catchAllPayload });
+        const catchAllCredits = await debitOneCreditIfNeeded(username, catchAllPayload.status, E, idemKey, 'single');
+        sendStatusToFrontend(E, catchAllPayload.status, catchAllPayload.timestamp, {
+          domain: catchAllPayload.domain, provider: catchAllPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: catchAllPayload.score,
+          subStatus: catchAllPayload.subStatus, confidence: catchAllPayload.confidence,
+          category: catchAllPayload.category, message: catchAllPayload.message, reason: catchAllPayload.reason,
+        }, sessionId, true, username, 'single');
+        return res.json({ ...catchAllPayload, via: 'catch-all-check', cached: false, inProgress: false, credits: catchAllCredits });
       }
+    } catch (catchAllErr) {
+      logger('catchall_check_error', `Catch-all check failed: ${catchAllErr.message} → proceeding with SendGrid`, 'warn');
     }
 
-    // ─────────────────────────────────────────────────────────
-    // 🔍 SMTP existence check: only for bank/healthcare domains.
-    //    Proofpoint and Mimecast gateways block SMTP probes by
-    //    design (greylisting) — skip SMTP for them and go
-    //    directly to SendGrid to avoid multi-minute delays.
-    // ─────────────────────────────────────────────────────────
-    if (isBankOrHealthcare) {
-      logger("smtp_existence_check", `Running SMTP existence check before SendGrid for ${domainCategory} domain`, "info");
-      try {
-        const smtpExistResult = await validateSMTP(E, { logger });
-        const smtpExistCat = smtpExistResult.category || categoryFromStatus(smtpExistResult.status || "");
-
-        if (smtpExistCat === "invalid") {
-          // Mailbox does not exist — return Invalid immediately, skip SendGrid
-          logger("smtp_existence_check", `SMTP check: mailbox does not exist → returning Invalid (skipping SendGrid)`, "warn");
-          const invalidPayload = {
-            email: E,
-            status: "Invalid",
-            subStatus: smtpExistResult.sub_status || "mailbox_not_found",
-            confidence: 0.95,
-            category: "invalid",
-            reason: "Invalid Mailbox",
-            message: "SMTP check confirmed this mailbox does not exist on the server.",
-            domain,
-            domainProvider: domainCategory,
-            isDisposable: false,
-            isFree: false,
-            isRoleBased: false,
-            score: 0,
-            timestamp: new Date(),
-            section: "single",
-          };
-          await replaceLatest(EmailLog, E, invalidPayload);
-          await replaceLatest(UserEmailLog2, E, invalidPayload);
-          sendStatusToFrontend(E, invalidPayload.status, invalidPayload.timestamp, {
-            domain: invalidPayload.domain, provider: invalidPayload.domainProvider,
-            isDisposable: false, isFree: false, isRoleBased: false, score: 0,
-            subStatus: invalidPayload.subStatus, confidence: invalidPayload.confidence,
-            category: invalidPayload.category, message: invalidPayload.message, reason: invalidPayload.reason,
-          }, sessionId, true, username, "single");
-          const userCredits = await debitOneCreditIfNeeded(username, invalidPayload.status, E, idemKey, "single");
-          if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: invalidPayload });
-          return res.json({ ...invalidPayload, via: "smtp-existence-check", cached: false, inProgress: false, credits: userCredits });
-        }
-
-        logger("smtp_existence_check", `SMTP check: mailbox exists (${smtpExistCat}) → proceeding to SendGrid`, "info");
-      } catch (smtpExistErr) {
-        // If SMTP existence check fails (timeout, connection error), proceed to SendGrid anyway
-        logger("smtp_existence_check", `SMTP existence check failed: ${smtpExistErr.message} → proceeding to SendGrid`, "warn");
-      }
-    } else {
-      // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
-      logger("smtp_existence_check", `Skipping SMTP check for ${domainCategory} (gateway blocks SMTP probes) → going directly to SendGrid`, "info");
-    }
+    // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
+    logger("smtp_existence_check", `Skipping SMTP check for ${domainCategory} (gateway blocks SMTP probes) → going directly to SendGrid`, "info");
 
     logger(
-      isBankOrHealthcare && isProofpoint
-        ? "bank_healthcare_proofpoint"
-        : isBankOrHealthcare
-          ? "bank_healthcare"
-          : "proofpoint",
+      isProofpoint ? "proofpoint" : "mimecast",
       `${domainCategory} domain detected → SendGrid direct verification`,
       "info",
     );
@@ -774,24 +736,161 @@ module.exports = function singleValidatorRouter(deps) {
         console.warn("SendGridLog create failed:", e.message);
       }
       
-      // Return response WITHOUT saving to EmailLog
+      // ── WAIT UP TO 15 SECONDS FOR SENDGRID WEBHOOK RESULT ─────────────────
+      // Poll every 500ms. For Mimecast/Exchange domains, the sequence is:
+      //   processed → delivered (kept alive) → bounce (final, deletes pending)
+      // We wait long enough to capture the bounce that follows delivered.
+      // If the bounce arrives in time → return Risky/Invalid.
+      // If only delivered arrives → return Valid (from EmailLog).
+      // If nothing arrives → return Risky as safe fallback.
+      // Increased from 15s to 30s to avoid race conditions where the webhook
+      // arrives just after the timeout, causing a Risky→Valid result flip.
+      const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 30000);
+      const POLL_INTERVAL_MS = +(process.env.SENDGRID_POLL_INTERVAL_MS || 500);
+      const pollStart = Date.now();
+
+      logger('sendgrid_poll', `Polling for webhook result (max ${WEBHOOK_WAIT_MS}ms, interval ${POLL_INTERVAL_MS}ms)...`, 'info');
+
+      while (Date.now() - pollStart < WEBHOOK_WAIT_MS) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+
+        // Check if webhook has been processed (pending record deleted by webhook handler)
+        const stillPending = await SendGridPending.findOne({ messageId: sgResult.messageId });
+        if (!stillPending) {
+          // Webhook processed — fetch the final result from EmailLog
+          const webhookResult = await EmailLog.findOne({ email: E }).lean();
+          if (webhookResult && webhookResult.category && webhookResult.category !== 'unknown') {
+            logger('sendgrid_poll', `Webhook result received in ${Date.now() - pollStart}ms: ${webhookResult.status} (${webhookResult.category})`, 'info');
+
+            // Credits already debited by webhook handler — just get current count
+            const userAfterWebhook = await User.findOne({ username });
+
+            return res.json({
+              email: E,
+              status: webhookResult.status,
+              category: webhookResult.category,
+              subStatus: webhookResult.subStatus || null,
+              confidence: webhookResult.confidence || null,
+              domain: webhookResult.domain || domain,
+              domainProvider: webhookResult.domainProvider || domainCategory,
+              isDisposable: !!webhookResult.isDisposable,
+              isFree: !!webhookResult.isFree,
+              isRoleBased: !!webhookResult.isRoleBased,
+              score: webhookResult.score || 50,
+              timestamp: webhookResult.timestamp || new Date(),
+              via: viaLabel,
+              cached: false,
+              inProgress: false,
+              credits: userAfterWebhook?.credits || 0,
+            });
+          }
+        }
+      }
+
+      // ── Polling timeout ────────────────────────────────────────────────────
+      // Check EmailLog for any intermediate result written by the webhook
+      // handler (e.g. Valid from 'delivered' that didn't delete pending).
+      // NOTE: Do NOT delete SendGridPending here — the bounce may arrive
+      // after the polling window. The bounce handler will find the record,
+      // update the DB to Risky, and push a WebSocket update to the UI.
+      logger('sendgrid_poll', `Webhook wait timeout (${WEBHOOK_WAIT_MS}ms) — checking EmailLog for intermediate result (keeping SendGridPending alive for late bounce)`, 'warn');
+
+      const intermediateResult = await EmailLog.findOne({ email: E }).lean();
+      if (intermediateResult && intermediateResult.category && intermediateResult.category !== 'unknown') {
+        logger('sendgrid_poll', `EmailLog has result: ${intermediateResult.status} (${intermediateResult.category}) — returning as final`, 'info');
+
+        // Debit credits (not debited by the 'delivered' webhook handler)
+        const finalCredits = await debitOneCreditIfNeeded(username, intermediateResult.status, E, idemKey, 'single');
+
+        if (stableCache && intermediateResult.category !== 'unknown') {
+          stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: intermediateResult });
+        }
+
+        sendStatusToFrontend(E, intermediateResult.status, intermediateResult.timestamp || new Date(), {
+          domain: intermediateResult.domain || domain,
+          provider: intermediateResult.domainProvider || domainCategory,
+          isDisposable: !!intermediateResult.isDisposable,
+          isFree: !!intermediateResult.isFree,
+          isRoleBased: !!intermediateResult.isRoleBased,
+          score: intermediateResult.score || 50,
+          subStatus: intermediateResult.subStatus || null,
+          confidence: intermediateResult.confidence || null,
+          category: intermediateResult.category,
+          message: intermediateResult.message || '',
+          reason: intermediateResult.reason || '',
+        }, sessionId, true, username, 'single');
+
+        const userAfterWebhook = await User.findOne({ username });
         return res.json({
           email: E,
-          status: "Processing",
-          category: "pending",
-        subStatus: "sendgrid_pending_webhook",
-        message: "Email sent for verification. Waiting for delivery confirmation...",
+          status: intermediateResult.status,
+          category: intermediateResult.category,
+          subStatus: intermediateResult.subStatus || null,
+          confidence: intermediateResult.confidence || null,
+          domain: intermediateResult.domain || domain,
+          domainProvider: intermediateResult.domainProvider || domainCategory,
+          isDisposable: !!intermediateResult.isDisposable,
+          isFree: !!intermediateResult.isFree,
+          isRoleBased: !!intermediateResult.isRoleBased,
+          score: intermediateResult.score || 50,
+          timestamp: intermediateResult.timestamp || new Date(),
+          via: viaLabel,
+          cached: false,
+          inProgress: false,
+          credits: userAfterWebhook?.credits || 0,
+        });
+      }
+
+      // No result at all — return Risky as safe fallback
+      logger('sendgrid_poll', `No result in EmailLog — returning Risky as safe fallback`, 'warn');
+
+      const riskyFallbackPayload = {
+        email: E,
+        status: 'Risky',
+        subStatus: 'sendgrid_no_webhook',
+        confidence: 0.6,
+        category: 'risky',
+        reason: 'Unconfirmed Delivery',
+        message: 'SendGrid did not confirm delivery within the expected time. Treating as risky to be safe.',
         domain,
         domainProvider: domainCategory,
-        via: viaLabel,
-        awaitingWebhook: true,
-        messageId: sgResult.messageId,
-        credits: user?.credits || 0,
         isDisposable: false,
         isFree: false,
         isRoleBased: false,
-        score: 50,
-        timestamp: new Date()
+        score: 40,
+        timestamp: new Date(),
+        section: 'single',
+      };
+
+      await replaceLatest(EmailLog, E, riskyFallbackPayload);
+      await replaceLatest(UserEmailLog2, E, riskyFallbackPayload);
+
+      if (stableCache) {
+        stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: riskyFallbackPayload });
+      }
+
+      const fallbackCredits = await debitOneCreditIfNeeded(username, riskyFallbackPayload.status, E, idemKey, 'single');
+
+      sendStatusToFrontend(E, riskyFallbackPayload.status, riskyFallbackPayload.timestamp, {
+        domain: riskyFallbackPayload.domain,
+        provider: riskyFallbackPayload.domainProvider,
+        isDisposable: false,
+        isFree: false,
+        isRoleBased: false,
+        score: riskyFallbackPayload.score,
+        subStatus: riskyFallbackPayload.subStatus,
+        confidence: riskyFallbackPayload.confidence,
+        category: riskyFallbackPayload.category,
+        message: riskyFallbackPayload.message,
+        reason: riskyFallbackPayload.reason,
+      }, sessionId, true, username, 'single');
+
+      return res.json({
+        ...riskyFallbackPayload,
+        via: viaLabel,
+        cached: false,
+        inProgress: false,
+        credits: fallbackCredits,
       });
     }
 
@@ -847,7 +946,7 @@ module.exports = function singleValidatorRouter(deps) {
     });
   }
 
-  async function maybeSendgridFallbackOnUnknown({ E, username, sessionId, smtpRaw }) {
+  async function maybeSendgridFallbackOnUnknown({ E, username, sessionId, smtpRaw, idemKey }) {
     if (!smtpRaw) return null;
 
     const cat = smtpRaw.category || categoryFromStatus(smtpRaw.status || "");
@@ -861,6 +960,128 @@ module.exports = function singleValidatorRouter(deps) {
 
     try {
       const sgResult = await verifySendGrid(E, { logger });
+
+      // ── If SendGrid is awaiting webhook, create pending record + poll ──────
+      if (sgResult.awaitingWebhook && sgResult.messageId) {
+        logger("sendgrid_fallback_pending", `Email sent via SendGrid fallback, awaiting webhook (messageId: ${sgResult.messageId})`, "info");
+
+        const SendGridPending = deps.SendGridPending || mongoose.model('SendGridPending');
+
+        // Create SendGridPending so the webhook handler can find and process it
+        try {
+          await SendGridPending.create({
+            email: E,
+            username,
+            sessionId,
+            messageId: sgResult.messageId,
+            domain,
+            provider: 'SendGrid (SMTP fallback)',
+            idemKey: idemKey || null,
+            metadata: { isFallback: true, smtpCategory: smtpRaw.category }
+          });
+        } catch (e) {
+          logger("sendgrid_fallback_pending_err", `SendGridPending create failed: ${e.message}`, "warn");
+        }
+
+        // best-effort SendGridLog (use 'unknown' — valid enum value)
+        try {
+          await SendGridLog.create({
+            email: E,
+            domain,
+            status: 'unknown',
+            sub_status: 'sendgrid_pending_webhook',
+            category: 'unknown',
+            confidence: 0.5,
+            score: 50,
+            reason: 'SMTP unknown → SendGrid fallback, awaiting webhook',
+            messageId: sgResult.messageId,
+            statusCode: sgResult.statusCode,
+            method: sgResult.method || "web_api",
+            isProofpoint: false,
+            isFallback: true,
+            smtpCategory: smtpRaw.category,
+            smtpSubStatus: smtpRaw.sub_status,
+            provider: 'SendGrid (SMTP fallback)',
+            elapsed_ms: sgResult.elapsed_ms,
+            username,
+            sessionId,
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            rawResponse: sgResult,
+          });
+        } catch (e) {
+          logger("sendgrid_fallback_log_err", `SendGridLog create failed: ${e.message}`, "warn");
+        }
+
+        // ── Poll up to 5s for webhook result ─────────────────────────────────
+        const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 5000);
+        const POLL_INTERVAL_MS = +(process.env.SENDGRID_POLL_INTERVAL_MS || 500);
+        const pollStart = Date.now();
+
+        logger('sendgrid_fallback_poll', `Polling for webhook result (max ${WEBHOOK_WAIT_MS}ms, interval ${POLL_INTERVAL_MS}ms)...`, 'info');
+
+        while (Date.now() - pollStart < WEBHOOK_WAIT_MS) {
+          await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+
+          // Webhook handler deletes SendGridPending when it processes the event
+          const stillPending = await SendGridPending.findOne({ messageId: sgResult.messageId });
+          if (!stillPending) {
+            // Webhook processed — fetch the final result from EmailLog
+            const webhookResult = await EmailLog.findOne({ email: E }).lean();
+            if (webhookResult && webhookResult.category && webhookResult.category !== 'unknown') {
+              logger('sendgrid_fallback_poll', `Webhook result received in ${Date.now() - pollStart}ms: ${webhookResult.status} (${webhookResult.category})`, 'info');
+
+              // Return the webhook result as sgTrueSendrResult
+              // Credits already debited by webhook handler — idemKey ensures no double-debit
+              const sgTrueSendrResult = {
+                status: webhookResult.status,
+                sub_status: webhookResult.subStatus || null,
+                category: webhookResult.category,
+                confidence: webhookResult.confidence || null,
+                domain: webhookResult.domain || domain,
+                provider: webhookResult.domainProvider || 'SendGrid (SMTP fallback)',
+                domainProvider: webhookResult.domainProvider || 'SendGrid (SMTP fallback)',
+                isDisposable: !!webhookResult.isDisposable,
+                isFree: !!webhookResult.isFree,
+                isRoleBased: !!webhookResult.isRoleBased,
+                score: webhookResult.score || 50,
+                timestamp: webhookResult.timestamp || new Date(),
+              };
+
+              return { sgTrueSendrResult, via: "sendgrid-fallback" };
+            }
+          }
+        }
+
+        // Timeout — return Risky as safe fallback (never leave as Unknown)
+        logger('sendgrid_fallback_poll', `Webhook wait timeout (${WEBHOOK_WAIT_MS}ms) — returning Risky as safe fallback`, 'warn');
+
+        // Clean up stale pending record
+        try {
+          await SendGridPending.deleteOne({ messageId: sgResult.messageId });
+        } catch (e) {}
+
+        return {
+          sgTrueSendrResult: {
+            status: 'Risky',
+            sub_status: 'sendgrid_no_webhook',
+            category: 'risky',
+            confidence: 0.6,
+            domain,
+            provider: 'SendGrid (SMTP fallback)',
+            domainProvider: 'SendGrid (SMTP fallback)',
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            score: 40,
+            timestamp: new Date(),
+          },
+          via: "sendgrid-fallback"
+        };
+      }
+
+      // ── Normal (non-pending) SendGrid result ─────────────────────────────
       const meta = { domain, flags: { disposable: false, free: false, role: false } };
       const sgTrueSendrResult = toTrueSendrFormat(sgResult, meta);
 
@@ -869,14 +1090,14 @@ module.exports = function singleValidatorRouter(deps) {
         sgTrueSendrResult.domainProvider = "SendGrid (fallback)";
       }
 
-      // best-effort fallback log
+      // best-effort fallback log (use valid enum values)
       try {
         await SendGridLog.create({
           email: E,
           domain,
-          status: sgResult.status,
+          status: ['valid','invalid','risky','unknown'].includes(sgResult.status) ? sgResult.status : 'unknown',
           sub_status: sgResult.sub_status,
-          category: sgResult.category,
+          category: ['valid','invalid','risky','unknown'].includes(sgResult.category) ? sgResult.category : 'unknown',
           confidence: sgResult.confidence || 0.5,
           score: sgTrueSendrResult.score || 50,
           reason: sgResult.reason,
@@ -976,10 +1197,12 @@ module.exports = function singleValidatorRouter(deps) {
       );
 
       if (cachedDb) {
+        const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
         const fresh =
           Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= FRESH_DB_MS;
 
-        if (fresh) {
+        // Skip cache for unknown results — re-validate every time
+        if (fresh && cachedCategory !== 'unknown') {
           await bumpUpdatedAt(EmailLog, E, "single");
 
           const history = await buildHistoryForEmail(E);
@@ -1050,7 +1273,7 @@ module.exports = function singleValidatorRouter(deps) {
           await replaceLatest(EmailLog, E, payload);
           await replaceLatest(UserEmailLog, E, payload);
 
-          if (stableCache) {
+          if (stableCache && payload.category !== 'unknown') {
             stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
           }
 
@@ -1116,6 +1339,7 @@ module.exports = function singleValidatorRouter(deps) {
           username,
           sessionId,
           smtpRaw: smtpResult,
+          idemKey,
         });
 
         const rawToUse = fb?.sgTrueSendrResult || smtpResult;
@@ -1259,10 +1483,12 @@ module.exports = function singleValidatorRouter(deps) {
       );
 
       if (cachedDb) {
+        const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
         const fresh =
           Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= FRESH_DB_MS;
 
-        if (fresh) {
+        // Skip cache for unknown results — re-validate every time
+        if (fresh && cachedCategory !== 'unknown') {
           await bumpUpdatedAt(EmailLog, E, "single");
 
           const history = await buildHistoryForEmail(E);
@@ -1333,7 +1559,7 @@ module.exports = function singleValidatorRouter(deps) {
           await replaceLatest(EmailLog, E, payload);
           await replaceLatest(UserEmailLog, E, payload);
 
-          if (stableCache) {
+          if (stableCache && payload.category !== 'unknown') {
             stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
           }
 
@@ -1376,9 +1602,9 @@ module.exports = function singleValidatorRouter(deps) {
         }
       }
 
-      // stable cache hit (if you use it)
+      // stable cache hit — skip if result is unknown (must re-validate)
       const hit = stableCache ? stableCache.get(E) : null;
-      if (hit && hit.until > Date.now()) {
+      if (hit && hit.until > Date.now() && hit.result?.category !== 'unknown') {
         const { EmailLog: UserEmailLog2 } = getUserDb(
           mongoose,
           EmailLog,
@@ -1528,6 +1754,7 @@ module.exports = function singleValidatorRouter(deps) {
         username,
         sessionId,
         smtpRaw: prelimRawSmtp,
+        idemKey,
       });
 
       const prelimRaw = fb?.sgTrueSendrResult || prelimRawSmtp;
@@ -1592,13 +1819,26 @@ module.exports = function singleValidatorRouter(deps) {
       // 🏛️ .org / .edu / .gov domain override (prelim stage)
       // ─────────────────────────────────────────────────────────
       if (prelimPayload.category !== "invalid" && isOrgEduGovDomain(prelimPayload.domain)) {
-        console.log(`[single][org_edu_gov_override][prelim] ${E} → domain "${prelimPayload.domain}" ends with .org/.edu/.gov/.mx/.tw, overriding ${prelimPayload.category} → Risky`);
+        console.log(`[single][org_edu_gov_override][prelim] ${E} → domain "${prelimPayload.domain}" ends with .org/.edu/.gov/.mx, overriding ${prelimPayload.category} → Risky`);
         prelimPayload.status = "Risky";
         prelimPayload.category = "risky";
         prelimPayload.subStatus = "org_edu_gov_domain";
         prelimPayload.score = Math.min(prelimPayload.score, 45);
         prelimPayload.reason = "Restricted Domain TLD";
         prelimPayload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // 🌍 ccTLD domain override (prelim stage)
+      // ─────────────────────────────────────────────────────────
+      if (prelimPayload.category !== "invalid" && isCcTLDDomain(prelimPayload.domain)) {
+        console.log(`[single][cctld_override][prelim] ${E} → domain "${prelimPayload.domain}" has 2-letter ccTLD, overriding ${prelimPayload.category} → Risky`);
+        prelimPayload.status = "Risky";
+        prelimPayload.category = "risky";
+        prelimPayload.subStatus = "cctld_domain";
+        prelimPayload.score = Math.min(prelimPayload.score, 45);
+        prelimPayload.reason = "Country-Specific Domain";
+        prelimPayload.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
       }
 
       await replaceLatest(EmailLog, E, prelimPayload);
@@ -1660,6 +1900,7 @@ module.exports = function singleValidatorRouter(deps) {
             username,
             sessionId,
             smtpRaw: finalRaw,
+            idemKey,
           });
 
           const rawToUse = fb2?.sgTrueSendrResult || finalRaw;
@@ -1730,13 +1971,26 @@ module.exports = function singleValidatorRouter(deps) {
           // 🏛️ .org / .edu / .gov domain override (stable background stage)
           // ─────────────────────────────────────────────────────────
           if (finalPayload.category !== "invalid" && isOrgEduGovDomain(finalPayload.domain)) {
-            console.log(`[single][org_edu_gov_override][stable] ${E} → domain "${finalPayload.domain}" ends with .org/.edu/.gov/.mx/.tw, overriding ${finalPayload.category} → Risky`);
+            console.log(`[single][org_edu_gov_override][stable] ${E} → domain "${finalPayload.domain}" ends with .org/.edu/.gov/.mx, overriding ${finalPayload.category} → Risky`);
             finalPayload.status = "Risky";
             finalPayload.category = "risky";
             finalPayload.subStatus = "org_edu_gov_domain";
             finalPayload.score = Math.min(finalPayload.score, 45);
             finalPayload.reason = "Restricted Domain TLD";
             finalPayload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
+          }
+
+          // ─────────────────────────────────────────────────────────
+          // 🌍 ccTLD domain override (stable background stage)
+          // ─────────────────────────────────────────────────────────
+          if (finalPayload.category !== "invalid" && isCcTLDDomain(finalPayload.domain)) {
+            console.log(`[single][cctld_override][stable] ${E} → domain "${finalPayload.domain}" has 2-letter ccTLD, overriding ${finalPayload.category} → Risky`);
+            finalPayload.status = "Risky";
+            finalPayload.category = "risky";
+            finalPayload.subStatus = "cctld_domain";
+            finalPayload.score = Math.min(finalPayload.score, 45);
+            finalPayload.reason = "Country-Specific Domain";
+            finalPayload.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
           }
 
           await replaceLatest(EmailLog, E, finalPayload);

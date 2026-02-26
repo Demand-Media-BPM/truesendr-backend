@@ -84,6 +84,38 @@ module.exports = function sendgridWebhookRouter(deps) {
   router.post('/events', express.json(), webhookHandler);
 
   /**
+   * Detect if a bounce reason indicates a sender/gateway policy block
+   * rather than a hard bounce (missing mailbox).
+   *
+   * Policy blocks mean the recipient mailbox may exist but our sender
+   * was rejected by the gateway's rules (e.g. Mimecast blocked senders,
+   * IP reputation, SPF/DKIM/DMARC failure). These should be Risky, not Invalid.
+   *
+   * @param {string} reason - The bounce reason string from SendGrid
+   * @returns {boolean}
+   */
+  function isPolicyBlock(reason) {
+    if (!reason) return false;
+    const r = String(reason).toLowerCase();
+    return (
+      r.includes('blocked senders') ||       // Mimecast: blocked senders list
+      r.includes('header based') ||          // Mimecast: header-based filtering
+      r.includes('mimecast.com/docs') ||     // Mimecast: documentation reference
+      r.includes('sender blocked') ||        // Generic: sender blocked by policy
+      r.includes('ip blocked') ||            // Generic: IP address blocked
+      r.includes('ip reputation') ||         // Generic: IP reputation block
+      r.includes('blacklisted') ||           // Generic: sender/IP blacklisted
+      r.includes('dnsbl') ||                 // Generic: DNS blacklist rejection
+      r.includes('policy violation') ||      // Generic: policy violation
+      r.includes('rejected by policy') ||    // Generic: explicit policy rejection
+      r.includes('access denied') ||         // Generic: access denied by gateway
+      r.includes('spf fail') ||              // SPF authentication failure
+      r.includes('dkim fail') ||             // DKIM authentication failure
+      r.includes('dmarc fail')               // DMARC authentication failure
+    );
+  }
+
+  /**
    * Process individual webhook event
    * @param {object} event - SendGrid event data
    */
@@ -149,10 +181,27 @@ module.exports = function sendgridWebhookRouter(deps) {
                 break;
 
               case 'bounce':
-                finalStatus = 'Invalid';
-                finalSubStatus = type === 'soft' ? 'sendgrid_soft_bounce' : 'sendgrid_hard_bounce';
-                finalCategory = 'invalid';
-                confidence = type === 'soft' ? 0.75 : 0.98;
+                if (type === 'soft') {
+                  // Soft bounce: mailbox may be temporarily full/unavailable — treat as Risky
+                  finalStatus = 'Risky';
+                  finalSubStatus = 'sendgrid_soft_bounce';
+                  finalCategory = 'risky';
+                  confidence = 0.75;
+                } else if (isPolicyBlock(reason)) {
+                  // Policy block: our sender was rejected by the recipient's mail gateway
+                  // (e.g. Mimecast blocked senders, IP reputation, SPF/DKIM/DMARC failure).
+                  // The mailbox may exist — this is a sender policy issue, not a missing mailbox.
+                  finalStatus = 'Risky';
+                  finalSubStatus = 'sendgrid_policy_block';
+                  finalCategory = 'risky';
+                  confidence = 0.80;
+                } else {
+                  // Hard bounce: mailbox does not exist — treat as Invalid
+                  finalStatus = 'Invalid';
+                  finalSubStatus = 'sendgrid_hard_bounce';
+                  finalCategory = 'invalid';
+                  confidence = 0.98;
+                }
                 break;
 
               case 'dropped':
@@ -166,6 +215,13 @@ module.exports = function sendgridWebhookRouter(deps) {
                 finalStatus = 'Invalid';
                 finalSubStatus = 'sendgrid_deferred';
                 finalCategory = 'invalid';
+                confidence = 0.85;
+                break;
+
+              case 'blocked':
+                finalStatus = 'Risky';
+                finalSubStatus = 'sendgrid_blocked';
+                finalCategory = 'risky';
                 confidence = 0.85;
                 break;
 
@@ -360,6 +416,9 @@ module.exports = function sendgridWebhookRouter(deps) {
     let finalCategory = null;
     let confidence = 0.5;
     let shouldSaveToEmailLog = false;
+    // isFinalEvent: true = delete SendGridPending + debit credits
+    // false = update EmailLog/WebSocket only, keep SendGridPending alive for potential bounce
+    let isFinalEvent = true;
 
     switch (eventType) {
       case 'delivered':
@@ -368,14 +427,36 @@ module.exports = function sendgridWebhookRouter(deps) {
         finalCategory = 'valid';
         confidence = 0.95;
         shouldSaveToEmailLog = true;
+        // ── NOT a final event ──────────────────────────────────────────────
+        // Keep SendGridPending alive: a bounce may follow (e.g. mailbox full).
+        // Credits are debited by the bounce handler or by the polling timeout.
+        isFinalEvent = false;
         break;
 
       case 'bounce':
-        finalStatus = 'Invalid';
-        finalSubStatus = type === 'soft' ? 'sendgrid_soft_bounce' : 'sendgrid_hard_bounce';
-        finalCategory = 'invalid';
-        confidence = type === 'soft' ? 0.75 : 0.98;
+        if (type === 'soft') {
+          // Soft bounce: mailbox may be temporarily full/unavailable — treat as Risky
+          finalStatus = 'Risky';
+          finalSubStatus = 'sendgrid_soft_bounce';
+          finalCategory = 'risky';
+          confidence = 0.75;
+        } else if (isPolicyBlock(reason)) {
+          // Policy block: our sender was rejected by the recipient's mail gateway
+          // (e.g. Mimecast blocked senders, IP reputation, SPF/DKIM/DMARC failure).
+          // The mailbox may exist — this is a sender policy issue, not a missing mailbox.
+          finalStatus = 'Risky';
+          finalSubStatus = 'sendgrid_policy_block';
+          finalCategory = 'risky';
+          confidence = 0.80;
+        } else {
+          // Hard bounce: mailbox does not exist — treat as Invalid
+          finalStatus = 'Invalid';
+          finalSubStatus = 'sendgrid_hard_bounce';
+          finalCategory = 'invalid';
+          confidence = 0.98;
+        }
         shouldSaveToEmailLog = true;
+        isFinalEvent = true;
         break;
 
       case 'dropped':
@@ -384,6 +465,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         finalCategory = 'invalid';
         confidence = 0.90;
         shouldSaveToEmailLog = true;
+        isFinalEvent = true;
         break;
 
       case 'deferred':
@@ -392,6 +474,16 @@ module.exports = function sendgridWebhookRouter(deps) {
         finalCategory = 'invalid';
         confidence = 0.85;
         shouldSaveToEmailLog = true;
+        isFinalEvent = true;
+        break;
+
+      case 'blocked':
+        finalStatus = 'Risky';
+        finalSubStatus = 'sendgrid_blocked';
+        finalCategory = 'risky';
+        confidence = 0.85;
+        shouldSaveToEmailLog = true;
+        isFinalEvent = true;
         break;
 
       case 'processed':
@@ -401,12 +493,13 @@ module.exports = function sendgridWebhookRouter(deps) {
 
       case 'open':
       case 'click':
-        // Strong signal - email was delivered
+        // Strong engagement signal — treat as final Valid
         finalStatus = 'Valid';
         finalSubStatus = 'sendgrid_engaged';
         finalCategory = 'valid';
         confidence = 0.99;
         shouldSaveToEmailLog = true;
+        isFinalEvent = true;
         break;
 
       case 'spamreport':
@@ -415,6 +508,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         finalCategory = 'risky';
         confidence = 0.85;
         shouldSaveToEmailLog = true;
+        isFinalEvent = true;
         break;
 
       case 'unsubscribe':
@@ -423,6 +517,7 @@ module.exports = function sendgridWebhookRouter(deps) {
         finalCategory = 'valid';
         confidence = 0.95;
         shouldSaveToEmailLog = true;
+        isFinalEvent = true;
         break;
 
       default:
@@ -457,7 +552,7 @@ module.exports = function sendgridWebhookRouter(deps) {
       section: 'single',
     };
 
-    // Save to global EmailLog
+    // Save to global EmailLog (always — so polling can read intermediate results)
     await replaceLatest(EmailLog, E, finalPayload);
 
     // Save to user EmailLog
@@ -470,16 +565,20 @@ module.exports = function sendgridWebhookRouter(deps) {
     );
     await replaceLatest(UserEmailLog, E, finalPayload);
 
-    // Debit credit now (was not debited when email was sent)
-    await deps.debitOneCreditIfNeeded(
-      pending.username,
-      finalStatus,
-      E,
-      pending.idemKey,
-      'single'
-    );
+    // ── Only debit credits on FINAL events ────────────────────────────────
+    // For 'delivered', credits are debited by the bounce handler (if bounce
+    // follows) or by the polling timeout handler (if no bounce arrives).
+    if (isFinalEvent) {
+      await deps.debitOneCreditIfNeeded(
+        pending.username,
+        finalStatus,
+        E,
+        pending.idemKey,
+        'single'
+      );
+    }
 
-    // Send WebSocket notification
+    // Send WebSocket notification (always — UI should update immediately)
     if (pending.sessionId) {
       sendStatusToFrontend(
         E,
@@ -519,8 +618,8 @@ module.exports = function sendgridWebhookRouter(deps) {
               webhookResponse: response,
               webhookStatus: status,
               webhookAttempt: attempt,
-              finalCategory: finalCategory,
-              finalStatus: finalStatus,
+              finalCategory: isFinalEvent ? finalCategory : undefined,
+              finalStatus: isFinalEvent ? finalStatus : undefined,
             }
           }
         );
@@ -529,10 +628,15 @@ module.exports = function sendgridWebhookRouter(deps) {
       }
     }
 
-    // Delete from SendGridPending
-    await SendGridPending.deleteOne({ _id: pending._id });
-
-    console.log(`✅ [SendGrid Webhook] Successfully processed: ${E} -> ${finalStatus} (${finalCategory}, event: ${eventType}, reason: ${reason || 'N/A'})`);
+    // ── Only delete SendGridPending on FINAL events ────────────────────────
+    // For 'delivered', keep the record alive so the polling loop can detect
+    // a subsequent bounce event (e.g. mailbox full on Exchange/Mimecast).
+    if (isFinalEvent) {
+      await SendGridPending.deleteOne({ _id: pending._id });
+      console.log(`✅ [SendGrid Webhook] Final event processed: ${E} -> ${finalStatus} (${finalCategory}, event: ${eventType}, reason: ${reason || 'N/A'})`);
+    } else {
+      console.log(`ℹ️ [SendGrid Webhook] Intermediate event processed: ${E} -> ${finalStatus} (event: ${eventType}) — keeping SendGridPending alive for potential bounce`);
+    }
   }
 
   /**
