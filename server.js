@@ -35,6 +35,7 @@ const deliverabilityRoutes = require("./routes/deliverability");
 // App / HTTP / WS
 // ─────────────────────────────────────────────────────────────────────────────
 const app = express();
+app.set("trust proxy", 1);
 const PORT = ENV.PORTSERVER;
 
 const server = http.createServer(app);

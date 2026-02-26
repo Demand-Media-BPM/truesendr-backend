@@ -902,7 +902,6 @@
 
 
 
-
 // routes/EmailFinder.js
 const express = require("express");
 const mongoose = require("mongoose");
@@ -955,7 +954,10 @@ const upload = multer({
 ─────────────────────────────────────────────────────────────── */
 
 function normalizeTenant(username) {
-  return String(username || "").trim().toLowerCase().replace(/\s+/g, "-");
+  return String(username || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, "-");
 }
 
 function getUserDbByTenant(tenant) {
@@ -1012,7 +1014,9 @@ async function requireAuth(req, res, next) {
 ─────────────────────────────────────────────────────────────── */
 
 function normEmail(x) {
-  return String(x || "").trim().toLowerCase();
+  return String(x || "")
+    .trim()
+    .toLowerCase();
 }
 
 function normalizeASCII(s = "") {
@@ -1270,7 +1274,9 @@ function renderLocalFromCode(code, { first, last, F, L }) {
 }
 
 function buildFixedPairs(nameParts, domain) {
-  const d = String(domain || "").toLowerCase().trim();
+  const d = String(domain || "")
+    .toLowerCase()
+    .trim();
   if (!d || !nameParts.first) return [];
   const out = [];
   const seen = new Set();
@@ -1338,8 +1344,14 @@ async function recordPatternSuccessFromCache(domain, code) {
   return recordPatternSuccess(domain, code);
 }
 
-function makeCandidatesWithPriorityParts(domain, nameParts, preferredCodes = []) {
-  const d = String(domain || "").toLowerCase().trim();
+function makeCandidatesWithPriorityParts(
+  domain,
+  nameParts,
+  preferredCodes = [],
+) {
+  const d = String(domain || "")
+    .toLowerCase()
+    .trim();
   if (!d || !nameParts?.first) return [];
 
   const finalPairs = [];
@@ -1378,20 +1390,45 @@ const FRESH_FINDER_MS = Number(
   process.env.FRESH_FINDER_MS || 15 * 24 * 60 * 60 * 1000,
 );
 
+/**
+ * ✅ FIX #1:
+ * normalizeOutcomeCategory now understands SendGrid webhook events
+ * so "delivered" becomes "valid" and "bounce/dropped/blocked" becomes "invalid".
+ */
 function normalizeOutcomeCategory(input) {
-  const s = String(input || "")
-    .trim()
-    .toLowerCase()
-    .replace(/^[^a-z0-9]+/g, "");
+  const raw = String(input || "").trim().toLowerCase();
 
-  if (s === "valid" || s.startsWith("valid")) return "valid";
-  if (s === "invalid" || s.startsWith("invalid")) return "invalid";
-  if (s === "risky" || s.startsWith("risky")) return "risky";
-  if (s === "unknown" || s.startsWith("unknown")) return "unknown";
+  // direct categories
+  if (raw === "valid" || raw.startsWith("valid")) return "valid";
+  if (raw === "invalid" || raw.startsWith("invalid")) return "invalid";
+  if (raw === "risky" || raw.startsWith("risky")) return "risky";
+  if (raw === "unknown" || raw.startsWith("unknown")) return "unknown";
 
-  if (s.includes("valid")) return "valid";
-  if (s.includes("invalid") || s.includes("undeliverable")) return "invalid";
-  if (s.includes("risky") || s.includes("risk")) return "risky";
+  // sendgrid webhook events => category mapping
+  // (this is the missing piece causing "Webhook finalized → unknown")
+  const evt = raw.replace(/\s+/g, "");
+  if (evt === "delivered" || evt === "open" || evt === "opened" || evt === "click" || evt === "clicked") {
+    return "valid";
+  }
+  if (
+    evt === "bounce" ||
+    evt === "bounced" ||
+    evt === "dropped" ||
+    evt === "blocked" ||
+    evt === "spamreport" ||
+    evt === "unsubscribe"
+  ) {
+    return "invalid";
+  }
+  if (evt === "deferred") return "risky";
+
+  // fuzzy matches
+  if (raw.includes("deliver")) return "valid";
+  if (raw.includes("bounce") || raw.includes("dropped") || raw.includes("blocked") || raw.includes("undeliverable"))
+    return "invalid";
+  if (raw.includes("risk")) return "risky";
+  if (raw.includes("valid")) return "valid";
+  if (raw.includes("invalid")) return "invalid";
 
   return "unknown";
 }
@@ -1432,7 +1469,11 @@ async function validateCandidateBulkLike({
         `Domain ${domain} has no MX records - cannot receive emails`,
         "warn",
       );
-      const built = buildReasonAndMessage("Invalid", "invalid_domain_no_mx", {});
+      const built = buildReasonAndMessage(
+        "Invalid",
+        "invalid_domain_no_mx",
+        {},
+      );
       return {
         ok: false,
         out: {
@@ -1475,7 +1516,8 @@ async function validateCandidateBulkLike({
         category: "invalid",
         confidence: 0.95,
         reason: "Invalid Domain",
-        message: built.message || `Domain ${domain} does not exist or DNS failed`,
+        message:
+          built.message || `Domain ${domain} does not exist or DNS failed`,
         domain,
         domainProvider: "N/A",
         isDisposable: false,
@@ -1561,26 +1603,142 @@ async function validateCandidateBulkLike({
     };
   };
 
-  // ✅ Bulk-like: wait until webhook updates SendGridLog.status/category
-  const SENDGRID_WAIT_MS = Number(process.env.SENDGRID_WAIT_MS || 20000);
+  // ✅ SendGrid "finalization" wait (robust)
+  const SENDGRID_WAIT_MS = Number(
+    process.env.SENDGRID_WAIT_MS || (isProofpoint ? 90000 : 30000)
+  );
   const SENDGRID_POLL_MS = Number(process.env.SENDGRID_POLL_MS || 750);
+  const SENDGRID_DEDUPE_MS = Number(process.env.SENDGRID_DEDUPE_MS || 10 * 60 * 1000); // 10 min
 
-  async function waitForSendGridFinalByMessageId(messageId) {
+  const FINAL_EVENTS = new Set([
+    "delivered",
+    "bounce",
+    "bounced",
+    "dropped",
+    "deferred",
+    "spamreport",
+    "open",
+    "click",
+    "unsubscribe",
+    "blocked",
+  ]);
+
+  function isSendGridRowFinal(row) {
+    if (!row) return false;
+
+    if (row.webhookReceived === true) return true;
+
+    const cat = String(row.category || "").toLowerCase();
+    const finalCat = String(row.finalCategory || "").toLowerCase();
+    if (cat && cat !== "unknown") return true;
+    if (finalCat && finalCat !== "unknown") return true;
+
+    const st = String(row.status || "").toLowerCase();
+    const fst = String(row.finalStatus || "").toLowerCase();
+    if (fst && fst !== "unknown") return true;
+    if (st && st !== "unknown" && st !== "pending") return true;
+
+    const evt = String(row.webhookEvent || row.event || "").toLowerCase();
+    if (evt && FINAL_EVENTS.has(evt)) return true;
+
+    return false;
+  }
+
+  /**
+   * ✅ FIX #2:
+   * pickDecidedCategoryFromRow now correctly interprets webhook event values
+   * like "delivered/bounce/dropped" into valid/invalid/risky.
+   */
+  function pickDecidedCategoryFromRow(row) {
+    return normalizeOutcomeCategory(
+      row?.finalCategory ||
+        row?.category ||
+        row?.finalStatus ||
+        row?.status ||
+        row?.webhookEvent ||
+        row?.event ||
+        "unknown"
+    );
+  }
+
+  /**
+   * ✅ FIX #3 (safe):
+   * Keep full messageId (don’t split by ".") and also compute a "base" for fallback matching.
+   */
+  function normalizeMsgIdFull(x) {
+    if (!x) return null;
+    let s = String(x).trim();
+    s = s.replace(/^<|>$/g, ""); // remove angle brackets if present
+    return s || null;
+  }
+
+  function normalizeMsgIdBase(x) {
+    const full = normalizeMsgIdFull(x);
+    if (!full) return null;
+    // base is only used for startsWith/regex fallback; we do NOT destroy the id anymore
+    return full.split(".")[0] || full;
+  }
+
+  async function getRecentSendGridRowByEmail(emailNorm) {
+    const since = new Date(Date.now() - SENDGRID_DEDUPE_MS);
+    return SendGridLog.findOne({ email: emailNorm, createdAt: { $gte: since } })
+      .sort({ createdAt: -1 })
+      .lean();
+  }
+
+  async function getSendGridRowByMessageIdSmart(messageIdFull) {
+    if (!messageIdFull) return null;
+    const full = normalizeMsgIdFull(messageIdFull);
+    const base = normalizeMsgIdBase(messageIdFull);
+
+    // 1) exact match (full)
+    const exact = await SendGridLog.findOne({
+      $or: [
+        { messageId: full },
+        { fullMessageId: full },
+        { sg_message_id: full },
+        { sgMessageId: full },
+      ],
+    })
+      .sort({ createdAt: -1 })
+      .lean();
+    if (exact) return exact;
+
+    // 2) fallback: startsWith base (covers webhook IDs like base.something)
+    if (base) {
+      const re = new RegExp("^" + String(base).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      const alt = await SendGridLog.findOne({
+        $or: [
+          { messageId: re },
+          { fullMessageId: re },
+          { sg_message_id: re },
+          { sgMessageId: re },
+        ],
+      })
+        .sort({ createdAt: -1 })
+        .lean();
+      if (alt) return alt;
+    }
+
+    return null;
+  }
+
+  async function waitForSendGridFinalSmart({ messageId, email }) {
     const started = Date.now();
+    const msgFull = normalizeMsgIdFull(messageId);
 
     while (Date.now() - started < SENDGRID_WAIT_MS) {
       if (cancel?.isStopped?.()) return null;
 
-      const row = await SendGridLog.findOne({ messageId }).lean();
-      if (!row) {
-        await new Promise((r) => setTimeout(r, SENDGRID_POLL_MS));
-        continue;
+      // 1) by messageId (best when it matches webhook)
+      let row = await getSendGridRowByMessageIdSmart(msgFull);
+
+      // 2) fallback by email+recent (covers messageId mismatch cases)
+      if (!row && email) {
+        row = await getRecentSendGridRowByEmail(email);
       }
 
-      if (row.webhookReceived === true) return row;
-
-      const cat = String(row.category || "").toLowerCase();
-      if (cat && cat !== "unknown") return row;
+      if (row && isSendGridRowFinal(row)) return row;
 
       await new Promise((r) => setTimeout(r, SENDGRID_POLL_MS));
     }
@@ -1595,24 +1753,154 @@ async function validateCandidateBulkLike({
       throw new Error("cancelled");
     }
 
+    // ✅ 0) DEDUPE: if we already sent recently for this email, reuse that log
+    try {
+      const recent = await getRecentSendGridRowByEmail(E);
+
+      if (recent) {
+        const recentMsgId =
+          recent.fullMessageId ||
+          recent.messageId ||
+          recent.sg_message_id ||
+          recent.sgMessageId ||
+          null;
+
+        if (isSendGridRowFinal(recent)) {
+          const decidedCategory = pickDecidedCategoryFromRow(recent);
+
+          const decidedStatus =
+            decidedCategory === "valid"
+              ? "✅ Valid"
+              : decidedCategory === "invalid"
+                ? "❌ Invalid"
+                : decidedCategory === "risky"
+                  ? "⚠️ Risky"
+                  : "❔ Unknown";
+
+          const sgTrueSendr = {
+            email: E,
+            domain,
+            provider: providerLabel,
+            status: decidedStatus,
+            sub_status: recent.sub_status || recent.subStatus || null,
+            category: decidedCategory,
+            confidence:
+              typeof recent.confidence === "number" ? recent.confidence : 0.85,
+            reason:
+              recent.bounceReason || recent.webhookReason || recent.reason || null,
+            message: recent.bounceReason
+              ? `SendGrid: ${recent.bounceReason}`
+              : recent.webhookReason
+                ? `SendGrid: ${recent.webhookReason}`
+                : null,
+            isDisposable: !!recent.isDisposable,
+            isFree: !!recent.isFree,
+            isRoleBased: !!recent.isRoleBased,
+            score: typeof recent.score === "number" ? recent.score : 50,
+            isCatchAll: false,
+          };
+
+          logger(
+            "sendgrid_dedupe_final",
+            `Reusing recent SendGridLog (final) → ${sgTrueSendr.category}`,
+            "info"
+          );
+
+          return await finalize(sgTrueSendr, providerLabel);
+        }
+
+        // pending-like: wait using smart waiter (msgId or email fallback)
+        if (recentMsgId) {
+          logger(
+            "sendgrid_dedupe_wait",
+            `Reusing recent SendGridLog (pending) → waiting webhook for messageId=${normalizeMsgIdFull(recentMsgId)}`,
+            "info"
+          );
+
+          const row = await waitForSendGridFinalSmart({
+            messageId: recentMsgId,
+            email: E,
+          });
+
+          if (row) {
+            const decidedCategory = pickDecidedCategoryFromRow(row);
+
+            const decidedStatus =
+              decidedCategory === "valid"
+                ? "✅ Valid"
+                : decidedCategory === "invalid"
+                  ? "❌ Invalid"
+                  : decidedCategory === "risky"
+                    ? "⚠️ Risky"
+                    : "❔ Unknown";
+
+            const sgTrueSendr = {
+              email: E,
+              domain,
+              provider: providerLabel,
+              status: decidedStatus,
+              sub_status: row.sub_status || row.subStatus || null,
+              category: decidedCategory,
+              confidence:
+                typeof row.confidence === "number" ? row.confidence : 0.85,
+              reason: row.bounceReason || row.webhookReason || row.reason || null,
+              message: row.bounceReason
+                ? `SendGrid: ${row.bounceReason}`
+                : row.webhookReason
+                  ? `SendGrid: ${row.webhookReason}`
+                  : null,
+              isDisposable: !!row.isDisposable,
+              isFree: !!row.isFree,
+              isRoleBased: !!row.isRoleBased,
+              score: typeof row.score === "number" ? row.score : 50,
+              isCatchAll: false,
+            };
+
+            logger(
+              "sendgrid_dedupe_wait_done",
+              `Webhook finalized (dedupe) → ${sgTrueSendr.category}`,
+              "info"
+            );
+
+            return await finalize(sgTrueSendr, providerLabel);
+          }
+
+          logger(
+            "sendgrid_dedupe_wait_timeout",
+            `No webhook final within ${SENDGRID_WAIT_MS}ms (dedupe)`,
+            "warn"
+          );
+          // continue to "send new" as last resort
+        }
+      }
+    } catch (e) {
+      logger("sendgrid_dedupe_error", e.message || "dedupe failed", "warn");
+    }
+
+    // ✅ 1) SEND NEW via SendGrid
     const t0 = Date.now();
-    const sgResult = await verifySendGrid(E, { logger, trainingTag: "finder" });
+    const sgResult = await verifySendGrid(E, {
+      logger,
+      trainingTag: "finder",
+      // harmless metadata (doesn't affect other features)
+      username,
+      jobId,
+    });
     const elapsedMs = Date.now() - t0;
     logger("sendgrid_time", `verifySendGrid elapsed=${elapsedMs}ms`, "info");
 
-    const messageId = sgResult?.messageId || sgResult?.sg_message_id || null;
+    const fullMessageId =
+      sgResult?.messageId || sgResult?.sg_message_id || sgResult?.sgMessageId || null;
+    const messageIdFull = normalizeMsgIdFull(fullMessageId);
+    const messageIdBase = normalizeMsgIdBase(fullMessageId);
 
-    // schema status enum: deliverable / undeliverable / risky / unknown
     const schemaStatus = String(sgResult?.status || "unknown").toLowerCase();
-    const statusSafe = ["deliverable", "undeliverable", "risky", "unknown"].includes(
-      schemaStatus,
-    )
+    const statusSafe = ["deliverable", "undeliverable", "risky", "unknown"].includes(schemaStatus)
       ? schemaStatus
       : "unknown";
 
-    // schema category enum: valid / invalid / risky / unknown
     const categorySafe = normalizeOutcomeCategory(
-      sgResult?.category || sgResult?.status || "unknown",
+      sgResult?.category || sgResult?.status || sgResult?.event || sgResult?.webhookEvent || "unknown"
     );
 
     const isPendingLike =
@@ -1620,32 +1908,30 @@ async function validateCandidateBulkLike({
       /pending|processing|queued/i.test(String(sgResult?.sub_status || "")) ||
       /pending|processing|queued/i.test(String(sgResult?.status || ""));
 
-    const metaSg = {
-      domain,
-      flags: { disposable: false, free: false, role: false },
-    };
+    const metaSg = { domain, flags: { disposable: false, free: false, role: false } };
 
     let sgTrueSendr = toTrueSendrFormat(sgResult, metaSg);
     sgTrueSendr.provider = providerLabel;
     sgTrueSendr.domainProvider = providerLabel;
 
-    // ✅ Create SendGridLog row (required fields: status, category)
+    // ✅ write log row (Finder-only)
     try {
       await SendGridLog.create({
         email: E,
         domain,
         username,
-        sessionId: null,
+        sessionId: String(jobId || ""), // helps some webhook matchers; safe
         bulkId: null,
 
-        messageId,
+        // store both full + base
+        fullMessageId: messageIdFull,
+        messageId: messageIdFull || messageIdBase || null,
+
         status: statusSafe,
         category: categorySafe,
-        sub_status:
-          sgResult?.sub_status || (isPendingLike ? "sendgrid_pending" : null),
+        sub_status: sgResult?.sub_status || (isPendingLike ? "sendgrid_pending" : null),
 
-        confidence:
-          typeof sgResult?.confidence === "number" ? sgResult.confidence : 0.5,
+        confidence: typeof sgResult?.confidence === "number" ? sgResult.confidence : 0.5,
         score: typeof sgTrueSendr?.score === "number" ? sgTrueSendr.score : 50,
 
         reason: sgResult?.reason || null,
@@ -1671,36 +1957,47 @@ async function validateCandidateBulkLike({
       logger("sendgrid_log_error", e.message, "warn");
     }
 
-    // ✅ if pending-like and messageId, wait for webhook update
-    if (isPendingLike && messageId) {
+    // ✅ 2) Pending-like => wait with SMART waiter (messageId OR email fallback)
+    if (isPendingLike) {
       logger(
         "sendgrid_wait",
-        `Pending-like → waiting webhook for messageId=${messageId}`,
-        "info",
+        `Pending-like → waiting webhook for messageId=${messageIdFull || messageIdBase || "N/A"}`,
+        "info"
       );
 
-      const row = await waitForSendGridFinalByMessageId(messageId);
+      const row = await waitForSendGridFinalSmart({
+        messageId: messageIdFull || messageIdBase,
+        email: E,
+      });
 
       if (cancel?.isStopped?.()) return null;
 
       if (row) {
+        const decidedCategory = pickDecidedCategoryFromRow(row);
+
+        const decidedStatus =
+          decidedCategory === "valid"
+            ? "✅ Valid"
+            : decidedCategory === "invalid"
+              ? "❌ Invalid"
+              : decidedCategory === "risky"
+                ? "⚠️ Risky"
+                : "❔ Unknown";
+
         sgTrueSendr = {
           email: E,
           domain,
           provider: providerLabel,
-          status:
-            row.category === "valid"
-              ? "✅ Valid"
-              : row.category === "invalid"
-                ? "❌ Invalid"
-                : row.category === "risky"
-                  ? "⚠️ Risky"
-                  : "❔ Unknown",
-          sub_status: row.sub_status || null,
-          category: String(row.category || "unknown").toLowerCase(),
+          status: decidedStatus,
+          sub_status: row.sub_status || row.subStatus || null,
+          category: decidedCategory,
           confidence: typeof row.confidence === "number" ? row.confidence : 0.85,
-          reason: row.bounceReason || row.reason || null,
-          message: row.bounceReason ? `SendGrid: ${row.bounceReason}` : null,
+          reason: row.bounceReason || row.webhookReason || row.reason || null,
+          message: row.bounceReason
+            ? `SendGrid: ${row.bounceReason}`
+            : row.webhookReason
+              ? `SendGrid: ${row.webhookReason}`
+              : null,
           isDisposable: !!row.isDisposable,
           isFree: !!row.isFree,
           isRoleBased: !!row.isRoleBased,
@@ -1708,24 +2005,15 @@ async function validateCandidateBulkLike({
           isCatchAll: false,
         };
 
-        logger(
-          "sendgrid_wait_done",
-          `Webhook finalized → ${sgTrueSendr.category}`,
-          "info",
-        );
+        logger("sendgrid_wait_done", `Webhook finalized → ${sgTrueSendr.category}`, "info");
       } else {
-        logger(
-          "sendgrid_wait_timeout",
-          `No webhook final within ${SENDGRID_WAIT_MS}ms`,
-          "warn",
-        );
+        logger("sendgrid_wait_timeout", `No webhook final within ${SENDGRID_WAIT_MS}ms`, "warn");
       }
     }
 
     if (cancel?.isStopped?.()) return null;
 
-    const out = await finalize(sgTrueSendr, providerLabel);
-    return out;
+    return await finalize(sgTrueSendr, providerLabel);
   }
 
   // 1) SPECIAL DOMAIN → SendGrid first + bank/healthcare reputation gate
@@ -2103,7 +2391,9 @@ module.exports = function EmailFinderRouter() {
         }
 
         if (bulkOps.length > 0) {
-          const bulkResult = await Domain.bulkWrite(bulkOps, { ordered: false });
+          const bulkResult = await Domain.bulkWrite(bulkOps, {
+            ordered: false,
+          });
           affectedDomains +=
             (bulkResult.upsertedCount || 0) + (bulkResult.modifiedCount || 0);
         }
@@ -2175,7 +2465,9 @@ module.exports = function EmailFinderRouter() {
 
       const domainLC = normalizeDomain(domain);
       if (!domainLC) {
-        return res.status(400).json({ error: "Please provide a valid domain." });
+        return res
+          .status(400)
+          .json({ error: "Please provide a valid domain." });
       }
 
       const nameParts = splitFullName(fullName);
@@ -2208,7 +2500,9 @@ module.exports = function EmailFinderRouter() {
         const gUpdated = new Date(
           globalHit.updatedAt || globalHit.createdAt || 0,
         ).getTime();
-        const gFresh = gUpdated ? Date.now() - gUpdated <= FRESH_FINDER_MS : false;
+        const gFresh = gUpdated
+          ? Date.now() - gUpdated <= FRESH_FINDER_MS
+          : false;
 
         const gStatus = String(globalHit.status || "").toLowerCase();
         const gValid = gStatus === "valid";
@@ -2243,9 +2537,11 @@ module.exports = function EmailFinderRouter() {
 
           const quickPairs = buildFixedPairs(nameParts, domainLC);
           const hit = quickPairs.find(
-            (p) => p.email.toLowerCase() === String(globalHit.email).toLowerCase(),
+            (p) =>
+              p.email.toLowerCase() === String(globalHit.email).toLowerCase(),
           );
-          if (hit?.code) await recordPatternSuccessFromCache(domainLC, hit.code);
+          if (hit?.code)
+            await recordPatternSuccessFromCache(domainLC, hit.code);
 
           await User.findOneAndUpdate(
             { _id: userId, credits: { $gt: 0 } },
@@ -2414,7 +2710,8 @@ module.exports = function EmailFinderRouter() {
             { upsert: true },
           );
 
-          if (finalIsValid && bestCode) await recordPatternSuccess(domainLC, bestCode);
+          if (finalIsValid && bestCode)
+            await recordPatternSuccess(domainLC, bestCode);
 
           // domain sample only if valid
           if (finalIsValid) {
