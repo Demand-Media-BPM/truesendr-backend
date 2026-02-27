@@ -3,7 +3,7 @@ const express = require("express");
 const crypto = require("crypto");
 const Razorpay = require("razorpay");
 const axios = require("axios");
-
+const nodemailer = require("nodemailer");
 const RazorpayOrder = require("../models/RazorpayOrder");
 const CreditsLedger = require("../models/CreditsLedger");
 const User = require("../models/User");
@@ -656,6 +656,31 @@ function computeAmounts({ credits, pricePerCredit, taxRate }) {
 module.exports = function paymentRouter(_deps = {}) {
   const router = express.Router();
 
+  // ---------------------------------------------------------------------------
+  // SMTP transporter (Gmail SMTP from .env)
+  // ---------------------------------------------------------------------------
+  const SMTP_HOST = process.env.SMTP_HOST || "smtp.gmail.com";
+  const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+  const SMTP_SECURE = String(process.env.SMTP_SECURE || "false") === "true";
+  const SMTP_USER = process.env.SMTP_USER || "";
+  const SMTP_PASS = process.env.SMTP_PASS || "";
+  const MAIL_FROM = process.env.MAIL_FROM || `Truesendr <${SMTP_USER}>`;
+
+  const ENTERPRISE_LEAD_TO = [
+    "jenny.j@truesendr.com",
+    "saurabh.s@demandmediabpm.com",
+  ].join(",");
+
+  const mailer =
+    SMTP_USER && SMTP_PASS
+      ? nodemailer.createTransport({
+          host: SMTP_HOST,
+          port: SMTP_PORT,
+          secure: SMTP_SECURE,
+          auth: { user: SMTP_USER, pass: SMTP_PASS },
+        })
+      : null;
+
   const key_id = process.env.RAZORPAY_KEY_ID || "";
   const key_secret = process.env.RAZORPAY_KEY_SECRET || "";
   const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET || "";
@@ -697,6 +722,255 @@ module.exports = function paymentRouter(_deps = {}) {
       return res.status(500).json({ ok: false, message: "Server error" });
     }
   });
+
+  // ---------------------------------------------------------------------------
+  // POST /api/payment/razorpay/enterprise-lead
+  // Sends enterprise "Contact Us" details to internal emails
+  // ---------------------------------------------------------------------------
+  router.post("/razorpay/enterprise-lead", async (req, res) => {
+    try {
+      if (!mailer) {
+        return res.status(500).json({
+          ok: false,
+          message:
+            "SMTP not configured on server (missing SMTP_USER/SMTP_PASS).",
+        });
+      }
+
+      const body = parseMaybeBufferBody(req);
+
+      const name = String(body.name || "").trim();
+      const email = String(body.email || "").trim();
+      const jobTitle = String(body.jobTitle || "").trim();
+      const companyName = String(body.companyName || "").trim();
+      const countryCode = String(body.countryCode || "").trim();
+      const countryName = String(body.countryName || "").trim();
+      const dialCode = String(body.dialCode || "").trim();
+      const phone = String(body.phone || "").trim();
+      const volume = String(body.volume || "").trim();
+      const username = String(body.username || "").trim();
+      const page = String(body.page || "Enterprise Lead").trim();
+
+      if (!name || !email) {
+        return res.status(400).json({
+          ok: false,
+          message: "Name and Company Email are required.",
+        });
+      }
+
+      const subject = `TrueSendr Enterprise Request: ${name}${companyName ? " • " + companyName : ""}`;
+
+      const text = [
+        `Enterprise Plan Request`,
+        `----------------------`,
+        `Name: ${name}`,
+        `Company Email: ${email}`,
+        `Job Title: ${jobTitle || "-"}`,
+        `Company Name: ${companyName || "-"}`,
+        `Country: ${countryName || "-"} ${countryCode ? "(" + countryCode + ")" : ""}`,
+        `Phone: ${[dialCode, phone].filter(Boolean).join(" ") || "-"}`,
+        `Estimated Monthly Volume: ${volume || "-"}`,
+        `Username (if logged in): ${username || "-"}`,
+        `Source: ${page}`,
+        `Time: ${new Date().toISOString()}`,
+      ].join("\n");
+
+      const html = `
+  <div style="background:#f5f7fb;padding:24px;font-family:Segoe UI,Roboto,Arial,sans-serif;">
+    <div style="max-width:700px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+      
+      <!-- Header -->
+      <div style="padding:18px 24px;border-bottom:1px solid #e5e7eb;">
+        <div style="font-size:18px;font-weight:600;color:#111827;">
+          Enterprise Plan Request
+        </div>
+        <div style="margin-top:4px;font-size:12px;color:#6b7280;">
+          TrueSendr • ${escapeHtml(new Date().toISOString())} (UTC)
+        </div>
+      </div>
+
+      <!-- Body -->
+      <div style="padding:24px;">
+        <p style="margin:0 0 16px 0;font-size:14px;color:#374151;">
+          A new enterprise inquiry has been submitted via the <b>${escapeHtml(page)}</b>.
+        </p>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;font-size:14px;">
+          ${row("Name", name)}
+          ${row("Company Email", email, true)}
+          ${row("Job Title", jobTitle || "-")}
+          ${row("Company Name", companyName || "-")}
+          ${row(
+            "Country",
+            (countryName || "-") + (countryCode ? ` (${countryCode})` : ""),
+          )}
+          ${row("Phone", [dialCode, phone].filter(Boolean).join(" ") || "-")}
+          ${row("Estimated Monthly Volume", volume || "-")}
+          ${row("Username (if logged in)", username || "-")}
+        </table>
+      </div>
+
+      <!-- Footer -->
+      <div style="padding:14px 24px;border-top:1px solid #e5e7eb;font-size:12px;color:#6b7280;background:#fafafa;">
+        This is an internal notification generated by TrueSendr.
+      </div>
+    </div>
+  </div>
+`;
+
+      // helper for table rows (email-safe)
+      function row(label, value, isEmail = false) {
+        const v = escapeHtml(value ?? "-");
+        const display = isEmail
+          ? `<a href="mailto:${v}" style="color:#2563eb;text-decoration:none;">${v}</a>`
+          : `<span style="color:#111827;">${v}</span>`;
+
+        return `
+    <tr>
+      <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;width:34%;color:#6b7280;font-weight:600;">
+        ${escapeHtml(label)}
+      </td>
+      <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;">
+        ${display}
+      </td>
+    </tr>
+  `;
+      }
+
+      // -------------------------------------------------------------------
+      // Auto-reply email to the user (confirmation)
+      // -------------------------------------------------------------------
+      const userSubject = `We received your TrueSendr Enterprise request`;
+
+      const userText = [
+        `Hi ${name},`,
+        ``,
+        `Thanks for contacting TrueSendr about an Enterprise Plan.`,
+        `We’ve received your details and our team will reach out to you within 24 hours.`,
+        ``,
+        `Your submitted details:`,
+        `- Name: ${name}`,
+        `- Company Email: ${email}`,
+        `- Job Title: ${jobTitle || "-"}`,
+        `- Company Name: ${companyName || "-"}`,
+        `- Country: ${countryName || "-"} ${countryCode ? "(" + countryCode + ")" : ""}`,
+        `- Phone: ${[dialCode, phone].filter(Boolean).join(" ") || "-"}`,
+        `- Estimated Monthly Volume: ${volume || "-"}`,
+        ``,
+        `Regards,`,
+        `TrueSendr Team`,
+      ].join("\n");
+
+      const userHtml = `
+  <div style="background:#f5f7fb;padding:24px;font-family:Segoe UI,Roboto,Arial,sans-serif;">
+    <div style="max-width:700px;margin:0 auto;background:#ffffff;border:1px solid #e5e7eb;border-radius:8px;overflow:hidden;">
+      
+      <!-- Header -->
+      <div style="padding:18px 24px;border-bottom:1px solid #e5e7eb;">
+        <div style="font-size:18px;font-weight:600;color:#111827;">
+          We received your request
+        </div>
+        <div style="margin-top:4px;font-size:12px;color:#6b7280;">
+          TrueSendr • ${escapeHtml(new Date().toISOString())} (UTC)
+        </div>
+      </div>
+
+      <!-- Body -->
+      <div style="padding:24px;">
+        <p style="margin:0 0 12px 0;font-size:14px;color:#374151;">
+          Hi <b>${escapeHtml(name)}</b>,
+        </p>
+
+        <p style="margin:0 0 14px 0;font-size:14px;color:#374151;line-height:1.6;">
+          Thanks for contacting TrueSendr about an <b>Enterprise Plan</b>.
+          We’ve received your details and our team will reach out to you within <b>24 hours</b>.
+        </p>
+
+        <div style="margin-top:16px;font-size:14px;font-weight:600;color:#111827;">
+          Your submitted details
+        </div>
+
+        <table width="100%" cellpadding="0" cellspacing="0" style="margin-top:10px;border-collapse:collapse;font-size:14px;">
+          ${userRow("Name", name)}
+          ${userRow("Company Email", email, true)}
+          ${userRow("Job Title", jobTitle || "-")}
+          ${userRow("Company Name", companyName || "-")}
+          ${userRow("Country", (countryName || "-") + (countryCode ? ` (${countryCode})` : ""))}
+          ${userRow("Phone", [dialCode, phone].filter(Boolean).join(" ") || "-")}
+          ${userRow("Estimated Monthly Volume", volume || "-")}
+        </table>
+
+        <div style="margin-top:18px;padding:12px 14px;background:#f9fafb;border:1px solid #e5e7eb;border-radius:6px;font-size:13px;color:#374151;line-height:1.55;">
+          If you have any additional details to share, just reply to this email.
+        </div>
+
+        <p style="margin:18px 0 0 0;font-size:14px;color:#374151;">
+          Regards,<br/>
+          <b>TrueSendr Team</b>
+        </p>
+      </div>
+
+      <!-- Footer -->
+      <div style="padding:14px 24px;border-top:1px solid #e5e7eb;font-size:12px;color:#6b7280;background:#fafafa;">
+        This is an automated confirmation from TrueSendr.
+      </div>
+    </div>
+  </div>
+`;
+
+      function userRow(label, value, isEmail = false) {
+        const v = escapeHtml(value ?? "-");
+        const display = isEmail
+          ? `<a href="mailto:${v}" style="color:#2563eb;text-decoration:none;">${v}</a>`
+          : `<span style="color:#111827;">${v}</span>`;
+
+        return `
+          <tr>
+            <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;width:34%;color:#6b7280;font-weight:600;">
+              ${escapeHtml(label)}
+            </td>
+            <td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;">
+              ${display}
+            </td>
+          </tr>
+        `;
+      }
+
+      await mailer.sendMail({
+        from: MAIL_FROM,
+        to: ENTERPRISE_LEAD_TO,
+        replyTo: email, // so you can reply directly to the customer
+        subject,
+        text,
+        html,
+      });
+
+            // ✅ Send confirmation email to the user
+      await mailer.sendMail({
+        from: MAIL_FROM,
+        to: email,
+        replyTo: "jenny.j@truesendr.com", // optional: lets user reply to your team
+        subject: userSubject,
+        text: userText,
+        html: userHtml,
+      });
+
+      return res.json({ ok: true });
+    } catch (err) {
+      console.error("❌ enterprise-lead error:", err);
+      return res.status(500).json({ ok: false, message: "Server error" });
+    }
+  });
+
+  // tiny html escape helper
+  function escapeHtml(s) {
+    return String(s || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#039;");
+  }
 
   const rzp = new Razorpay({ key_id, key_secret });
 
