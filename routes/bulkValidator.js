@@ -929,16 +929,43 @@ module.exports = function bulkValidatorRouter(deps) {
       `🔄 [BULK][${bulkId}] Regenerating result file with updated statuses...`,
     );
 
-    // Fetch updated EmailLog entries for all emails
+    // Fetch updated EmailLog entries for all emails.
+    // Sort by updatedAt descending so the most recent record comes first.
+    // Only keep the first (newest) record per email to avoid stale results
+    // from previous bulk jobs or sections overwriting the webhook result.
     const emails = toValidate.map((item) => item.email);
     const updatedLogs = await UserEmailLog.find({
       email: { $in: emails },
-    }).lean();
+    }).sort({ updatedAt: -1, createdAt: -1 }).lean();
 
-    // Create a map for quick lookup
+    // Create a map for quick lookup — first record wins (most recent)
     const logMap = new Map();
     updatedLogs.forEach((log) => {
-      logMap.set(log.email, log);
+      if (!logMap.has(log.email)) {
+        logMap.set(log.email, log);
+      }
+    });
+
+    // Also check global EmailLog as a fallback — the webhook handler always
+    // updates the global EmailLog, so if the user-specific one is stale,
+    // the global one will have the correct (post-webhook) result.
+    const globalLogs = await EmailLog.find({
+      email: { $in: emails },
+    }).sort({ updatedAt: -1, createdAt: -1 }).lean();
+
+    globalLogs.forEach((log) => {
+      const existing = logMap.get(log.email);
+      if (!existing) {
+        // No user-specific record — use global
+        logMap.set(log.email, log);
+      } else {
+        // Use whichever is more recent
+        const existingTime = new Date(existing.updatedAt || existing.createdAt || 0).getTime();
+        const globalTime = new Date(log.updatedAt || log.createdAt || 0).getTime();
+        if (globalTime > existingTime) {
+          logMap.set(log.email, log);
+        }
+      }
     });
 
     // Build result rows with updated data
@@ -1671,8 +1698,10 @@ module.exports = function bulkValidatorRouter(deps) {
               console.log(`   Sub-Status: ${sgResult.sub_status || "N/A"}`);
 
               // Convert to TrueSendr format
+              // Pass domainCategory so the real gateway provider name is shown
               const metaSg = {
                 domain,
+                provider: domainCategory,
                 flags: { disposable: false, free: false, role: false },
               };
               const result = toTrueSendrFormat(sgResult, metaSg);
@@ -1815,8 +1844,14 @@ module.exports = function bulkValidatorRouter(deps) {
                 console.log(`   Status: ${sgResult.status}`);
                 console.log(`   Category: ${sgResult.category}`);
 
+                // Derive real provider from SMTP result (MX-based) or MX lookup
+                const realProviderFallback = (prelimRaw.provider && prelimRaw.provider !== 'Unavailable')
+                  ? prelimRaw.provider
+                  : await detectProviderByMX(domain).catch(() => 'Unknown Provider');
+
                 const metaSg = {
                   domain,
+                  provider: realProviderFallback,
                   flags: { disposable: false, free: false, role: false },
                 };
                 const sgTrueSendrResult = toTrueSendrFormat(sgResult, metaSg);
@@ -1838,7 +1873,7 @@ module.exports = function bulkValidatorRouter(deps) {
                     isFallback: true,
                     smtpCategory: prelimRaw.category,
                     smtpSubStatus: prelimRaw.sub_status,
-                    provider: prelimRaw.provider || "Unknown (SMTP fallback)",
+                    provider: realProviderFallback,
                     elapsed_ms: sgResult.elapsed_ms,
                     error: sgResult.error,
                     username,
@@ -1863,8 +1898,7 @@ module.exports = function bulkValidatorRouter(deps) {
                   history,
                   {
                     domain: sgTrueSendrResult.domain || domain,
-                    provider:
-                      sgTrueSendrResult.provider || "SendGrid (fallback)",
+                    provider: sgTrueSendrResult.provider || realProviderFallback,
                   },
                 );
 
@@ -1895,7 +1929,7 @@ module.exports = function bulkValidatorRouter(deps) {
                   reason: merged.reason || built.reasonLabel,
                   message: merged.message || built.message,
                   domain: merged.domain || domain,
-                  domainProvider: merged.provider || "SendGrid (fallback)",
+                  domainProvider: merged.provider || realProviderFallback,
                   isDisposable: !!merged.isDisposable,
                   isFree: !!merged.isFree,
                   isRoleBased: !!merged.isRoleBased,
@@ -2016,8 +2050,14 @@ module.exports = function bulkValidatorRouter(deps) {
                       console.log(`   Status: ${sgResult.status}`);
                       console.log(`   Category: ${sgResult.category}`);
 
+                      // Derive real provider from SMTP stable result (MX-based) or MX lookup
+                      const realProviderStableFallback = (stableRaw.provider && stableRaw.provider !== 'Unavailable')
+                        ? stableRaw.provider
+                        : await detectProviderByMX(domain).catch(() => 'Unknown Provider');
+
                       const metaSg = {
                         domain,
+                        provider: realProviderStableFallback,
                         flags: { disposable: false, free: false, role: false },
                       };
                       const sgTrueSendrResult = toTrueSendrFormat(
@@ -2042,9 +2082,7 @@ module.exports = function bulkValidatorRouter(deps) {
                           isFallback: true,
                           smtpCategory: stableRaw.category,
                           smtpSubStatus: stableRaw.sub_status,
-                          provider:
-                            stableRaw.provider ||
-                            "Unknown (SMTP stable fallback)",
+                          provider: realProviderStableFallback,
                           elapsed_ms: sgResult.elapsed_ms,
                           error: sgResult.error,
                           username,
@@ -2075,7 +2113,7 @@ module.exports = function bulkValidatorRouter(deps) {
                           domain: sgTrueSendrResult.domain || domain,
                           provider:
                             sgTrueSendrResult.provider ||
-                            "SendGrid (stable fallback)",
+                            realProviderStableFallback,
                         },
                       );
 
@@ -2111,7 +2149,7 @@ module.exports = function bulkValidatorRouter(deps) {
                         message: merged.message || built.message,
                         domain: merged.domain || domain,
                         domainProvider:
-                          merged.provider || "SendGrid (stable fallback)",
+                          merged.provider || realProviderStableFallback,
                         isDisposable: !!merged.isDisposable,
                         isFree: !!merged.isFree,
                         isRoleBased: !!merged.isRoleBased,

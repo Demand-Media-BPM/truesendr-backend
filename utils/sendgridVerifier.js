@@ -417,7 +417,7 @@ function toTrueSendrFormat(sgResult, meta = {}) {
     category: sgResult.category,
     sub_status: sgResult.sub_status,
     domain: sgResult.domain || meta.domain || 'N/A',
-    provider: 'Proofpoint Email Protection',
+    provider: meta.provider || 'Proofpoint Email Protection',
     isDisposable: flags.disposable,
     isFree: flags.free,
     isRoleBased: flags.role,

@@ -10,6 +10,7 @@ const {
   extractDomain,
   categoryFromStatus: catFromStatus,
   normalizeStatus,
+  detectProviderByMX,
 } = require("../utils/validator");
 
 // Training samples model
@@ -29,6 +30,12 @@ const SendGridLog = require("../models/SendGridLog");
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
 const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain, isCcTLDDomain } = require("../utils/domainClassifier");
+
+// ── SendGrid result cache TTL: 3 days ─────────────────────────────────────────
+// Email addresses validated via SendGrid are stored for 3 days so that
+// re-validation within that window returns the cached result instead of
+// re-sending through SendGrid.
+const SENDGRID_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 259 200 000 ms
 
 module.exports = function singleValidatorRouter(deps) {
   const {
@@ -294,8 +301,11 @@ module.exports = function singleValidatorRouter(deps) {
     await replaceLatest(UserEmailLogModel, E, payload);
 
     // memory cache — never cache unknown results; they must be re-validated every time
+    // SendGrid-validated results are cached for 3 days; all others use the default TTL.
     if (shouldCache && stableCache && payload.category !== 'unknown') {
-      stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
+      const isSgVia = via && String(via).startsWith('sendgrid');
+      const cacheTTL = isSgVia ? SENDGRID_CACHE_TTL_MS : (CACHE_TTL_MS || 0);
+      stableCache.set(E, { until: Date.now() + cacheTTL, result: payload });
     }
 
     const credits = await debitOneCreditIfNeeded(
@@ -765,6 +775,11 @@ module.exports = function singleValidatorRouter(deps) {
             // Credits already debited by webhook handler — just get current count
             const userAfterWebhook = await User.findOne({ username });
 
+            // Cache the SendGrid webhook result for 3 days
+            if (stableCache && webhookResult.category !== 'unknown') {
+              stableCache.set(E, { until: Date.now() + SENDGRID_CACHE_TTL_MS, result: webhookResult });
+            }
+
             return res.json({
               email: E,
               status: webhookResult.status,
@@ -803,7 +818,8 @@ module.exports = function singleValidatorRouter(deps) {
         const finalCredits = await debitOneCreditIfNeeded(username, intermediateResult.status, E, idemKey, 'single');
 
         if (stableCache && intermediateResult.category !== 'unknown') {
-          stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: intermediateResult });
+          // SendGrid intermediate result — cache for 3 days
+          stableCache.set(E, { until: Date.now() + SENDGRID_CACHE_TTL_MS, result: intermediateResult });
         }
 
         sendStatusToFrontend(E, intermediateResult.status, intermediateResult.timestamp || new Date(), {
@@ -866,7 +882,8 @@ module.exports = function singleValidatorRouter(deps) {
       await replaceLatest(UserEmailLog2, E, riskyFallbackPayload);
 
       if (stableCache) {
-        stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: riskyFallbackPayload });
+        // SendGrid fallback result — cache for 3 days
+        stableCache.set(E, { until: Date.now() + SENDGRID_CACHE_TTL_MS, result: riskyFallbackPayload });
       }
 
       const fallbackCredits = await debitOneCreditIfNeeded(username, riskyFallbackPayload.status, E, idemKey, 'single');
@@ -895,7 +912,8 @@ module.exports = function singleValidatorRouter(deps) {
     }
 
     // Normal flow for non-pending results
-    const meta = { domain, flags: { disposable: false, free: false, role: false } };
+    // Pass domainCategory so toTrueSendrFormat uses the correct gateway provider name
+    const meta = { domain, provider: domainCategory, flags: { disposable: false, free: false, role: false } };
     const result = toTrueSendrFormat(sgResult, meta);
 
     // best-effort SendGridLog
@@ -958,6 +976,14 @@ module.exports = function singleValidatorRouter(deps) {
 
     const domain = extractDomain(E);
 
+    // ── Determine the real provider from SMTP result (MX-based) or MX lookup ──
+    // smtpRaw.provider is already set by validateSMTP via resolveMxCached → mxToProvider.
+    // We use it directly so the UI always shows the real provider name
+    // (e.g. "Outlook / Microsoft 365") instead of "SendGrid (SMTP fallback)".
+    const realProvider = (smtpRaw.provider && smtpRaw.provider !== 'Unavailable')
+      ? smtpRaw.provider
+      : await detectProviderByMX(domain).catch(() => 'Unknown Provider');
+
     try {
       const sgResult = await verifySendGrid(E, { logger });
 
@@ -975,7 +1001,7 @@ module.exports = function singleValidatorRouter(deps) {
             sessionId,
             messageId: sgResult.messageId,
             domain,
-            provider: 'SendGrid (SMTP fallback)',
+            provider: realProvider,
             idemKey: idemKey || null,
             metadata: { isFallback: true, smtpCategory: smtpRaw.category }
           });
@@ -1001,7 +1027,7 @@ module.exports = function singleValidatorRouter(deps) {
             isFallback: true,
             smtpCategory: smtpRaw.category,
             smtpSubStatus: smtpRaw.sub_status,
-            provider: 'SendGrid (SMTP fallback)',
+            provider: realProvider,
             elapsed_ms: sgResult.elapsed_ms,
             username,
             sessionId,
@@ -1014,8 +1040,11 @@ module.exports = function singleValidatorRouter(deps) {
           logger("sendgrid_fallback_log_err", `SendGridLog create failed: ${e.message}`, "warn");
         }
 
-        // ── Poll up to 5s for webhook result ─────────────────────────────────
-        const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 5000);
+        // ── Poll up to 30s for webhook result ────────────────────────────────
+        // Increased from 5s → 30s so single validator waits as long as the
+        // Proofpoint/Mimecast direct path. This captures bounces that arrive
+        // a few seconds after the initial "delivered" event.
+        const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 30000);
         const POLL_INTERVAL_MS = +(process.env.SENDGRID_POLL_INTERVAL_MS || 500);
         const pollStart = Date.now();
 
@@ -1040,8 +1069,8 @@ module.exports = function singleValidatorRouter(deps) {
                 category: webhookResult.category,
                 confidence: webhookResult.confidence || null,
                 domain: webhookResult.domain || domain,
-                provider: webhookResult.domainProvider || 'SendGrid (SMTP fallback)',
-                domainProvider: webhookResult.domainProvider || 'SendGrid (SMTP fallback)',
+                provider: webhookResult.domainProvider || realProvider,
+                domainProvider: webhookResult.domainProvider || realProvider,
                 isDisposable: !!webhookResult.isDisposable,
                 isFree: !!webhookResult.isFree,
                 isRoleBased: !!webhookResult.isRoleBased,
@@ -1054,13 +1083,38 @@ module.exports = function singleValidatorRouter(deps) {
           }
         }
 
-        // Timeout — return Risky as safe fallback (never leave as Unknown)
-        logger('sendgrid_fallback_poll', `Webhook wait timeout (${WEBHOOK_WAIT_MS}ms) — returning Risky as safe fallback`, 'warn');
+        // ── Polling timeout ────────────────────────────────────────────────────
+        // Check EmailLog for any intermediate result written by the webhook
+        // handler (e.g. Valid from 'delivered' that didn't delete pending).
+        // NOTE: Do NOT delete SendGridPending here — the bounce may arrive
+        // after the polling window. The bounce handler will find the record,
+        // update the DB, and push a WebSocket update to the UI.
+        logger('sendgrid_fallback_poll', `Webhook wait timeout (${WEBHOOK_WAIT_MS}ms) — checking EmailLog for intermediate result (keeping SendGridPending alive for late bounce)`, 'warn');
 
-        // Clean up stale pending record
-        try {
-          await SendGridPending.deleteOne({ messageId: sgResult.messageId });
-        } catch (e) {}
+        const intermediateResult = await EmailLog.findOne({ email: E }).lean();
+        if (intermediateResult && intermediateResult.category && intermediateResult.category !== 'unknown') {
+          logger('sendgrid_fallback_poll', `EmailLog has intermediate result: ${intermediateResult.status} (${intermediateResult.category}) — returning as fallback result`, 'info');
+          return {
+            sgTrueSendrResult: {
+              status: intermediateResult.status,
+              sub_status: intermediateResult.subStatus || null,
+              category: intermediateResult.category,
+              confidence: intermediateResult.confidence || null,
+              domain: intermediateResult.domain || domain,
+              provider: intermediateResult.domainProvider || realProvider,
+              domainProvider: intermediateResult.domainProvider || realProvider,
+              isDisposable: !!intermediateResult.isDisposable,
+              isFree: !!intermediateResult.isFree,
+              isRoleBased: !!intermediateResult.isRoleBased,
+              score: intermediateResult.score || 50,
+              timestamp: intermediateResult.timestamp || new Date(),
+            },
+            via: "sendgrid-fallback"
+          };
+        }
+
+        // No result at all — return Risky as safe fallback
+        logger('sendgrid_fallback_poll', `No result in EmailLog — returning Risky as safe fallback (SendGridPending kept alive for late webhook)`, 'warn');
 
         return {
           sgTrueSendrResult: {
@@ -1069,8 +1123,8 @@ module.exports = function singleValidatorRouter(deps) {
             category: 'risky',
             confidence: 0.6,
             domain,
-            provider: 'SendGrid (SMTP fallback)',
-            domainProvider: 'SendGrid (SMTP fallback)',
+            provider: realProvider,
+            domainProvider: realProvider,
             isDisposable: false,
             isFree: false,
             isRoleBased: false,
@@ -1082,12 +1136,13 @@ module.exports = function singleValidatorRouter(deps) {
       }
 
       // ── Normal (non-pending) SendGrid result ─────────────────────────────
-      const meta = { domain, flags: { disposable: false, free: false, role: false } };
+      // Pass realProvider so toTrueSendrFormat uses the MX-based provider name
+      const meta = { domain, provider: realProvider, flags: { disposable: false, free: false, role: false } };
       const sgTrueSendrResult = toTrueSendrFormat(sgResult, meta);
 
       if (!sgTrueSendrResult.provider && !sgTrueSendrResult.domainProvider) {
-        sgTrueSendrResult.provider = "SendGrid (fallback)";
-        sgTrueSendrResult.domainProvider = "SendGrid (fallback)";
+        sgTrueSendrResult.provider = realProvider;
+        sgTrueSendrResult.domainProvider = realProvider;
       }
 
       // best-effort fallback log (use valid enum values)
@@ -1198,8 +1253,11 @@ module.exports = function singleValidatorRouter(deps) {
 
       if (cachedDb) {
         const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
+        // SendGrid-validated results use a 3-day freshness window; others use FRESH_DB_MS.
+        const isSgCached = cachedDb.subStatus && String(cachedDb.subStatus).startsWith('sendgrid_');
+        const freshnessTTL = isSgCached ? SENDGRID_CACHE_TTL_MS : FRESH_DB_MS;
         const fresh =
-          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= FRESH_DB_MS;
+          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= freshnessTTL;
 
         // Skip cache for unknown results — re-validate every time
         if (fresh && cachedCategory !== 'unknown') {
@@ -1484,8 +1542,11 @@ module.exports = function singleValidatorRouter(deps) {
 
       if (cachedDb) {
         const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
+        // SendGrid-validated results use a 3-day freshness window; others use FRESH_DB_MS.
+        const isSgCached = cachedDb.subStatus && String(cachedDb.subStatus).startsWith('sendgrid_');
+        const freshnessTTL = isSgCached ? SENDGRID_CACHE_TTL_MS : FRESH_DB_MS;
         const fresh =
-          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= FRESH_DB_MS;
+          Date.now() - (cachedDb.updatedAt || cachedDb.createdAt) <= freshnessTTL;
 
         // Skip cache for unknown results — re-validate every time
         if (fresh && cachedCategory !== 'unknown') {
@@ -1872,7 +1933,10 @@ module.exports = function singleValidatorRouter(deps) {
       const prelimCat = categoryFromStatus(prelimPayload.status);
       if (["valid", "invalid", "risky"].includes(prelimCat)) {
         if (stableCache) {
-          stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: prelimPayload });
+          // Use 3-day TTL for SendGrid-validated results
+          const isSgPrelim = prelimVia && String(prelimVia).startsWith('sendgrid');
+          const prelimCacheTTL = isSgPrelim ? SENDGRID_CACHE_TTL_MS : (CACHE_TTL_MS || 0);
+          stableCache.set(E, { until: Date.now() + prelimCacheTTL, result: prelimPayload });
         }
         await markPendingDone(username, E);
 
@@ -1997,7 +2061,10 @@ module.exports = function singleValidatorRouter(deps) {
           await replaceLatest(UserEmailLog, E, finalPayload);
 
           if (stableCache && /Valid|Invalid|Risky/i.test(finalPayload.status)) {
-            stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: finalPayload });
+            // Use 3-day TTL for SendGrid-validated results
+            const isSgFinal = fb2?.via && String(fb2.via).startsWith('sendgrid');
+            const finalCacheTTL = isSgFinal ? SENDGRID_CACHE_TTL_MS : (CACHE_TTL_MS || 0);
+            stableCache.set(E, { until: Date.now() + finalCacheTTL, result: finalPayload });
           }
 
           sendStatusToFrontend(

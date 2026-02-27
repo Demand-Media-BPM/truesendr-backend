@@ -2012,6 +2012,7 @@ const GATEWAY_PATTERNS = {
   proofpoint:      /(^|\.)(pphosted\.com|ppe-hosted\.com|proofpoint\.com)$/i,
   barracuda:       /(^|\.)barracudanetworks\.com$/i,
   ironport:        /(^|\.)iphmx\.com$/i,
+  trendmicro:      /(^|\.)trendmicro\.(com|eu|co\.jp|net)$/i,
   topsec:          /(^|\.)topsec\.com$/i,
   symantec:        /(^|\.)messagelabs\.com$/i,
   sophos:          /(^|\.)sophos\.com$/i,
@@ -2100,10 +2101,15 @@ const TRAINING_TTL_MS = +process.env.TRAINING_TTL_MS || 10 * 60 * 1000;
 
 function mxToProvider(mxCsv) {
   const s = (mxCsv || '').toLowerCase();
-  if (s.includes('mimecast.com')) return 'Mimecast Secure Email Gateway';
+  if (s.includes('mimecast.com') || s.includes('mcsv.net')) return 'Mimecast Secure Email Gateway';
   if (s.includes('pphosted.com') || s.includes('ppe-hosted.com') || s.includes('proofpoint.com'))
     return 'Proofpoint Email Protection';
   if (s.includes('barracudanetworks.com')) return 'Barracuda Email Security Gateway';
+  if (s.includes('iphmx.com')) return 'Cisco Secure Email';
+  if (s.includes('trendmicro.')) return 'Trend Micro Email Security';
+  if (s.includes('messagelabs.com')) return 'Symantec Email Security';
+  if (s.includes('topsec.com')) return 'Topsec Email Security';
+  if (s.includes('sophos.com')) return 'Sophos Email Security';
   if (s.includes('google.com')) return 'Gmail / Google Workspace';
   if (s.includes('protection.outlook.com') || s.includes('outlook.com'))
     return 'Outlook / Microsoft 365';

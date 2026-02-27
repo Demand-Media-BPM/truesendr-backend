@@ -205,17 +205,22 @@ module.exports = function sendgridWebhookRouter(deps) {
                 break;
 
               case 'dropped':
-                finalStatus = 'Invalid';
+                // dropped = SendGrid suppression list (previously bounced address).
+                // Treat as Risky (not Invalid) — suppression list may be stale,
+                // and this is consistent with the single-validator fallback behaviour.
+                finalStatus = 'Risky';
                 finalSubStatus = 'sendgrid_dropped';
-                finalCategory = 'invalid';
-                confidence = 0.90;
+                finalCategory = 'risky';
+                confidence = 0.75;
                 break;
 
               case 'deferred':
-                finalStatus = 'Invalid';
+                // deferred = temporary delivery failure — not a permanent rejection.
+                // Treat as Risky so the address can be retried later.
+                finalStatus = 'Risky';
                 finalSubStatus = 'sendgrid_deferred';
-                finalCategory = 'invalid';
-                confidence = 0.85;
+                finalCategory = 'risky';
+                confidence = 0.70;
                 break;
 
               case 'blocked':
@@ -342,36 +347,48 @@ module.exports = function sendgridWebhookRouter(deps) {
 
             // ============================================================
             // ✅ STEP 4: Decrement webhook counter in BulkStat
+            // BulkStat is stored in the user-specific DB (not the global DB),
+            // so we must use getUserDb to find and update the correct record.
             // ============================================================
             try {
-              const BulkStat = mongoose.model('BulkStat');
-              
-              // Find BulkStat that contains this messageId
-              const bulkStat = await BulkStat.findOne({
-                sendgridMessageIds: messageId,
-                state: 'waiting_for_webhooks'
-              });
-              
-              if (bulkStat) {
-                // Decrement pending count and remove messageId
-                const result = await BulkStat.findOneAndUpdate(
-                  { bulkId: bulkStat.bulkId },
-                  {
-                    $inc: { sendgridPendingCount: -1 },
-                    $pull: { sendgridMessageIds: messageId }
-                  },
-                  { new: true }
+              if (sendGridLog.username && deps.BulkStat) {
+                const { BulkStat: UserBulkStat } = getUserDb(
+                  mongoose,
+                  EmailLog,
+                  deps.RegionStat,
+                  deps.DomainReputation,
+                  sendGridLog.username,
+                  deps.BulkStat
                 );
-                
-                if (result) {
-                  const remaining = result.sendgridPendingCount;
-                  const total = result.sendgridEmailCount;
-                  console.log(`📉 [SendGrid Webhook] Bulk ${bulkStat.bulkId}: ${remaining}/${total} webhooks remaining`);
-                  
-                  // If this was the last webhook, log completion
-                  if (remaining === 0) {
-                    console.log(`🎉 [SendGrid Webhook] Bulk ${bulkStat.bulkId}: All webhooks received!`);
+
+                // Find BulkStat in the user-specific DB that contains this messageId
+                const bulkStat = await UserBulkStat.findOne({
+                  sendgridMessageIds: messageId,
+                  state: 'waiting_for_webhooks'
+                });
+
+                if (bulkStat) {
+                  // Decrement pending count and remove messageId
+                  const result = await UserBulkStat.findOneAndUpdate(
+                    { bulkId: bulkStat.bulkId },
+                    {
+                      $inc: { sendgridPendingCount: -1 },
+                      $pull: { sendgridMessageIds: messageId }
+                    },
+                    { new: true }
+                  );
+
+                  if (result) {
+                    const remaining = result.sendgridPendingCount;
+                    const total = result.sendgridEmailCount;
+                    console.log(`📉 [SendGrid Webhook] Bulk ${bulkStat.bulkId}: ${remaining}/${total} webhooks remaining`);
+
+                    if (remaining === 0) {
+                      console.log(`🎉 [SendGrid Webhook] Bulk ${bulkStat.bulkId}: All webhooks received!`);
+                    }
                   }
+                } else {
+                  console.warn(`⚠️  [SendGrid Webhook] BulkStat not found for messageId ${messageId} in user DB (${sendGridLog.username})`);
                 }
               }
             } catch (err) {
@@ -460,19 +477,24 @@ module.exports = function sendgridWebhookRouter(deps) {
         break;
 
       case 'dropped':
-        finalStatus = 'Invalid';
+        // dropped = SendGrid suppression list (previously bounced address).
+        // Treat as Risky (not Invalid) — suppression list may be stale,
+        // and this is consistent with the single-validator fallback behaviour.
+        finalStatus = 'Risky';
         finalSubStatus = 'sendgrid_dropped';
-        finalCategory = 'invalid';
-        confidence = 0.90;
+        finalCategory = 'risky';
+        confidence = 0.75;
         shouldSaveToEmailLog = true;
         isFinalEvent = true;
         break;
 
       case 'deferred':
-        finalStatus = 'Invalid';
+        // deferred = temporary delivery failure — not a permanent rejection.
+        // Treat as Risky so the address can be retried later.
+        finalStatus = 'Risky';
         finalSubStatus = 'sendgrid_deferred';
-        finalCategory = 'invalid';
-        confidence = 0.85;
+        finalCategory = 'risky';
+        confidence = 0.70;
         shouldSaveToEmailLog = true;
         isFinalEvent = true;
         break;
@@ -636,6 +658,61 @@ module.exports = function sendgridWebhookRouter(deps) {
       console.log(`✅ [SendGrid Webhook] Final event processed: ${E} -> ${finalStatus} (${finalCategory}, event: ${eventType}, reason: ${reason || 'N/A'})`);
     } else {
       console.log(`ℹ️ [SendGrid Webhook] Intermediate event processed: ${E} -> ${finalStatus} (event: ${eventType}) — keeping SendGridPending alive for potential bounce`);
+    }
+
+    // ── Cross-section update for dropped/deferred ──────────────────────────
+    // When a dropped or deferred event is processed via the single path, also
+    // update any bulk EmailLog record for this email to Risky.
+    // This prevents a stale bulk 'bounce → Invalid' result from persisting
+    // when the actual final event was 'dropped' or 'deferred'.
+    if ((eventType === 'dropped' || eventType === 'deferred') && finalCategory === 'risky') {
+      try {
+        const recentBulkLog = await SendGridLog.findOne({
+          email: E,
+          bulkId: { $exists: true, $ne: null },
+        }).sort({ createdAt: -1 }).lean();
+
+        if (recentBulkLog) {
+          const bulkPayload = {
+            ...finalPayload,
+            section: 'bulk',
+            domainProvider: recentBulkLog.provider || finalPayload.domainProvider,
+          };
+
+          await replaceLatest(EmailLog, E, bulkPayload);
+
+          const bulkUsername = recentBulkLog.username || pending.username;
+          if (bulkUsername) {
+            const { EmailLog: BulkUserEmailLog } = getUserDb(
+              mongoose, EmailLog, deps.RegionStat, deps.DomainReputation, bulkUsername
+            );
+            await replaceLatest(BulkUserEmailLog, E, bulkPayload);
+
+            if (recentBulkLog.sessionId) {
+              sendStatusToFrontend(
+                E, bulkPayload.status, bulkPayload.timestamp,
+                {
+                  domain: bulkPayload.domain,
+                  provider: bulkPayload.domainProvider,
+                  isDisposable: bulkPayload.isDisposable,
+                  isFree: bulkPayload.isFree,
+                  isRoleBased: bulkPayload.isRoleBased,
+                  score: bulkPayload.score,
+                  subStatus: bulkPayload.subStatus,
+                  confidence: bulkPayload.confidence,
+                  category: bulkPayload.category,
+                  message: bulkPayload.message,
+                  reason: bulkPayload.reason,
+                },
+                recentBulkLog.sessionId, true, bulkUsername, 'bulk'
+              );
+            }
+          }
+          console.log(`🔄 [SendGrid Webhook] Cross-section update: ${E} bulk result -> Risky (${eventType} event)`);
+        }
+      } catch (crossErr) {
+        console.warn(`⚠️ [SendGrid Webhook] Cross-section update failed for ${E}:`, crossErr.message);
+      }
     }
   }
 
