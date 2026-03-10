@@ -10,6 +10,40 @@ const { cleanFileRows } = require("../utils/fileCleaner");
 
 const router = express.Router();
 
+const EXCEL_CELL_CHAR_LIMIT = 32767;
+
+// convert any value into something safe for xlsx export
+function toExcelSafeValue(value) {
+  if (value === null || value === undefined) return "";
+
+  // keep numbers / booleans / dates as-is where possible
+  if (typeof value === "number" || typeof value === "boolean") return value;
+  if (value instanceof Date) return value;
+
+  let str = String(value);
+
+  // remove null chars which may break xml/xlsx writing
+  str = str.replace(/\u0000/g, "");
+
+  // Excel cell text limit
+  if (str.length > EXCEL_CELL_CHAR_LIMIT) {
+    str = str.slice(0, EXCEL_CELL_CHAR_LIMIT);
+  }
+
+  return str;
+}
+
+// sanitize every row before creating worksheet
+function makeRowsExcelSafe(rows = []) {
+  return rows.map((row) => {
+    const safeRow = {};
+    for (const [key, value] of Object.entries(row || {})) {
+      safeRow[key] = toExcelSafeValue(value);
+    }
+    return safeRow;
+  });
+}
+
 // in-memory job store (TTL-based)
 const jobStore = new Map();
 
@@ -145,7 +179,6 @@ router.get("/download/:jobId", async (req, res) => {
     }
 
     if (!rowsToExport || rowsToExport.length === 0) {
-      // return an empty workbook with headers from emailColumn if available
       const ws = XLSX.utils.json_to_sheet([]);
       const wb = XLSX.utils.book_new();
       XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
@@ -164,7 +197,9 @@ router.get("/download/:jobId", async (req, res) => {
       return res.send(buf);
     }
 
-    const ws = XLSX.utils.json_to_sheet(rowsToExport);
+    const safeRowsToExport = makeRowsExcelSafe(rowsToExport);
+
+    const ws = XLSX.utils.json_to_sheet(safeRowsToExport);
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
 
