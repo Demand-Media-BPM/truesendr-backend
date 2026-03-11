@@ -1191,6 +1191,55 @@ module.exports = function singleValidatorRouter(deps) {
   // POST /api/single/validate
   // (sync-style: does a single live SMTP pass; applies Yash SendGrid rules)
   // ────────────────────────────────────────────────────────────
+  router.post("/validate-smtp-admin-testing", async (req, res) => {
+    try {
+      const { email, sessionId, username } =
+        typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+
+      if (!email) return res.status(400).json({ error: "Email is required" });
+
+      const E = normEmail(email);
+      const logger = mkLogger(sessionId, E, username);
+
+      logger(
+        "smtp_admin_testing_start",
+        "Running SMTP-only admin testing validation (no cache/db/sendgrid)",
+        "info",
+      );
+
+      const smtpResult = await validateSMTP(E, { logger });
+
+      return res.json({
+        email: E,
+        status: smtpResult.status || "Unknown",
+        category:
+          smtpResult.category || categoryFromStatus(smtpResult.status || "Unknown"),
+        subStatus: smtpResult.sub_status || smtpResult.subStatus || null,
+        confidence:
+          typeof smtpResult.confidence === "number" ? smtpResult.confidence : null,
+        reason: smtpResult.reason || "",
+        message:
+          smtpResult.reason ||
+          "SMTP-only validation completed.",
+        domain: smtpResult.domain || extractDomain(E),
+        domainProvider: smtpResult.provider || "Unavailable",
+        provider: smtpResult.provider || "Unavailable",
+        isDisposable: !!smtpResult.isDisposable,
+        isFree: !!smtpResult.isFree,
+        isRoleBased: !!smtpResult.isRoleBased,
+        score: typeof smtpResult.score === "number" ? smtpResult.score : 0,
+        timestamp: new Date(),
+        section: "single",
+        via: "smtp-only-admin-testing",
+        cached: false,
+        inProgress: false,
+      });
+    } catch (err) {
+      console.error("❌ /api/single/validate-smtp-admin-testing:", err.message);
+      return res.status(500).json({ error: err.message });
+    }
+  });
+
   router.post("/validate", async (req, res) => {
     const idemKey =
       req.headers["x-idempotency-key"] ||
