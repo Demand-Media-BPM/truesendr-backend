@@ -94,10 +94,8 @@ const PROVIDERS = {
     imap: { host: "outlook.office365.com", port: 993, secure: true },
     smtp: { host: "smtp.office365.com", port: 587, secure: false }, // optional
     inboxFolder: "INBOX",
-
-    // folder name varies in Exchange tenants
     spamFolder: "Junk Email",
-    spamFolderAlternates: ["Junk", "Junk E-mail", "Spam"],
+    spamFolderAlternates: [],
   },
 };
 
@@ -1277,6 +1275,171 @@ async function msImapSearchSubjectInFolder({
   });
 }
 
+async function msImapListFolders({
+  host,
+  port = 993,
+  user,
+  accessToken,
+  timeoutMs = 60_000,
+}) {
+  if (!accessToken) throw new Error("Missing accessToken");
+
+  const xoauth2 = Buffer.from(
+    `user=${user}\x01auth=Bearer ${accessToken}\x01\x01`,
+    "utf8",
+  ).toString("base64");
+
+  return await new Promise((resolve, reject) => {
+    const socket = tls.connect(
+      { host, port, servername: host, minVersion: "TLSv1.2" },
+      () => {},
+    );
+
+    let finished = false;
+    let buf = "";
+    let tagN = 1;
+
+    const cleanup = () => {
+      try {
+        socket.removeAllListeners("data");
+        socket.removeAllListeners("error");
+        socket.removeAllListeners("timeout");
+        socket.removeAllListeners("close");
+      } catch {}
+      try {
+        socket.end();
+      } catch {}
+      try {
+        socket.destroy();
+      } catch {}
+    };
+
+    const finishOk = (val) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      resolve(val);
+    };
+
+    const finishErr = (err) => {
+      if (finished) return;
+      finished = true;
+      cleanup();
+      reject(err instanceof Error ? err : new Error(String(err)));
+    };
+
+    socket.setTimeout(timeoutMs, () => finishErr(new Error("IMAP timeout")));
+    socket.on("error", (e) => finishErr(e));
+    socket.on("close", () => {
+      if (!finished) finishErr(new Error("IMAP socket closed unexpectedly"));
+    });
+
+    const sendLine = (line) => socket.write(line + "\r\n");
+
+    const waiters = new Map();
+    function setWaiter(tag, onOk, onNoBad) {
+      waiters.set(tag.toLowerCase(), { onOk, onNoBad });
+    }
+
+    let sawXoauth2InCap = false;
+    let authed = false;
+    const folders = [];
+
+    const capTag = "c" + tagN++;
+    const listTag = "l" + tagN++;
+    const logoutTag = "z" + tagN++;
+
+    async function startAuthAndList() {
+      try {
+        await msAuthXoauth2TwoStep(socket, xoauth2, { timeoutMs: 30_000 });
+        authed = true;
+
+        sendLine(`${listTag} LIST "" "*"`);
+        setWaiter(
+          listTag,
+          () => {
+            try {
+              sendLine(`${logoutTag} LOGOUT`);
+            } catch {}
+            finishOk(folders);
+          },
+          (line) => finishErr(new Error(`LIST failed: ${line}`)),
+        );
+      } catch (e) {
+        finishErr(e);
+      }
+    }
+
+    socket.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
+
+      while (true) {
+        const idx = buf.indexOf("\n");
+        if (idx === -1) break;
+
+        const line = buf.slice(0, idx).replace(/\r$/, "");
+        buf = buf.slice(idx + 1);
+
+        if (/^\*\s+BYE\b/i.test(line)) {
+          return finishErr(new Error(`Server BYE: ${line}`));
+        }
+
+        if (!authed && /^\*\s+OK\b/i.test(line)) {
+          sendLine(`${capTag} CAPABILITY`);
+          setWaiter(
+            capTag,
+            () => {
+              if (!sawXoauth2InCap) {
+                return finishErr(
+                  new Error("Server did not advertise AUTH=XOAUTH2"),
+                );
+              }
+              startAuthAndList();
+            },
+            (bad) => finishErr(new Error(`CAPABILITY failed: ${bad}`)),
+          );
+          continue;
+        }
+
+        if (/^\*\s+CAPABILITY\b/i.test(line) && /AUTH=XOAUTH2/i.test(line)) {
+          sawXoauth2InCap = true;
+        }
+
+        // Example:
+        // * LIST (\HasNoChildren) "/" "INBOX"
+        // * LIST (\HasChildren) "/" "Junk Email"
+        const m = line.match(/^\*\s+LIST\s+\((.*?)\)\s+"([^"]*)"\s+"(.+)"$/i);
+        if (m) {
+          const flagsRaw = m[1] || "";
+          const delimiter = m[2] || "";
+          const name = m[3] || "";
+
+          folders.push({
+            name,
+            delimiter,
+            flags: flagsRaw
+              .split(/\s+/)
+              .map((x) => x.trim())
+              .filter(Boolean),
+          });
+        }
+
+        const tagMatch = line.match(/^([A-Za-z0-9]+)\s+(OK|NO|BAD)\b/i);
+        if (tagMatch) {
+          const tag = tagMatch[1].toLowerCase();
+          const status = tagMatch[2].toUpperCase();
+          const w = waiters.get(tag);
+          if (w) {
+            waiters.delete(tag);
+            if (status === "OK") w.onOk(line);
+            else w.onNoBad(line);
+          }
+        }
+      }
+    });
+  });
+}
+
 async function checkSingleMailbox(providerKey, email, subject) {
   const cfg = getProviderConfig(providerKey);
 
@@ -1942,7 +2105,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
           counts,
         });
       }
- 
+
       return res.json({ ok: true, tests });
     } catch (err) {
       console.error("History deliverability tests error:", err);
@@ -2371,6 +2534,112 @@ module.exports = function deliverabilityRouter(deps = {}) {
       return res
         .status(500)
         .json({ ok: false, message: err?.message || "Cleanup failed." });
+    }
+  });
+
+  // POST /api/deliverability/list-folders
+  router.post("/list-folders", async (req, res) => {
+    const { provider } = req.body || {};
+
+    try {
+      if (!provider) {
+        return res.status(400).json({
+          ok: false,
+          message: "Provider is required.",
+        });
+      }
+
+      const cfg = getProviderConfig(provider);
+      if (!cfg) {
+        return res.status(400).json({
+          ok: false,
+          message:
+            "Provider not configured. Please check .env email & app password/OAuth.",
+        });
+      }
+
+      const auth = await buildImapAuth(provider, cfg);
+      const isMs = provider === "microsoft_business";
+
+      // Microsoft Business: custom XOAUTH2 + LIST
+      if (isMs) {
+        const folders = await msImapListFolders({
+          host: cfg.imap.host,
+          port: cfg.imap.port,
+          user: cfg.email,
+          accessToken: auth?.accessToken,
+          timeoutMs: 60_000,
+        });
+
+        return res.json({
+          ok: true,
+          provider,
+          email: cfg.email,
+          count: folders.length,
+          folders,
+          folderNames: folders.map((f) => f.name),
+        });
+      }
+
+      // Non-Microsoft providers: ImapFlow
+      const client = new ImapFlow({
+        host: cfg.imap.host,
+        port: cfg.imap.port,
+        secure: cfg.imap.secure,
+        auth,
+        logger: false,
+        socketTimeout: 60_000,
+        greetingTimeout: 30_000,
+        tls: { servername: cfg.imap.host, minVersion: "TLSv1.2" },
+      });
+
+      try {
+        await client.connect();
+
+        const boxes = await client.list();
+        const folders = (boxes || []).map((box) => ({
+          name: box.path || box.name || "",
+          path: box.path || "",
+          flags: Array.isArray(box.flags) ? box.flags : [],
+          specialUse: box.specialUse || null,
+          delimiter: box.delimiter || null,
+        }));
+
+        try {
+          await client.logout();
+        } catch {}
+        try {
+          if (client?.usable) await client.close();
+        } catch {}
+
+        return res.json({
+          ok: true,
+          provider,
+          email: cfg.email,
+          count: folders.length,
+          folders,
+          folderNames: folders.map((f) => f.name || f.path),
+        });
+      } catch (imapErr) {
+        try {
+          if (client?.usable) await client.logout();
+        } catch {}
+        try {
+          if (client?.usable) await client.close();
+        } catch {}
+
+        return res.status(500).json({
+          ok: false,
+          message: "Failed to list IMAP folders.",
+          error: imapErr?.message || String(imapErr),
+        });
+      }
+    } catch (e) {
+      return res.status(500).json({
+        ok: false,
+        message: "Internal server error.",
+        error: e?.message || String(e),
+      });
     }
   });
 
