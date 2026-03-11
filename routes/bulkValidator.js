@@ -1303,17 +1303,50 @@ module.exports = function bulkValidatorRouter(deps) {
           !!domainClassification &&
           (domainClassification.isBank || domainClassification.isHealthcare);
 
-        // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare → Risky directly ──────
-        // These domains are high-risk for cold email sending regardless of whether
-        // they use Proofpoint/Mimecast. Skip all validation and return Risky.
-        if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTLDDomain(domain)) {
+
+        let isProofpoint = false;
+        try {
+          isProofpoint = await isProofpointDomain(domain);
+        } catch (e) {
+          isProofpoint = false;
+          logger("proofpoint_check_error", e.message || "failed", "warn");
+        }
+
+        let isMimecast = false;
+        try {
+          isMimecast = await isMimecastDomain(domain);
+        } catch (e) {
+          isMimecast = false;
+          logger("mimecast_check_error", e.message || "failed", "warn");
+        }
+
+        let preDetectedProvider = "";
+        let isBarracuda = false;
+        try {
+          preDetectedProvider = String(await detectProviderByMX(domain) || "");
+          isBarracuda = /barracuda/i.test(preDetectedProvider);
+        } catch (_) {
+          preDetectedProvider = "";
+          isBarracuda = false;
+        }
+
+        const normalizedProvider = preDetectedProvider.toLowerCase();
+        const isKnownPublicProvider =
+          /gmail|google|outlook|microsoft|yahoo|icloud|zoho|aol|gmx|yandex|proton|fastmail/.test(normalizedProvider);
+
+        const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
+        const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
+        const isCcTldRestricted = isCcTLDDomain(domain) && (isRestrictedGatewayDomain || isCustomDomain);
+
+        // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare, restricted ccTLD → Risky directly ──────
+        if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTldRestricted) {
           const subStatus = isOrgEduGovDomain(domain) ? 'org_edu_gov_domain'
-            : isCcTLDDomain(domain) ? 'cctld_domain'
+            : isCcTldRestricted ? 'cctld_domain'
             : 'bank_healthcare_domain';
           const message = isOrgEduGovDomain(domain)
             ? 'This address belongs to an organizational, educational, or government domain (.org/.edu/.gov). Sending cold emails to these domains is risky.'
-            : isCcTLDDomain(domain)
-            ? 'This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.'
+            : isCcTldRestricted
+            ? 'This address belongs to a country-specific domain (ccTLD) on a restricted/custom provider type. Sending cold emails to these domains is risky and may result in blocks or bounces.'
             : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
           console.log(`[BULK][early_risky] ${E} → domain "${domain}" is ${subStatus} → returning Risky directly`);
@@ -1354,22 +1387,6 @@ module.exports = function bulkValidatorRouter(deps) {
             RoleBased: 'No', Score: 30, SubStatus: subStatus, Confidence: 0.9,
             Category: 'risky', Message: message, Reason: 'High-Risk Domain', Source: 'Live',
           };
-        }
-
-        let isProofpoint = false;
-        try {
-          isProofpoint = await isProofpointDomain(domain);
-        } catch (e) {
-          isProofpoint = false;
-          logger("proofpoint_check_error", e.message || "failed", "warn");
-        }
-
-        let isMimecast = false;
-        try {
-          isMimecast = await isMimecastDomain(domain);
-        } catch (e) {
-          isMimecast = false;
-          logger("mimecast_check_error", e.message || "failed", "warn");
         }
 
         // Yash-style domain logs
@@ -2319,19 +2336,41 @@ module.exports = function bulkValidatorRouter(deps) {
         }
 
         // ─────────────────────────────────────────────────────────
-        // 🌍 ccTLD domain override: any 2-letter country code TLD
+        // 🌍 ccTLD domain override (restricted providers/custom domains only)
         // ─────────────────────────────────────────────────────────
-        if (final && final.category !== "invalid" && categoryFromStatus(final.status || "") !== "invalid" && isCcTLDDomain(domain)) {
-          console.log(`[BULK][cctld_override] ${E} → domain "${domain}" has 2-letter ccTLD, overriding ${final.category} → Risky`);
-          final.status = "Risky";
-          final.category = "risky";
-          final.subStatus = "cctld_domain";
-          final.score = Math.min(typeof final.score === "number" ? final.score : 50, 45);
-          final.reason = "Country-Specific Domain";
-          final.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
-          // Persist the overridden result
-          await replaceLatest(EmailLog, E, { email: E, ...final });
-          await replaceLatest(UserEmailLog, E, { email: E, ...final });
+        if (
+          final &&
+          final.category !== "invalid" &&
+          categoryFromStatus(final.status || "") !== "invalid" &&
+          isCcTLDDomain(domain)
+        ) {
+          const finalProvider = String(
+            final.domainProvider || final.provider || preDetectedProvider || ""
+          ).toLowerCase();
+
+          const finalIsBarracuda = /barracuda/i.test(finalProvider);
+          const finalIsProofpoint = /proofpoint/i.test(finalProvider) || isProofpoint;
+          const finalIsMimecast = /mimecast/i.test(finalProvider) || isMimecast;
+          const finalIsKnownPublicProvider =
+            /gmail|google|outlook|microsoft|yahoo|icloud|zoho|aol|gmx|yandex|proton|fastmail/.test(finalProvider);
+
+          const finalIsRestrictedProvider =
+            finalIsProofpoint || finalIsMimecast || finalIsBarracuda;
+          const finalIsCustomDomain =
+            !finalIsRestrictedProvider && !finalIsKnownPublicProvider;
+
+          if (finalIsRestrictedProvider || finalIsCustomDomain) {
+            console.log(`[BULK][cctld_override] ${E} → domain "${domain}" has 2-letter ccTLD on restricted/custom provider, overriding ${final.category} → Risky`);
+            final.status = "Risky";
+            final.category = "risky";
+            final.subStatus = "cctld_domain";
+            final.score = Math.min(typeof final.score === "number" ? final.score : 50, 45);
+            final.reason = "Country-Specific Domain";
+            final.message = "This address belongs to a country-specific domain (ccTLD) on a restricted/custom provider type. Sending cold emails to these domains is risky and may result in blocks or bounces.";
+            // Persist the overridden result
+            await replaceLatest(EmailLog, E, { email: E, ...final });
+            await replaceLatest(UserEmailLog, E, { email: E, ...final });
+          }
         }
 
         try {

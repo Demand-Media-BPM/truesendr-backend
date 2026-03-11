@@ -1,4 +1,3 @@
-// .......................................................................................................
 
 // routes/singleValidator.js
 const express = require("express");
@@ -283,18 +282,6 @@ module.exports = function singleValidatorRouter(deps) {
       payload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
     }
 
-    // ─────────────────────────────────────────────────────────
-    // 🌍 ccTLD domain override: any 2-letter country code TLD
-    // ─────────────────────────────────────────────────────────
-    if (payload.category !== "invalid" && isCcTLDDomain(payload.domain)) {
-      console.log(`[single][cctld_override] ${E} → domain "${payload.domain}" has 2-letter ccTLD, overriding ${payload.category} → Risky`);
-      payload.status = "Risky";
-      payload.category = "risky";
-      payload.subStatus = "cctld_domain";
-      payload.score = Math.min(payload.score, 45);
-      payload.reason = "Country-Specific Domain";
-      payload.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
-    }
 
     // persist in both global + user DB
     await replaceLatest(EmailLogModel, E, payload);
@@ -520,18 +507,37 @@ module.exports = function singleValidatorRouter(deps) {
     const isBankOrHealthcare =
       !!domainClassification?.isBank || !!domainClassification?.isHealthcare;
 
-    // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare → Risky directly ────────
-    // These domains are high-risk for cold email sending regardless of whether
-    // they use Proofpoint/Mimecast. Skip all validation and return Risky.
-    if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTLDDomain(domain)) {
+    const isProofpoint = await isProofpointDomain(domain);
+    const isMimecast = await isMimecastDomain(domain);
+
+    let detectedProvider = "";
+    let isBarracuda = false;
+    try {
+      detectedProvider = String(await detectProviderByMX(domain) || "");
+      isBarracuda = /barracuda/i.test(detectedProvider);
+    } catch (_) {
+      detectedProvider = "";
+      isBarracuda = false;
+    }
+
+    const normalizedProvider = detectedProvider.toLowerCase();
+    const isKnownPublicProvider =
+      /gmail|google|outlook|microsoft|yahoo|icloud|zoho|aol|gmx|yandex|proton|fastmail/.test(normalizedProvider);
+
+    const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
+    const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
+    const isCcTldRestricted = isCcTLDDomain(domain) && (isRestrictedGatewayDomain || isCustomDomain);
+
+    // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare, and restricted ccTLDs → Risky directly ────────
+    if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTldRestricted) {
       const earlyLogger = mkLogger(sessionId, E, username);
       const subStatus = isOrgEduGovDomain(domain) ? 'org_edu_gov_domain'
-        : isCcTLDDomain(domain) ? 'cctld_domain'
+        : isCcTldRestricted ? 'cctld_domain'
         : 'bank_healthcare_domain';
       const message = isOrgEduGovDomain(domain)
         ? 'This address belongs to an organizational, educational, or government domain (.org/.edu/.gov). Sending cold emails to these domains is risky.'
-        : isCcTLDDomain(domain)
-        ? 'This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.'
+        : isCcTldRestricted
+        ? 'This address belongs to a country-specific domain (ccTLD) on a restricted/custom provider type. Sending cold emails to these domains is risky and may result in blocks or bounces.'
         : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
       earlyLogger('early_risky', `Domain ${domain} is ${subStatus} → returning Risky directly`, 'info');
@@ -567,9 +573,6 @@ module.exports = function singleValidatorRouter(deps) {
       }, sessionId, true, username, 'single');
       return res.json({ ...riskyEarlyPayload, via: 'early-risky', cached: false, inProgress: false, credits: earlyCredits });
     }
-
-    const isProofpoint = await isProofpointDomain(domain);
-    const isMimecast = await isMimecastDomain(domain);
 
     if (!isProofpoint && !isMimecast) return null;
 
@@ -1889,18 +1892,9 @@ module.exports = function singleValidatorRouter(deps) {
         prelimPayload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
       }
 
-      // ─────────────────────────────────────────────────────────
-      // 🌍 ccTLD domain override (prelim stage)
-      // ─────────────────────────────────────────────────────────
-      if (prelimPayload.category !== "invalid" && isCcTLDDomain(prelimPayload.domain)) {
-        console.log(`[single][cctld_override][prelim] ${E} → domain "${prelimPayload.domain}" has 2-letter ccTLD, overriding ${prelimPayload.category} → Risky`);
-        prelimPayload.status = "Risky";
-        prelimPayload.category = "risky";
-        prelimPayload.subStatus = "cctld_domain";
-        prelimPayload.score = Math.min(prelimPayload.score, 45);
-        prelimPayload.reason = "Country-Specific Domain";
-        prelimPayload.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
-      }
+      // NOTE: ccTLD risky handling is applied in early-gating logic only
+      // (restricted providers/custom domains). Do not unconditionally
+      // downgrade ccTLDs at prelim stage.
 
       await replaceLatest(EmailLog, E, prelimPayload);
       await replaceLatest(UserEmailLog, E, prelimPayload);
@@ -2044,18 +2038,9 @@ module.exports = function singleValidatorRouter(deps) {
             finalPayload.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
           }
 
-          // ─────────────────────────────────────────────────────────
-          // 🌍 ccTLD domain override (stable background stage)
-          // ─────────────────────────────────────────────────────────
-          if (finalPayload.category !== "invalid" && isCcTLDDomain(finalPayload.domain)) {
-            console.log(`[single][cctld_override][stable] ${E} → domain "${finalPayload.domain}" has 2-letter ccTLD, overriding ${finalPayload.category} → Risky`);
-            finalPayload.status = "Risky";
-            finalPayload.category = "risky";
-            finalPayload.subStatus = "cctld_domain";
-            finalPayload.score = Math.min(finalPayload.score, 45);
-            finalPayload.reason = "Country-Specific Domain";
-            finalPayload.message = "This address belongs to a country-specific domain (ccTLD). Sending cold emails to country-specific domains is risky and may result in blocks or bounces.";
-          }
+          // NOTE: ccTLD risky handling is applied in early-gating logic only
+          // (restricted providers/custom domains). Do not unconditionally
+          // downgrade ccTLDs at stable stage.
 
           await replaceLatest(EmailLog, E, finalPayload);
           await replaceLatest(UserEmailLog, E, finalPayload);

@@ -547,9 +547,32 @@ function isKnownHealthcareDomain(domain) {
 /**
  * Check if domain contains bank-related keywords
  */
-function hasBankKeywords(domain) {
+function tokenizeDomain(domain) {
   const d = String(domain || '').toLowerCase().trim();
-  return BANK_KEYWORDS.some(keyword => d.includes(keyword));
+  if (!d || d === 'n/a') return [];
+  return d
+    .split('.')
+    .flatMap(part => part.split(/[^a-z0-9]+/))
+    .filter(Boolean);
+}
+
+function hasBankKeywords(domain) {
+  const tokens = tokenizeDomain(domain);
+  if (!tokens.length) return false;
+
+  // Strict token-level matching to reduce false positives
+  if (tokens.some(token => token === 'bank' || token === 'banking')) return true;
+  if (tokens.some(token => token === 'credit' || token === 'loan' || token === 'mortgage')) return true;
+  if (tokens.some(token => token === 'finance' || token === 'financial')) return true;
+  if (tokens.some(token => token === 'investment' || token === 'wealth' || token === 'securities' || token === 'treasury')) return true;
+  if (tokens.some(token => token === 'creditunion' || token === 'fcu')) return true;
+
+  // Keep compatibility for domains that concatenate common banking words
+  const joined = tokens.join('');
+  return (
+    joined.includes('creditunion') ||
+    joined.includes('banking')
+  );
 }
 
 /**
@@ -557,9 +580,9 @@ function hasBankKeywords(domain) {
  * Used to override Valid results to Risky for banking domains.
  */
 function hasBankWordInDomain(domain) {
-  const d = String(domain || '').toLowerCase().trim();
-  if (!d || d === 'n/a') return false;
-  return d.includes('bank');
+  const tokens = tokenizeDomain(domain);
+  if (!tokens.length) return false;
+  return tokens.some(token => token === 'bank' || token === 'banking');
 }
 
 /**
@@ -611,8 +634,31 @@ function isCcTLDDomain(domain) {
  * Check if domain contains healthcare-related keywords
  */
 function hasHealthcareKeywords(domain) {
-  const d = String(domain || '').toLowerCase().trim();
-  return HEALTHCARE_KEYWORDS.some(keyword => d.includes(keyword));
+  const tokens = tokenizeDomain(domain);
+  if (!tokens.length) return false;
+
+  // Remove ambiguous substring behavior (e.g. "demandmedia..." should NOT match "med")
+  // and rely on meaningful token matches only.
+  return tokens.some(token =>
+    token === 'health' ||
+    token === 'healthcare' ||
+    token === 'medical' ||
+    token === 'medicine' ||
+    token === 'clinic' ||
+    token === 'hospital' ||
+    token === 'doctor' ||
+    token === 'physician' ||
+    token === 'patient' ||
+    token === 'pharmacy' ||
+    token === 'pharma' ||
+    token === 'dental' ||
+    token === 'vision' ||
+    token === 'wellness' ||
+    token === 'rehab' ||
+    token === 'surgery' ||
+    token === 'diagnostic' ||
+    token === 'laboratory'
+  );
 }
 
 /**
