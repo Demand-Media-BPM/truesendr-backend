@@ -87,12 +87,23 @@ const PROVIDERS = {
     spamFolder: "Spam",
   },
 
+  hotmail: {
+    label: "Hotmail",
+    emailEnv: "DELIV_HOTMAIL_EMAIL",
+    passEnv: null,
+    imap: { host: "outlook.office365.com", port: 993, secure: true },
+    smtp: { host: "smtp-mail.outlook.com", port: 587, secure: false },
+    inboxFolder: "Inbox",
+    spamFolder: "Junk",
+    spamFolderAlternates: [],
+  },
+
   microsoft_business: {
     label: "Microsoft Business",
     emailEnv: "DELIV_MS_EMAIL",
     passEnv: null,
     imap: { host: "outlook.office365.com", port: 993, secure: true },
-    smtp: { host: "smtp.office365.com", port: 587, secure: false }, // optional
+    smtp: { host: "smtp.office365.com", port: 587, secure: false }, 
     inboxFolder: "INBOX",
     spamFolder: "Junk Email",
     spamFolderAlternates: [],
@@ -366,7 +377,10 @@ function getDeliverabilityModel(usernameRaw) {
 }
 
 function isMicrosoftProvider(key) {
-  return String(key || "") === "microsoft_business";
+  const k = String(key || "")
+    .trim()
+    .toLowerCase();
+  return k === "microsoft_business" || k === "hotmail";
 }
 
 function requireMsSetupKey(req, res) {
@@ -447,23 +461,26 @@ function decodeJwtClaims(token) {
   }
 }
 
-async function fetchMsAccessTokenByRefreshToken() {
+async function fetchMsAccessTokenByRefreshToken(providerKey) {
   const tenant = process.env.DELIV_MS_TENANT || "common";
   const clientId = process.env.DELIV_MS_CLIENT_ID;
   const clientSecret = process.env.DELIV_MS_CLIENT_SECRET;
   const redirectUri = process.env.DELIV_MS_REDIRECT_URI;
-  const refreshToken = process.env.DELIV_MS_REFRESH_TOKEN;
+
+  const refreshToken =
+    providerKey === "hotmail"
+      ? process.env.DELIV_HOTMAIL_REFRESH_TOKEN
+      : process.env.DELIV_MS_REFRESH_TOKEN;
 
   if (!clientId || !clientSecret || !redirectUri || !refreshToken) {
     throw new Error(
-      "Microsoft OAuth env missing. Need DELIV_MS_CLIENT_ID, DELIV_MS_CLIENT_SECRET, DELIV_MS_REDIRECT_URI, DELIV_MS_REFRESH_TOKEN",
+      providerKey === "hotmail"
+        ? "Microsoft OAuth env missing for Hotmail. Need DELIV_MS_CLIENT_ID, DELIV_MS_CLIENT_SECRET, DELIV_MS_REDIRECT_URI, DELIV_HOTMAIL_REFRESH_TOKEN"
+        : "Microsoft OAuth env missing. Need DELIV_MS_CLIENT_ID, DELIV_MS_CLIENT_SECRET, DELIV_MS_REDIRECT_URI, DELIV_MS_REFRESH_TOKEN",
     );
   }
 
   const tokenUrl = `https://login.microsoftonline.com/${tenant}/oauth2/v2.0/token`;
-
-  // console.log("[MS] tenant:", tenant);
-  // console.log("[MS] has refresh token:", !!refreshToken);
 
   const body = new URLSearchParams();
   body.set("client_id", clientId);
@@ -485,11 +502,12 @@ async function fetchMsAccessTokenByRefreshToken() {
   const json = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     throw new Error(
-      `MS token refresh failed (${resp.status}): ${json.error || ""} ${
-        json.error_description || ""
-      }`,
+      `MS token refresh failed for ${providerKey} (${resp.status}): ${
+        json.error || ""
+      } ${json.error_description || ""}`,
     );
   }
+
   return json.access_token;
 }
 
@@ -521,7 +539,7 @@ function msAuthorizeUrl() {
 async function buildImapAuth(providerKey, cfg) {
   // Microsoft Business: OAuth2
   if (isMicrosoftProvider(providerKey)) {
-    const token = await fetchMsAccessTokenByRefreshToken();
+    const token = await fetchMsAccessTokenByRefreshToken(providerKey);
 
     // Build XOAUTH2 base64 (works for IMAP AUTHENTICATE XOAUTH2)
     const xoauth2 = Buffer.from(
@@ -1408,11 +1426,48 @@ async function msImapListFolders({
         // Example:
         // * LIST (\HasNoChildren) "/" "INBOX"
         // * LIST (\HasChildren) "/" "Junk Email"
-        const m = line.match(/^\*\s+LIST\s+\((.*?)\)\s+"([^"]*)"\s+"(.+)"$/i);
-        if (m) {
-          const flagsRaw = m[1] || "";
-          const delimiter = m[2] || "";
-          const name = m[3] || "";
+        // const m = line.match(/^\*\s+LIST\s+\((.*?)\)\s+"([^"]*)"\s+"(.+)"$/i);
+        // if (m) {
+        //   const flagsRaw = m[1] || "";
+        //   const delimiter = m[2] || "";
+        //   const name = m[3] || "";
+
+        //   folders.push({
+        //     name,
+        //     delimiter,
+        //     flags: flagsRaw
+        //       .split(/\s+/)
+        //       .map((x) => x.trim())
+        //       .filter(Boolean),
+        //   });
+        // }
+
+        // Examples Microsoft may return:
+        // * LIST (\HasNoChildren) "/" "INBOX"
+        // * LIST (\HasNoChildren \Junk) "/" "Junk Email"
+        // * LIST (\HasChildren) "/" Archive
+        // * LIST (\HasNoChildren) NIL "Some Folder"
+        const listMatch = line.match(
+          /^\*\s+LIST\s+\(([^)]*)\)\s+("?[^"]*"?|NIL)\s+(.+)$/i,
+        );
+        if (listMatch) {
+          const flagsRaw = listMatch[1] || "";
+          let delimiterRaw = listMatch[2] || "";
+          let nameRaw = listMatch[3] || "";
+
+          // normalize delimiter
+          let delimiter = "";
+          if (!/^NIL$/i.test(delimiterRaw)) {
+            delimiter = delimiterRaw.replace(/^"(.*)"$/, "$1");
+          }
+
+          // normalize folder name
+          let name = nameRaw.trim();
+
+          // remove surrounding quotes if present
+          if (name.startsWith('"') && name.endsWith('"')) {
+            name = name.slice(1, -1);
+          }
 
           folders.push({
             name,
@@ -1460,7 +1515,7 @@ async function checkSingleMailbox(providerKey, email, subject) {
   }
 
   const auth = await buildImapAuth(providerKey, cfg);
-  const isMs = providerKey === "microsoft_business";
+  const isMs = isMicrosoftProvider(providerKey);
 
   if (isMs) {
     try {
@@ -1912,7 +1967,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
       return res
         .status(200)
         .send(
-          `✅ Microsoft connected.\n\nPaste this into EC2 .env:\n\nDELIV_MS_REFRESH_TOKEN=${refresh}\n\nThen restart backend.\n`,
+          `✅ Microsoft connected.\n\nCopy this refresh token and store it in the correct .env variable for the mailbox you used to sign in.\n\nREFRESH_TOKEN=${refresh}\n\nExamples:\n- security@truesendr.com -> DELIV_MS_REFRESH_TOKEN\n- truesendr@hotmail.com -> DELIV_HOTMAIL_REFRESH_TOKEN\n\nThen restart backend.\n`,
         );
     } catch (e) {
       return res
@@ -2559,7 +2614,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
       }
 
       const auth = await buildImapAuth(provider, cfg);
-      const isMs = provider === "microsoft_business";
+      const isMs = isMicrosoftProvider(provider);
 
       // Microsoft Business: custom XOAUTH2 + LIST
       if (isMs) {
@@ -2664,7 +2719,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
       }
 
       // Microsoft SMTP debug not supported
-      if (provider === "microsoft_business" && mode === "smtp") {
+      if (isMicrosoftProvider(provider) && mode === "smtp") {
         return res.status(400).json({
           ok: false,
           message: "SMTP debug not supported for Microsoft OAuth mailbox.",
@@ -2699,7 +2754,7 @@ module.exports = function deliverabilityRouter(deps = {}) {
       }
       // IMAP test
       const auth = await buildImapAuth(provider, cfg);
-      const isMs = provider === "microsoft_business";
+      const isMs = isMicrosoftProvider(provider);
 
       if (isMs) {
         // ✅ Exchange hates ImapFlow's inline XOAUTH2; use two-step AUTHENTICATE
