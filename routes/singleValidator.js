@@ -28,7 +28,7 @@ const { checkDomainCatchAll } = require("../utils/smtpValidator");
 const SendGridLog = require("../models/SendGridLog");
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
-const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain, isCcTLDDomain } = require("../utils/domainClassifier");
+const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain } = require("../utils/domainClassifier");
 
 // ── SendGrid result cache TTL: 3 days ─────────────────────────────────────────
 // Email addresses validated via SendGrid are stored for 3 days so that
@@ -510,6 +510,16 @@ module.exports = function singleValidatorRouter(deps) {
     const isProofpoint = await isProofpointDomain(domain);
     const isMimecast = await isMimecastDomain(domain);
 
+    const tld = String(domain || "").toLowerCase().split(".").pop() || "";
+    const isTargetSendgridSuffix =
+      tld === "us" ||
+      tld === "uk" ||
+      tld === "eu" ||
+      tld === "it" ||
+      tld === "gov" ||
+      tld === "ca" ||
+      tld === "br";
+
     let detectedProvider = "";
     let isBarracuda = false;
     try {
@@ -526,18 +536,18 @@ module.exports = function singleValidatorRouter(deps) {
 
     const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
     const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
-    const isCcTldRestricted = isCcTLDDomain(domain) && (isRestrictedGatewayDomain || isCustomDomain);
 
-    // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare, and restricted ccTLDs → Risky directly ────────
-    if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTldRestricted) {
+    // ── EARLY EXIT: .edu/.org/.gov and bank/healthcare only ────────
+    // IMPORTANT:
+    // ccTLD domains should NOT be marked risky here anymore.
+    // They should flow into SendGrid-direct decision:
+    //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
+    if (isOrgEduGovDomain(domain) || isBankOrHealthcare) {
       const earlyLogger = mkLogger(sessionId, E, username);
       const subStatus = isOrgEduGovDomain(domain) ? 'org_edu_gov_domain'
-        : isCcTldRestricted ? 'cctld_domain'
         : 'bank_healthcare_domain';
       const message = isOrgEduGovDomain(domain)
         ? 'This address belongs to an organizational, educational, or government domain (.org/.edu/.gov). Sending cold emails to these domains is risky.'
-        : isCcTldRestricted
-        ? 'This address belongs to a country-specific domain (ccTLD) on a restricted/custom provider type. Sending cold emails to these domains is risky and may result in blocks or bounces.'
         : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
       earlyLogger('early_risky', `Domain ${domain} is ${subStatus} → returning Risky directly`, 'info');
@@ -574,11 +584,16 @@ module.exports = function singleValidatorRouter(deps) {
       return res.json({ ...riskyEarlyPayload, via: 'early-risky', cached: false, inProgress: false, credits: earlyCredits });
     }
 
-    if (!isProofpoint && !isMimecast) return null;
+    const shouldSendgridDirect =
+      isBankOrHealthcare || ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
 
-    const domainCategory = isMimecast
-      ? "Mimecast Email Security"
-      : "Proofpoint Email Protection";
+    if (!shouldSendgridDirect) return null;
+
+    const domainCategory = isBankOrHealthcare
+      ? getDomainCategory(domain)
+      : isMimecast
+        ? "Mimecast Email Security"
+        : "Proofpoint Email Protection";
 
     const logger = mkLogger(sessionId, E, username);
 

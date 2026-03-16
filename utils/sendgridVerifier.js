@@ -9,9 +9,54 @@ const dns = require('dns').promises;
 
 // Initialize SendGrid with API key from environment
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
+const DEFAULT_SENDGRID_SENDERS = [
+  'jenny.j@truesendr.com',
+  'david.g@mailjournals.com',
+  'max.j@mailrant.com',
+  'john.doe@mailverite.com'
+];
 const SENDGRID_VERIFIED_SENDER = process.env.SENDGRID_VERIFIED_SENDER || 'jenny.j@truesendr.com';
+const SENDGRID_VERIFIED_SENDERS = (process.env.SENDGRID_VERIFIED_SENDERS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+
+const SENDGRID_SENDER_POOL = Array.from(new Set([
+  ...DEFAULT_SENDGRID_SENDERS,
+  SENDGRID_VERIFIED_SENDER.trim().toLowerCase(),
+  ...SENDGRID_VERIFIED_SENDERS
+]));
+
 const SENDGRID_ENABLED = process.env.SENDGRID_ENABLED === 'true';
 const SENDGRID_TIMEOUT_MS = +(process.env.SENDGRID_TIMEOUT_MS || 10000);
+
+// In-memory sender rotation state per recipient domain.
+// Ensures repeated sends to the same domain rotate sender account.
+const domainSenderRotation = new Map();
+
+function toDisplayNameFromEmail(senderEmail) {
+  const localPart = String(senderEmail || '').split('@')[0] || '';
+  const firstToken = localPart.split(/[._-]+/)[0] || 'Team';
+  const normalized = firstToken.charAt(0).toUpperCase() + firstToken.slice(1).toLowerCase();
+  return `${normalized} J`;
+}
+
+function pickSenderForRecipient(email) {
+  const domain = String(email || '').includes('@')
+    ? String(email).split('@')[1].toLowerCase()
+    : '';
+  if (!domain || SENDGRID_SENDER_POOL.length === 0) {
+    return SENDGRID_VERIFIED_SENDER;
+  }
+
+  const prevIndex = domainSenderRotation.has(domain)
+    ? domainSenderRotation.get(domain)
+    : -1;
+
+  const nextIndex = (prevIndex + 1) % SENDGRID_SENDER_POOL.length;
+  domainSenderRotation.set(domain, nextIndex);
+  return SENDGRID_SENDER_POOL[nextIndex];
+}
 
 if (SENDGRID_API_KEY) {
   sgMail.setApiKey(SENDGRID_API_KEY);
@@ -152,11 +197,16 @@ async function sendVerificationEmail(email, options = {}) {
   const randomSubject = SUBJECTS[Math.floor(Math.random() * SUBJECTS.length)];
   const randomBody   = BODIES[Math.floor(Math.random() * BODIES.length)];
 
+  const selectedSender = pickSenderForRecipient(email);
+  const selectedSenderName = toDisplayNameFromEmail(selectedSender);
+
+  logger('sendgrid', `Selected sender ${selectedSender} (${selectedSenderName}) for recipient ${email}`);
+
   const msg = {
     to: email,
     from: {
-      email: SENDGRID_VERIFIED_SENDER,
-      name: 'Jenny J'
+      email: selectedSender,
+      name: selectedSenderName
     },
     subject: randomSubject,
     text: randomBody.text,

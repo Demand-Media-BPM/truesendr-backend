@@ -30,7 +30,6 @@ const {
   hasBankWordInDomain,
   isOrgEduGovDomain,
   isTwDomain,
-  isCcTLDDomain,
   // isHighRiskDomain, // (optional) not required, Yash also doesn't actually use it in worker
 } = require("../utils/domainClassifier");
 
@@ -1336,17 +1335,18 @@ module.exports = function bulkValidatorRouter(deps) {
 
         const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
         const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
-        const isCcTldRestricted = isCcTLDDomain(domain) && (isRestrictedGatewayDomain || isCustomDomain);
 
-        // ── EARLY EXIT: .edu/.org/.gov, bank, healthcare, restricted ccTLD → Risky directly ──────
-        if (isOrgEduGovDomain(domain) || isBankOrHealthcare || isCcTldRestricted) {
-          const subStatus = isOrgEduGovDomain(domain) ? 'org_edu_gov_domain'
-            : isCcTldRestricted ? 'cctld_domain'
+        // ── EARLY EXIT: .edu/.org/.gov and bank/healthcare only ──────
+        // IMPORTANT:
+        // ccTLD domains should NOT be marked risky here anymore.
+        // They should flow into SendGrid-direct decision:
+        //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
+        if (isOrgEduGovDomain(domain) || isBankOrHealthcare) {
+          const subStatus = isOrgEduGovDomain(domain)
+            ? 'org_edu_gov_domain'
             : 'bank_healthcare_domain';
           const message = isOrgEduGovDomain(domain)
             ? 'This address belongs to an organizational, educational, or government domain (.org/.edu/.gov). Sending cold emails to these domains is risky.'
-            : isCcTldRestricted
-            ? 'This address belongs to a country-specific domain (ccTLD) on a restricted/custom provider type. Sending cold emails to these domains is risky and may result in blocks or bounces.'
             : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
           console.log(`[BULK][early_risky] ${E} → domain "${domain}" is ${subStatus} → returning Risky directly`);
@@ -1492,10 +1492,23 @@ module.exports = function bulkValidatorRouter(deps) {
             section: "bulk",
           };
         } else {
-          // ───────────────────────────────────────────────────────
-          // 1) BANK/HEALTHCARE OR PROOFPOINT OR MIMECAST → SENDGRID FIRST (Yash)
-          // ───────────────────────────────────────────────────────
-          if (isBankOrHealthcare || isProofpoint || isMimecast) {
+          const tld = String(domain || "").toLowerCase().split(".").pop() || "";
+          const isTargetSendgridSuffix =
+            tld === "us" ||
+            tld === "uk" ||
+            tld === "eu" ||
+            tld === "it" ||
+            tld === "gov" ||
+            tld === "ca" ||
+            tld === "br";
+
+          const shouldSendgridDirect =
+            isBankOrHealthcare || ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
+
+        // ───────────────────────────────────────────────────────
+        // 1) BANK/HEALTHCARE OR (PROOFPOINT/MIMECAST + target suffix) → SENDGRID FIRST
+        // ───────────────────────────────────────────────────────
+          if (shouldSendgridDirect) {
             const domainCategory = isBankOrHealthcare
               ? getDomainCategory(domain)
               : isMimecast
@@ -2335,43 +2348,9 @@ module.exports = function bulkValidatorRouter(deps) {
           await replaceLatest(UserEmailLog, E, { email: E, ...final });
         }
 
-        // ─────────────────────────────────────────────────────────
-        // 🌍 ccTLD domain override (restricted providers/custom domains only)
-        // ─────────────────────────────────────────────────────────
-        if (
-          final &&
-          final.category !== "invalid" &&
-          categoryFromStatus(final.status || "") !== "invalid" &&
-          isCcTLDDomain(domain)
-        ) {
-          const finalProvider = String(
-            final.domainProvider || final.provider || preDetectedProvider || ""
-          ).toLowerCase();
-
-          const finalIsBarracuda = /barracuda/i.test(finalProvider);
-          const finalIsProofpoint = /proofpoint/i.test(finalProvider) || isProofpoint;
-          const finalIsMimecast = /mimecast/i.test(finalProvider) || isMimecast;
-          const finalIsKnownPublicProvider =
-            /gmail|google|outlook|microsoft|yahoo|icloud|zoho|aol|gmx|yandex|proton|fastmail/.test(finalProvider);
-
-          const finalIsRestrictedProvider =
-            finalIsProofpoint || finalIsMimecast || finalIsBarracuda;
-          const finalIsCustomDomain =
-            !finalIsRestrictedProvider && !finalIsKnownPublicProvider;
-
-          if (finalIsRestrictedProvider || finalIsCustomDomain) {
-            console.log(`[BULK][cctld_override] ${E} → domain "${domain}" has 2-letter ccTLD on restricted/custom provider, overriding ${final.category} → Risky`);
-            final.status = "Risky";
-            final.category = "risky";
-            final.subStatus = "cctld_domain";
-            final.score = Math.min(typeof final.score === "number" ? final.score : 50, 45);
-            final.reason = "Country-Specific Domain";
-            final.message = "This address belongs to a country-specific domain (ccTLD) on a restricted/custom provider type. Sending cold emails to these domains is risky and may result in blocks or bounces.";
-            // Persist the overridden result
-            await replaceLatest(EmailLog, E, { email: E, ...final });
-            await replaceLatest(UserEmailLog, E, { email: E, ...final });
-          }
-        }
+        // NOTE:
+        // ccTLD domains (e.g., .be/.de/.fr) should NOT be force-marked risky.
+        // Provider-based validation flow (SMTP/SendGrid) determines final status.
 
         try {
           const d0 = final.domain || extractDomain(E);
