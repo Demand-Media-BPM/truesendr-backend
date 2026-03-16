@@ -23,6 +23,7 @@ const {
 const { checkDomainCatchAll } = require("../utils/smtpValidator");
 
 const SendGridLog = require("../models/SendGridLog");
+const dns = require("dns").promises;
 
 const {
   classifyDomain,
@@ -300,6 +301,26 @@ module.exports = function bulkValidatorRouter(deps) {
       cleanedBuf,
       fixBuf,
     };
+  }
+
+  async function checkDomainExistence(domain) {
+    const d = String(domain || "").toLowerCase().trim();
+    if (!d || d === "n/a") return { state: "invalid", reason: "missing_domain" };
+
+    try {
+      const mx = await dns.resolveMx(d);
+      if (Array.isArray(mx) && mx.length > 0) return { state: "exists" };
+      return { state: "invalid", reason: "no_mx" };
+    } catch (err) {
+      const code = String(err?.code || "").toUpperCase();
+      if (["ENOTFOUND", "NXDOMAIN", "ENODATA", "NOTFOUND"].includes(code)) {
+        return { state: "invalid", reason: "dns_not_found", code };
+      }
+      if (["ETIMEOUT", "ESERVFAIL", "SERVFAIL", "EAI_AGAIN", "REFUSED", "FORMERR"].includes(code)) {
+        return { state: "unknown", reason: "dns_transient", code };
+      }
+      return { state: "unknown", reason: "dns_unknown_error", code };
+    }
   }
 
   // ───────────────────────────────────────────────────────────
@@ -1264,6 +1285,69 @@ module.exports = function bulkValidatorRouter(deps) {
         let smtpStableCat = null;
 
         const domain = extractDomain(E);
+
+        // ─────────────────────────────────────────────────────────
+        // Domain existence check (must run before any other rule)
+        // exists -> proceed | invalid -> stop invalid | unknown -> proceed
+        // ─────────────────────────────────────────────────────────
+        const domainCheck = await checkDomainExistence(domain);
+        if (domainCheck.state === "invalid") {
+          const invalidFinal = {
+            email: E,
+            status: "Invalid",
+            subStatus: domainCheck.reason === "no_mx" ? "invalid_domain_no_mx" : "invalid_domain_dns_error",
+            confidence: 0.99,
+            category: "invalid",
+            reason: "Invalid Domain",
+            message: domainCheck.reason === "no_mx"
+              ? `Domain ${domain} has no MX records and cannot receive emails`
+              : `Domain ${domain} does not exist or DNS lookup failed`,
+            domain,
+            domainProvider: "N/A",
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            score: 0,
+            timestamp: new Date(),
+            section: "bulk",
+          };
+          await replaceLatest(EmailLog, E, { email: E, ...invalidFinal });
+          await replaceLatest(UserEmailLog, E, { email: E, ...invalidFinal });
+          const invalidCat = getOutcomeCategory(invalidFinal);
+          await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, invalidCat);
+          try {
+            sendStatusToFrontend(E, invalidFinal.status, invalidFinal.timestamp, {
+              domain: invalidFinal.domain,
+              provider: invalidFinal.domainProvider,
+              isDisposable: false,
+              isFree: false,
+              isRoleBased: false,
+              score: invalidFinal.score,
+              subStatus: invalidFinal.subStatus,
+              confidence: invalidFinal.confidence,
+              category: invalidFinal.category,
+              message: invalidFinal.message,
+              reason: invalidFinal.reason,
+            }, sessionId, true, username);
+          } catch {}
+          return {
+            Email: E,
+            Status: "Invalid",
+            Timestamp: new Date(invalidFinal.timestamp).toLocaleString(),
+            Domain: domain,
+            Provider: "N/A",
+            Disposable: "No",
+            Free: "No",
+            RoleBased: "No",
+            Score: 0,
+            SubStatus: invalidFinal.subStatus,
+            Confidence: invalidFinal.confidence,
+            Category: "invalid",
+            Message: invalidFinal.message,
+            Reason: invalidFinal.reason,
+            Source: "Live",
+          };
+        }
 
         // ─────────────────────────────────────────────────────────
         // 🇹🇼 .tw domain direct Risky: skip all validation entirely.

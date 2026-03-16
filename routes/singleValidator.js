@@ -26,15 +26,18 @@ const {
 // Catch-all domain probe (used before Proofpoint/Mimecast SendGrid path)
 const { checkDomainCatchAll } = require("../utils/smtpValidator");
 const SendGridLog = require("../models/SendGridLog");
+const dns = require("dns").promises;
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
 const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain } = require("../utils/domainClassifier");
 
-// ── SendGrid result cache TTL: 3 days ─────────────────────────────────────────
-// Email addresses validated via SendGrid are stored for 3 days so that
+// ── SendGrid result cache TTL: 7 days ─────────────────────────────────────────
+// Email addresses validated via SendGrid are stored for 7 days so that
 // re-validation within that window returns the cached result instead of
 // re-sending through SendGrid.
-const SENDGRID_CACHE_TTL_MS = 3 * 24 * 60 * 60 * 1000; // 259 200 000 ms
+const SENDGRID_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 604 800 000 ms
+const DOMAIN_REP_MIN_SAMPLES = +(process.env.DOMAIN_REP_MIN_SAMPLES || 20);
+const DOMAIN_REP_BOUNCE_THRESHOLD = +(process.env.DOMAIN_REP_BOUNCE_THRESHOLD || 0.60);
 
 module.exports = function singleValidatorRouter(deps) {
   const {
@@ -118,6 +121,44 @@ module.exports = function singleValidatorRouter(deps) {
     if (!SinglePending) return;
     if (!username || !email) return;
     await SinglePending.updateOne({ username, email }, { $set: { status: "done" } });
+  }
+
+  async function checkDomainExistence(domain) {
+    const d = String(domain || "").toLowerCase().trim();
+    if (!d || d === "n/a") return { state: "invalid", reason: "missing_domain" };
+
+    try {
+      const mx = await dns.resolveMx(d);
+      if (Array.isArray(mx) && mx.length > 0) return { state: "exists" };
+      return { state: "invalid", reason: "no_mx" };
+    } catch (err) {
+      const code = String(err?.code || "").toUpperCase();
+      if (["ENOTFOUND", "NXDOMAIN", "ENODATA", "NOTFOUND"].includes(code)) {
+        return { state: "invalid", reason: "dns_not_found", code };
+      }
+      if (["ETIMEOUT", "ESERVFAIL", "SERVFAIL", "EAI_AGAIN", "REFUSED", "FORMERR"].includes(code)) {
+        return { state: "unknown", reason: "dns_transient", code };
+      }
+      return { state: "unknown", reason: "dns_unknown_error", code };
+    }
+  }
+
+  async function checkHighBounceDomain(domain) {
+    const d = String(domain || "").toLowerCase().trim();
+    if (!d || d === "n/a") return { block: false };
+
+    const rep = await DomainReputation.findOne({ domain: d }).lean();
+    if (!rep) return { block: false };
+
+    const sent = Number(rep.sent || 0);
+    const invalid = Number(rep.invalid || 0);
+    if (sent < DOMAIN_REP_MIN_SAMPLES) return { block: false };
+
+    const bounceRate = sent > 0 ? invalid / sent : 0;
+    if (bounceRate >= DOMAIN_REP_BOUNCE_THRESHOLD) {
+      return { block: true, sent, invalid, bounceRate };
+    }
+    return { block: false, sent, invalid, bounceRate };
   }
 
   // ────────────────────────────────────────────────────────────
@@ -1280,6 +1321,84 @@ module.exports = function singleValidatorRouter(deps) {
       }
 
       // ─────────────────────────────────────────────────────────
+      // Domain existence check (must run before any other rule)
+      // exists -> proceed | invalid -> stop invalid | unknown -> proceed
+      // ─────────────────────────────────────────────────────────
+      const domain = extractDomain(E);
+      const domainCheck = await checkDomainExistence(domain);
+      if (domainCheck.state === "invalid") {
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        const invalidPayload = {
+          email: E,
+          status: "Invalid",
+          subStatus: domainCheck.reason === "no_mx" ? "invalid_domain_no_mx" : "invalid_domain_dns_error",
+          confidence: 0.99,
+          category: "invalid",
+          reason: "Invalid Domain",
+          message: domainCheck.reason === "no_mx"
+            ? `Domain ${domain} has no MX records and cannot receive emails`
+            : `Domain ${domain} does not exist or DNS lookup failed`,
+          domain,
+          domainProvider: "N/A",
+          isDisposable: false,
+          isFree: false,
+          isRoleBased: false,
+          score: 0,
+          timestamp: new Date(),
+          section: "single",
+        };
+        await replaceLatest(EmailLog, E, invalidPayload);
+        await replaceLatest(UserEmailLog2, E, invalidPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: invalidPayload });
+        const credits = await debitOneCreditIfNeeded(username, invalidPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, invalidPayload.status, invalidPayload.timestamp, {
+          domain: invalidPayload.domain, provider: invalidPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: invalidPayload.score,
+          subStatus: invalidPayload.subStatus, confidence: invalidPayload.confidence,
+          category: invalidPayload.category, message: invalidPayload.message, reason: invalidPayload.reason,
+        }, sessionId, true, username, "single");
+        return res.json({ ...invalidPayload, via: "domain-existence", cached: false, credits });
+      }
+
+
+      // ─────────────────────────────────────────────────────────
+      // Domain reputation high-bounce gate (highest priority pre-send rule)
+      // ─────────────────────────────────────────────────────────
+      const repDomain = extractDomain(E);
+      const repCheck = await checkHighBounceDomain(repDomain);
+      if (repCheck.block) {
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        const riskyPayload = {
+          email: E,
+          status: "Risky",
+          subStatus: "high_bounce_domain_reputation",
+          confidence: 0.92,
+          category: "risky",
+          reason: "High Bounce Domain Reputation",
+          message: `Domain ${repDomain} has high historical bounce rate (${(repCheck.bounceRate * 100).toFixed(1)}% across ${repCheck.sent} sends). Marked risky before sending.`,
+          domain: repDomain,
+          domainProvider: "Domain Reputation",
+          isDisposable: false,
+          isFree: false,
+          isRoleBased: false,
+          score: 20,
+          timestamp: new Date(),
+          section: "single",
+        };
+        await replaceLatest(EmailLog, E, riskyPayload);
+        await replaceLatest(UserEmailLog2, E, riskyPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: riskyPayload });
+        const credits = await debitOneCreditIfNeeded(username, riskyPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, riskyPayload.status, riskyPayload.timestamp, {
+          domain: riskyPayload.domain, provider: riskyPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: riskyPayload.score,
+          subStatus: riskyPayload.subStatus, confidence: riskyPayload.confidence,
+          category: riskyPayload.category, message: riskyPayload.message, reason: riskyPayload.reason,
+        }, sessionId, true, username, "single");
+        return res.json({ ...riskyPayload, via: "domain-reputation-gate", cached: false, credits });
+      }
+
+      // ─────────────────────────────────────────────────────────
       // 🇹🇼 .tw domain direct Risky: skip all validation entirely.
       //    SMTP cannot probe .tw domains reliably — return Risky immediately.
       // ─────────────────────────────────────────────────────────
@@ -1531,12 +1650,91 @@ module.exports = function singleValidatorRouter(deps) {
       const E = normEmail(email);
       const logger = mkLogger(sessionId, E, username);
 
+      // ─────────────────────────────────────────────────────────
+      // Domain existence check (must run before any other rule)
+      // exists -> proceed | invalid -> stop invalid | unknown -> proceed
+      // ─────────────────────────────────────────────────────────
+      const verifyDomain = extractDomain(E);
+      const verifyDomainCheck = await checkDomainExistence(verifyDomain);
+      if (verifyDomainCheck.state === "invalid") {
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        const invalidPayload = {
+          email: E,
+          status: "Invalid",
+          subStatus: verifyDomainCheck.reason === "no_mx" ? "invalid_domain_no_mx" : "invalid_domain_dns_error",
+          confidence: 0.99,
+          category: "invalid",
+          reason: "Invalid Domain",
+          message: verifyDomainCheck.reason === "no_mx"
+            ? `Domain ${verifyDomain} has no MX records and cannot receive emails`
+            : `Domain ${verifyDomain} does not exist or DNS lookup failed`,
+          domain: verifyDomain,
+          domainProvider: "N/A",
+          isDisposable: false,
+          isFree: false,
+          isRoleBased: false,
+          score: 0,
+          timestamp: new Date(),
+          section: "single",
+        };
+        await replaceLatest(EmailLog, E, invalidPayload);
+        await replaceLatest(UserEmailLog2, E, invalidPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: invalidPayload });
+        const credits = await debitOneCreditIfNeeded(username, invalidPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, invalidPayload.status, invalidPayload.timestamp, {
+          domain: invalidPayload.domain, provider: invalidPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: invalidPayload.score,
+          subStatus: invalidPayload.subStatus, confidence: invalidPayload.confidence,
+          category: invalidPayload.category, message: invalidPayload.message, reason: invalidPayload.reason,
+        }, sessionId, true, username, "single");
+        await markPendingDone(username, E);
+        return res.json({ ...invalidPayload, via: "domain-existence", cached: false, inProgress: false, credits });
+      }
+
       // credits check (idempotency aware)
       const user = await User.findOne({ username });
       if (!user) return res.status(404).json({ error: "User not found" });
       if (user.credits <= 0) {
         const alreadyPaid = idemKey && idempoGet(username, E, idemKey);
         if (!alreadyPaid) return res.status(400).json({ error: "You don't have credits" });
+      }
+
+      // ─────────────────────────────────────────────────────────
+      // Domain reputation high-bounce gate (highest priority pre-send rule)
+      // ─────────────────────────────────────────────────────────
+      const repDomain = extractDomain(E);
+      const repCheck = await checkHighBounceDomain(repDomain);
+      if (repCheck.block) {
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        const riskyPayload = {
+          email: E,
+          status: "Risky",
+          subStatus: "high_bounce_domain_reputation",
+          confidence: 0.92,
+          category: "risky",
+          reason: "High Bounce Domain Reputation",
+          message: `Domain ${repDomain} has high historical bounce rate (${(repCheck.bounceRate * 100).toFixed(1)}% across ${repCheck.sent} sends). Marked risky before sending.`,
+          domain: repDomain,
+          domainProvider: "Domain Reputation",
+          isDisposable: false,
+          isFree: false,
+          isRoleBased: false,
+          score: 20,
+          timestamp: new Date(),
+          section: "single",
+        };
+        await replaceLatest(EmailLog, E, riskyPayload);
+        await replaceLatest(UserEmailLog2, E, riskyPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: riskyPayload });
+        const credits = await debitOneCreditIfNeeded(username, riskyPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, riskyPayload.status, riskyPayload.timestamp, {
+          domain: riskyPayload.domain, provider: riskyPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: riskyPayload.score,
+          subStatus: riskyPayload.subStatus, confidence: riskyPayload.confidence,
+          category: riskyPayload.category, message: riskyPayload.message, reason: riskyPayload.reason,
+        }, sessionId, true, username, "single");
+        await markPendingDone(username, E);
+        return res.json({ ...riskyPayload, via: "domain-reputation-gate", cached: false, inProgress: false, credits });
       }
 
       // ─────────────────────────────────────────────────────────

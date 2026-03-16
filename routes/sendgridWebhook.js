@@ -21,6 +21,59 @@ module.exports = function sendgridWebhookRouter(deps) {
   } = deps;
 
   const SendGridLog = require('../models/SendGridLog');
+  const DomainReputation = deps.DomainReputation || require('../models/DomainReputation');
+
+  function extractDomainFromEmail(email) {
+    const e = String(email || '').toLowerCase();
+    if (!e.includes('@')) return '';
+    return e.split('@')[1].trim();
+  }
+
+  function isBounceLikeSubStatus(subStatus) {
+    const s = String(subStatus || '').toLowerCase();
+    return (
+      s === 'sendgrid_hard_bounce' ||
+      s === 'sendgrid_soft_bounce' ||
+      s === 'sendgrid_blocked' ||
+      s === 'sendgrid_dropped' ||
+      s === 'sendgrid_policy_block'
+    );
+  }
+
+  async function updateDomainReputationFromSendGrid({ domain, finalSubStatus, messageId }) {
+    try {
+      const d = String(domain || '').toLowerCase().trim();
+      if (!d) return;
+
+      // De-dup at messageId level to avoid double counting from repeated webhook events
+      if (messageId) {
+        const existing = await SendGridLog.findOne({
+          messageId,
+          domainReputationCounted: true,
+        }).select('_id').lean();
+
+        if (existing) return;
+      }
+
+      const inc = { sent: 1 };
+      if (isBounceLikeSubStatus(finalSubStatus)) inc.invalid = 1;
+
+      await DomainReputation.updateOne(
+        { domain: d },
+        { $setOnInsert: { domain: d }, $inc: inc },
+        { upsert: true }
+      );
+
+      if (messageId) {
+        await SendGridLog.updateOne(
+          { messageId },
+          { $set: { domainReputationCounted: true, domainReputationCountedAt: new Date() } }
+        );
+      }
+    } catch (e) {
+      console.warn('DomainReputation update failed:', e.message);
+    }
+  }
 
   // Webhook secret for verification (optional but recommended)
   const WEBHOOK_SECRET = process.env.SENDGRID_WEBHOOK_SECRET || '';
@@ -313,6 +366,13 @@ module.exports = function sendgridWebhookRouter(deps) {
                 }
               }
             );
+
+            // Build domain reputation from SendGrid final outcomes
+            await updateDomainReputationFromSendGrid({
+              domain: finalPayload.domain || extractDomainFromEmail(E),
+              finalSubStatus: finalSubStatus,
+              messageId,
+            });
 
             // ✅ Send WebSocket notification to frontend (CRITICAL for UI update!)
             if (sendGridLog.sessionId && sendGridLog.username) {
@@ -648,6 +708,14 @@ module.exports = function sendgridWebhookRouter(deps) {
       } catch (e) {
         console.warn('SendGridLog update failed:', e.message);
       }
+    }
+
+    if (isFinalEvent) {
+      await updateDomainReputationFromSendGrid({
+        domain: finalPayload.domain || extractDomainFromEmail(E),
+        finalSubStatus: finalSubStatus,
+        messageId,
+      });
     }
 
     // ── Only delete SendGridPending on FINAL events ────────────────────────
