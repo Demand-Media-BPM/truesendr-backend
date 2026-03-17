@@ -31,13 +31,14 @@ const dns = require("dns").promises;
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
 const { classifyDomain, getDomainCategory, hasBankWordInDomain, isOrgEduGovDomain, isTwDomain } = require("../utils/domainClassifier");
 
-// ── SendGrid result cache TTL: 7 days ─────────────────────────────────────────
-// Email addresses validated via SendGrid are stored for 7 days so that
+// ── SendGrid result cache TTL: 15 days ────────────────────────────────────────
+// Email addresses validated via SendGrid are stored for 15 days so that
 // re-validation within that window returns the cached result instead of
 // re-sending through SendGrid.
-const SENDGRID_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 604 800 000 ms
+const SENDGRID_CACHE_TTL_MS = 15 * 24 * 60 * 60 * 1000; // 1 296 000 000 ms
 const DOMAIN_REP_MIN_SAMPLES = +(process.env.DOMAIN_REP_MIN_SAMPLES || 20);
 const DOMAIN_REP_BOUNCE_THRESHOLD = +(process.env.DOMAIN_REP_BOUNCE_THRESHOLD || 0.60);
+const SENDGRID_VALID_SETTLE_MS = +(process.env.SENDGRID_VALID_SETTLE_MS || 5000);
 
 module.exports = function singleValidatorRouter(deps) {
   const {
@@ -329,7 +330,7 @@ module.exports = function singleValidatorRouter(deps) {
     await replaceLatest(UserEmailLogModel, E, payload);
 
     // memory cache — never cache unknown results; they must be re-validated every time
-    // SendGrid-validated results are cached for 3 days; all others use the default TTL.
+    // SendGrid-validated results are cached for 15 days; all others use the default TTL.
     if (shouldCache && stableCache && payload.category !== 'unknown') {
       const isSgVia = via && String(via).startsWith('sendgrid');
       const cacheTTL = isSgVia ? SENDGRID_CACHE_TTL_MS : (CACHE_TTL_MS || 0);
@@ -834,7 +835,7 @@ module.exports = function singleValidatorRouter(deps) {
             // Credits already debited by webhook handler — just get current count
             const userAfterWebhook = await User.findOne({ username });
 
-            // Cache the SendGrid webhook result for 3 days
+            // Cache the SendGrid webhook result for 15 days
             if (stableCache && webhookResult.category !== 'unknown') {
               stableCache.set(E, { until: Date.now() + SENDGRID_CACHE_TTL_MS, result: webhookResult });
             }
@@ -877,7 +878,7 @@ module.exports = function singleValidatorRouter(deps) {
         const finalCredits = await debitOneCreditIfNeeded(username, intermediateResult.status, E, idemKey, 'single');
 
         if (stableCache && intermediateResult.category !== 'unknown') {
-          // SendGrid intermediate result — cache for 3 days
+          // SendGrid intermediate result — cache for 15 days
           stableCache.set(E, { until: Date.now() + SENDGRID_CACHE_TTL_MS, result: intermediateResult });
         }
 
@@ -941,7 +942,7 @@ module.exports = function singleValidatorRouter(deps) {
       await replaceLatest(UserEmailLog2, E, riskyFallbackPayload);
 
       if (stableCache) {
-        // SendGrid fallback result — cache for 3 days
+        // SendGrid fallback result — cache for 15 days
         stableCache.set(E, { until: Date.now() + SENDGRID_CACHE_TTL_MS, result: riskyFallbackPayload });
       }
 
@@ -1026,14 +1027,35 @@ module.exports = function singleValidatorRouter(deps) {
   async function maybeSendgridFallbackOnUnknown({ E, username, sessionId, smtpRaw, idemKey }) {
     if (!smtpRaw) return null;
 
-    const cat = smtpRaw.category || categoryFromStatus(smtpRaw.status || "");
-    if (String(cat).toLowerCase() !== "unknown") return null;
+    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const domain = extractDomain(E);
+    const providerText = String(
+      smtpRaw.provider ||
+      smtpRaw.domainProvider ||
+      (await detectProviderByMX(domain).catch(() => "")) ||
+      ""
+    ).toLowerCase();
+
+    const isGoogleOrOutlookProvider =
+      /google|gmail|outlook|microsoft/.test(providerText);
+
+    // New rule (provider-based):
+    // If provider is Google/Outlook family, invoke SendGrid only when SMTP is risky
+    // and domain reputation is not in bad/high-risk state.
+    if (isGoogleOrOutlookProvider) {
+      const cat = String(smtpRaw.category || categoryFromStatus(smtpRaw.status || "")).toLowerCase();
+      if (cat !== "risky") return null;
+
+      const repCheck = await checkHighBounceDomain(domain);
+      if (repCheck?.block) return null;
+    } else {
+      const cat = smtpRaw.category || categoryFromStatus(smtpRaw.status || "");
+      if (String(cat).toLowerCase() !== "unknown") return null;
+    }
 
     const logger = mkLogger(sessionId, E, username);
 
     logger("sendgrid_fallback", "SMTP returned unknown → SendGrid fallback", "info");
-
-    const domain = extractDomain(E);
 
     // ── Determine the real provider from SMTP result (MX-based) or MX lookup ──
     // smtpRaw.provider is already set by validateSMTP via resolveMxCached → mxToProvider.
@@ -1120,21 +1142,37 @@ module.exports = function singleValidatorRouter(deps) {
             if (webhookResult && webhookResult.category && webhookResult.category !== 'unknown') {
               logger('sendgrid_fallback_poll', `Webhook result received in ${Date.now() - pollStart}ms: ${webhookResult.status} (${webhookResult.category})`, 'info');
 
-              // Return the webhook result as sgTrueSendrResult
+              let settledResult = webhookResult;
+              const settledCategory = String(webhookResult.category || "").toLowerCase();
+              if (
+                isGoogleOrOutlookProvider &&
+                settledCategory === "valid" &&
+                SENDGRID_VALID_SETTLE_MS > 0
+              ) {
+                logger("sendgrid_settle_wait", `Valid result detected for Google/Outlook provider. Waiting ${SENDGRID_VALID_SETTLE_MS}ms for possible bounce update.`, "info");
+                await delay(SENDGRID_VALID_SETTLE_MS);
+                const afterSettle = await EmailLog.findOne({ email: E }).lean();
+                if (afterSettle && afterSettle.category && afterSettle.category !== "unknown") {
+                  settledResult = afterSettle;
+                  logger("sendgrid_settle_wait", `Post-settle status: ${afterSettle.status} (${afterSettle.category})`, "info");
+                }
+              }
+
+              // Return settled webhook result as sgTrueSendrResult
               // Credits already debited by webhook handler — idemKey ensures no double-debit
               const sgTrueSendrResult = {
-                status: webhookResult.status,
-                sub_status: webhookResult.subStatus || null,
-                category: webhookResult.category,
-                confidence: webhookResult.confidence || null,
-                domain: webhookResult.domain || domain,
-                provider: webhookResult.domainProvider || realProvider,
-                domainProvider: webhookResult.domainProvider || realProvider,
-                isDisposable: !!webhookResult.isDisposable,
-                isFree: !!webhookResult.isFree,
-                isRoleBased: !!webhookResult.isRoleBased,
-                score: webhookResult.score || 50,
-                timestamp: webhookResult.timestamp || new Date(),
+                status: settledResult.status,
+                sub_status: settledResult.subStatus || null,
+                category: settledResult.category,
+                confidence: settledResult.confidence || null,
+                domain: settledResult.domain || domain,
+                provider: settledResult.domainProvider || realProvider,
+                domainProvider: settledResult.domainProvider || realProvider,
+                isDisposable: !!settledResult.isDisposable,
+                isFree: !!settledResult.isFree,
+                isRoleBased: !!settledResult.isRoleBased,
+                score: settledResult.score || 50,
+                timestamp: settledResult.timestamp || new Date(),
               };
 
               return { sgTrueSendrResult, via: "sendgrid-fallback" };

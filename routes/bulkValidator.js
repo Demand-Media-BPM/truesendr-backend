@@ -34,6 +34,8 @@ const {
   // isHighRiskDomain, // (optional) not required, Yash also doesn't actually use it in worker
 } = require("../utils/domainClassifier");
 
+const SENDGRID_VALID_SETTLE_MS = +(process.env.SENDGRID_VALID_SETTLE_MS || 5000);
+
 module.exports = function bulkValidatorRouter(deps) {
   const {
     mongoose,
@@ -911,6 +913,37 @@ module.exports = function bulkValidatorRouter(deps) {
 
     // Check if we timed out
     const finalStat = await UserBulkStat.findOne({ bulkId }).lean();
+
+    // Extra settle window:
+    // if any records are currently valid for Google/Outlook provider family,
+    // wait 5s and let potential bounce updates land before final regeneration.
+    try {
+      if (SENDGRID_VALID_SETTLE_MS > 0) {
+        const emails = Array.isArray(finalStat?.sendgridEmails) ? finalStat.sendgridEmails : [];
+        if (emails.length > 0) {
+          const candidates = await EmailLog.find({
+            email: { $in: emails },
+            category: { $in: ["valid", "Valid"] },
+          })
+            .select("email domainProvider provider")
+            .lean();
+
+          const hasGoogleOutlookValid = candidates.some((r) => {
+            const p = String(r?.domainProvider || r?.provider || "").toLowerCase();
+            return /google|gmail|outlook|microsoft/.test(p);
+          });
+
+          if (hasGoogleOutlookValid) {
+            console.log(
+              `⏳ [BULK][${bulkId}] settle_wait: waiting ${SENDGRID_VALID_SETTLE_MS}ms for possible valid→bounce updates`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, SENDGRID_VALID_SETTLE_MS));
+          }
+        }
+      }
+    } catch (e) {
+      console.warn(`⚠️  [BULK][${bulkId}] settle_wait check failed: ${e.message}`);
+    }
     const finalPending = finalStat?.sendgridPendingCount || 0;
 
     if (finalPending > 0) {
@@ -1937,8 +1970,35 @@ module.exports = function bulkValidatorRouter(deps) {
             smtpPrimaryCat =
               prelimRaw.category || categoryFromStatus(prelimRaw.status);
 
-            // Yash uses strict check: prelimRaw.category === "unknown"
-            if (prelimRaw.category === "unknown") {
+            // Provider-based rule alignment with single validator:
+            // For Google/Outlook-family providers, SendGrid fallback should trigger
+            // when SMTP is risky (and domain is not high-bounce blocked).
+            // For other providers, keep existing unknown-only fallback behavior.
+            const prelimProviderText = String(
+              prelimRaw.provider ||
+              prelimRaw.domainProvider ||
+              (await detectProviderByMX(domain).catch(() => "")) ||
+              "",
+            ).toLowerCase();
+            const isGoogleOrOutlookProviderPrelim =
+              /google|gmail|outlook|microsoft/.test(prelimProviderText);
+
+            let shouldRunSendGridFallbackPrelim = false;
+            if (isGoogleOrOutlookProviderPrelim) {
+              if (String(prelimRaw.category || "").toLowerCase() === "risky") {
+                const rep = await DomainReputation.findOne({ domain }).lean();
+                const sent = Number(rep?.sent || 0);
+                const invalid = Number(rep?.invalid || 0);
+                const bounceRate = sent > 0 ? invalid / sent : 0;
+                const isHighBounceBlocked = sent >= 5 && bounceRate >= 0.6;
+                shouldRunSendGridFallbackPrelim = !isHighBounceBlocked;
+              }
+            } else {
+              shouldRunSendGridFallbackPrelim =
+                String(prelimRaw.category || "").toLowerCase() === "unknown";
+            }
+
+            if (shouldRunSendGridFallbackPrelim) {
               console.log(
                 `\n⚠️  [BULK][${E}] SMTP returned UNKNOWN → Attempting SendGrid fallback...`,
               );
@@ -2141,8 +2201,35 @@ module.exports = function bulkValidatorRouter(deps) {
                   smtpStableCat =
                     stableRaw.category || categoryFromStatus(stableRaw.status);
 
-                  // Yash strict: stableRaw.category === "unknown"
-                  if (stableRaw.category === "unknown") {
+                  // Provider-based rule alignment with single validator:
+                  // For Google/Outlook-family providers, SendGrid fallback should trigger
+                  // when SMTP stable is risky (and domain is not high-bounce blocked).
+                  // For other providers, keep existing unknown-only fallback behavior.
+                  const stableProviderText = String(
+                    stableRaw.provider ||
+                    stableRaw.domainProvider ||
+                    (await detectProviderByMX(domain).catch(() => "")) ||
+                    "",
+                  ).toLowerCase();
+                  const isGoogleOrOutlookProviderStable =
+                    /google|gmail|outlook|microsoft/.test(stableProviderText);
+
+                  let shouldRunSendGridFallbackStable = false;
+                  if (isGoogleOrOutlookProviderStable) {
+                    if (String(stableRaw.category || "").toLowerCase() === "risky") {
+                      const rep = await DomainReputation.findOne({ domain }).lean();
+                      const sent = Number(rep?.sent || 0);
+                      const invalid = Number(rep?.invalid || 0);
+                      const bounceRate = sent > 0 ? invalid / sent : 0;
+                      const isHighBounceBlocked = sent >= 5 && bounceRate >= 0.6;
+                      shouldRunSendGridFallbackStable = !isHighBounceBlocked;
+                    }
+                  } else {
+                    shouldRunSendGridFallbackStable =
+                      String(stableRaw.category || "").toLowerCase() === "unknown";
+                  }
+
+                  if (shouldRunSendGridFallbackStable) {
                     console.log(
                       `\n⚠️  [BULK][${E}] SMTP Stable returned UNKNOWN → Attempting SendGrid fallback...`,
                     );
@@ -2510,6 +2597,7 @@ module.exports = function bulkValidatorRouter(deps) {
         // ✅ STEP 1: Track SendGrid emails that need webhook confirmation
         // ============================================================
         const sendgridMessageIds = [];
+        const sendGridEmails = [];
         const sendGridLogs = await SendGridLog.find({
           bulkId,
           messageId: { $exists: true, $ne: null },
@@ -2520,6 +2608,7 @@ module.exports = function bulkValidatorRouter(deps) {
         sendGridLogs.forEach((log) => {
           if (log.messageId) {
             sendgridMessageIds.push(log.messageId);
+            if (log.email) sendGridEmails.push(String(log.email).toLowerCase());
           }
         });
 
@@ -2543,6 +2632,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 sendgridEmailCount: sendgridMessageIds.length,
                 sendgridPendingCount: sendgridMessageIds.length,
                 sendgridMessageIds: sendgridMessageIds,
+                sendgridEmails: sendGridEmails,
                 webhookTimeoutAt: new Date(Date.now() + 20000), // 20 second timeout
               },
             },
