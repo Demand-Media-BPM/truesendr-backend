@@ -809,7 +809,7 @@ module.exports = function bulkValidatorRouter(deps) {
   }
 
   // ───────────────────────────────────────────────────────────
-  // helper: bump live counters + WS
+  // helper: bump live counters + WS (can be immediate or batched by context)
   // ───────────────────────────────────────────────────────────
   async function bumpLiveCounts(
     UserBulkStat,
@@ -817,12 +817,74 @@ module.exports = function bulkValidatorRouter(deps) {
     username,
     sessionId,
     cat,
+    context = null,
   ) {
+    const key =
+      cat === "valid"
+        ? "valid"
+        : cat === "invalid"
+          ? "invalid"
+          : cat === "risky"
+            ? "risky"
+            : "unknown";
+
+    // batched mode (used in high-throughput worker path)
+    if (context && typeof context === "object") {
+      context.pending = context.pending || {
+        valid: 0,
+        invalid: 0,
+        risky: 0,
+        unknown: 0,
+      };
+      context.running = context.running || {
+        valid: 0,
+        invalid: 0,
+        risky: 0,
+        unknown: 0,
+      };
+      context.pending[key] = (context.pending[key] || 0) + 1;
+      context.running[key] = (context.running[key] || 0) + 1;
+      context.opsSinceFlush = (context.opsSinceFlush || 0) + 1;
+
+      const now = Date.now();
+      const intervalMs = context.intervalMs || 900;
+      const flushEvery = context.flushEvery || 25;
+      const shouldFlush =
+        context.opsSinceFlush >= flushEvery ||
+        now - (context.lastFlushAt || 0) >= intervalMs;
+
+      if (shouldFlush) {
+        const inc = { ...context.pending };
+        const hasInc = Object.values(inc).some((v) => v > 0);
+        if (hasInc) {
+          await UserBulkStat.updateOne({ bulkId }, { $inc: inc });
+          context.pending = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
+          context.lastFlushAt = now;
+          context.opsSinceFlush = 0;
+
+          if (sessionId) {
+            sendBulkStatsToFrontend(sessionId, username, {
+              bulkId,
+              phase: "running",
+              counts: {
+                valid: context.running.valid || 0,
+                invalid: context.running.invalid || 0,
+                risky: context.running.risky || 0,
+                unknown: context.running.unknown || 0,
+              },
+            });
+          }
+        } else {
+          context.lastFlushAt = now;
+          context.opsSinceFlush = 0;
+        }
+      }
+      return;
+    }
+
+    // immediate mode (fallback)
     const inc = {};
-    if (cat === "valid") inc.valid = 1;
-    else if (cat === "invalid") inc.invalid = 1;
-    else if (cat === "risky") inc.risky = 1;
-    else inc.unknown = 1;
+    inc[key] = 1;
 
     const doc = await UserBulkStat.findOneAndUpdate(
       { bulkId },
@@ -839,6 +901,37 @@ module.exports = function bulkValidatorRouter(deps) {
           invalid: doc.invalid,
           risky: doc.risky,
           unknown: doc.unknown,
+        },
+      });
+    }
+  }
+
+  async function flushBatchedLiveCounts(
+    UserBulkStat,
+    bulkId,
+    username,
+    sessionId,
+    context,
+  ) {
+    if (!context || !context.pending) return;
+    const inc = { ...context.pending };
+    const hasInc = Object.values(inc).some((v) => v > 0);
+    if (!hasInc) return;
+
+    await UserBulkStat.updateOne({ bulkId }, { $inc: inc });
+    context.pending = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
+    context.lastFlushAt = Date.now();
+    context.opsSinceFlush = 0;
+
+    if (sessionId) {
+      sendBulkStatsToFrontend(sessionId, username, {
+        bulkId,
+        phase: "running",
+        counts: {
+          valid: context.running?.valid || 0,
+          invalid: context.running?.invalid || 0,
+          risky: context.running?.risky || 0,
+          unknown: context.running?.unknown || 0,
         },
       });
     }
@@ -1239,11 +1332,93 @@ module.exports = function bulkValidatorRouter(deps) {
       } catch {}
 
       const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      // perf caches scoped to a single bulk run (no logic changes)
+      const domainExistenceCache = new Map();
+      const providerCache = new Map();
+      const proofpointCache = new Map();
+      const mimecastCache = new Map();
+      const domainReputationCache = new Map();
+      const historyCache = new Map();
+
+      const getDomainExistenceCached = async (domain) => {
+        const k = String(domain || "").toLowerCase();
+        if (domainExistenceCache.has(k)) return domainExistenceCache.get(k);
+        const v = await checkDomainExistence(domain);
+        domainExistenceCache.set(k, v);
+        return v;
+      };
+
+      const getProviderCached = async (domain) => {
+        const k = String(domain || "").toLowerCase();
+        if (providerCache.has(k)) return providerCache.get(k);
+        let v = "";
+        try {
+          v = String((await detectProviderByMX(domain)) || "");
+        } catch (_) {
+          v = "";
+        }
+        providerCache.set(k, v);
+        return v;
+      };
+
+      const isProofpointCached = async (domain) => {
+        const k = String(domain || "").toLowerCase();
+        if (proofpointCache.has(k)) return proofpointCache.get(k);
+        let v = false;
+        try {
+          v = await isProofpointDomain(domain);
+        } catch (_) {
+          v = false;
+        }
+        proofpointCache.set(k, !!v);
+        return !!v;
+      };
+
+      const isMimecastCached = async (domain) => {
+        const k = String(domain || "").toLowerCase();
+        if (mimecastCache.has(k)) return mimecastCache.get(k);
+        let v = false;
+        try {
+          v = await isMimecastDomain(domain);
+        } catch (_) {
+          v = false;
+        }
+        mimecastCache.set(k, !!v);
+        return !!v;
+      };
+
+      const getDomainReputationCached = async (domain) => {
+        const k = String(domain || "").toLowerCase();
+        if (domainReputationCache.has(k)) return domainReputationCache.get(k);
+        const v = await DomainReputation.findOne({ domain: k }).lean();
+        domainReputationCache.set(k, v || null);
+        return v || null;
+      };
+
+      const getHistoryCached = async (email) => {
+        const e = normEmail(email);
+        if (historyCache.has(e)) return historyCache.get(e);
+        const h = await buildHistoryForEmail(e);
+        historyCache.set(e, h || {});
+        return h || {};
+      };
+
+      // batch live counts to reduce DB write pressure
+      const liveCountContext = {
+        pending: { valid: 0, invalid: 0, risky: 0, unknown: 0 },
+        running: { valid: 0, invalid: 0, risky: 0, unknown: 0 },
+        lastFlushAt: Date.now(),
+        opsSinceFlush: 0,
+        intervalMs: 900,
+        flushEvery: 25,
+      };
+
       let _lastProgressDbWrite = 0;
       const writeProgressToDbThrottled = async (current, total0) => {
         const now = Date.now();
         const shouldWrite =
-          now - _lastProgressDbWrite > 350 || current >= total0;
+          now - _lastProgressDbWrite > 900 || current >= total0;
         if (!shouldWrite) return;
         _lastProgressDbWrite = now;
 
@@ -1323,7 +1498,7 @@ module.exports = function bulkValidatorRouter(deps) {
         // Domain existence check (must run before any other rule)
         // exists -> proceed | invalid -> stop invalid | unknown -> proceed
         // ─────────────────────────────────────────────────────────
-        const domainCheck = await checkDomainExistence(domain);
+        const domainCheck = await getDomainExistenceCached(domain);
         if (domainCheck.state === "invalid") {
           const invalidFinal = {
             email: E,
@@ -1422,7 +1597,7 @@ module.exports = function bulkValidatorRouter(deps) {
 
         let isProofpoint = false;
         try {
-          isProofpoint = await isProofpointDomain(domain);
+          isProofpoint = await isProofpointCached(domain);
         } catch (e) {
           isProofpoint = false;
           logger("proofpoint_check_error", e.message || "failed", "warn");
@@ -1430,7 +1605,7 @@ module.exports = function bulkValidatorRouter(deps) {
 
         let isMimecast = false;
         try {
-          isMimecast = await isMimecastDomain(domain);
+          isMimecast = await isMimecastCached(domain);
         } catch (e) {
           isMimecast = false;
           logger("mimecast_check_error", e.message || "failed", "warn");
@@ -1439,7 +1614,7 @@ module.exports = function bulkValidatorRouter(deps) {
         let preDetectedProvider = "";
         let isBarracuda = false;
         try {
-          preDetectedProvider = String(await detectProviderByMX(domain) || "");
+          preDetectedProvider = String(await getProviderCached(domain) || "");
           isBarracuda = /barracuda/i.test(preDetectedProvider);
         } catch (_) {
           preDetectedProvider = "";
@@ -1662,7 +1837,7 @@ module.exports = function bulkValidatorRouter(deps) {
             // Domain reputation gate (for bank/healthcare) — Yash behavior
             if (isBankOrHealthcare) {
               try {
-                const domainStats = await DomainReputation.findOne({ domain });
+                const domainStats = await getDomainReputationCached(domain);
 
                 if (domainStats && domainStats.sent >= 5) {
                   const bounceRate = domainStats.invalid / domainStats.sent;
@@ -1892,7 +2067,7 @@ module.exports = function bulkValidatorRouter(deps) {
               }
 
               console.log(`\n📚 [BULK][${E}] Building email history...`);
-              const history = await buildHistoryForEmail(E);
+              const history = await getHistoryCached(E);
               console.log(`   Domain samples: ${history.domainSamples || 0}`);
               console.log(
                 `   Training samples: ${history.trainingSamples || 0}`,
@@ -2021,7 +2196,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 // Derive real provider from SMTP result (MX-based) or MX lookup
                 const realProviderFallback = (prelimRaw.provider && prelimRaw.provider !== 'Unavailable')
                   ? prelimRaw.provider
-                  : await detectProviderByMX(domain).catch(() => 'Unknown Provider');
+                  : (await getProviderCached(domain)) || 'Unknown Provider';
 
                 const metaSg = {
                   domain,
@@ -2065,7 +2240,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 }
 
                 console.log(`\n📚 [BULK][${E}] Building email history...`);
-                const history = await buildHistoryForEmail(E);
+const history = await getHistoryCached(E);
 
                 const merged = mergeSMTPWithHistory(
                   sgTrueSendrResult,
@@ -2131,7 +2306,7 @@ module.exports = function bulkValidatorRouter(deps) {
 
             // If still not final: merge SMTP prelim with history
             if (!final) {
-              const history = await buildHistoryForEmail(E);
+const history = await getHistoryCached(E);
 
               const prelim = mergeSMTPWithHistory(prelimRaw, history, {
                 domain: prelimRaw.domain || extractDomain(E),
@@ -2254,7 +2429,7 @@ module.exports = function bulkValidatorRouter(deps) {
                       // Derive real provider from SMTP stable result (MX-based) or MX lookup
                       const realProviderStableFallback = (stableRaw.provider && stableRaw.provider !== 'Unavailable')
                         ? stableRaw.provider
-                        : await detectProviderByMX(domain).catch(() => 'Unknown Provider');
+                        : (await getProviderCached(domain)) || 'Unknown Provider';
 
                       const metaSg = {
                         domain,
@@ -2305,7 +2480,7 @@ module.exports = function bulkValidatorRouter(deps) {
                       console.log(
                         `\n📚 [BULK][${E}] Building email history...`,
                       );
-                      const history = await buildHistoryForEmail(E);
+const history = await getHistoryCached(E);
 
                       const merged = mergeSMTPWithHistory(
                         sgTrueSendrResult,
@@ -2389,7 +2564,7 @@ module.exports = function bulkValidatorRouter(deps) {
 
                   // If still not final: merge stable SMTP with history
                   if (!final) {
-                    const historyStable = await buildHistoryForEmail(E);
+                    const historyStable = await getHistoryCached(E);
 
                     const stable = mergeSMTPWithHistory(
                       stableRaw,
