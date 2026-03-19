@@ -10,12 +10,11 @@ const dns = require('dns').promises;
 // Initialize SendGrid with API key from environment
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
 const DEFAULT_SENDGRID_SENDERS = [
-  'jenny.j@truesendr.com',
   'david.g@mailjournals.com',
   'max.j@mailrant.com',
   'john.doe@mailverite.com'
 ];
-const SENDGRID_VERIFIED_SENDER = process.env.SENDGRID_VERIFIED_SENDER || 'jenny.j@truesendr.com';
+const SENDGRID_VERIFIED_SENDER = process.env.SENDGRID_VERIFIED_SENDER || 'david.g@mailjournals.com';
 const SENDGRID_VERIFIED_SENDERS = (process.env.SENDGRID_VERIFIED_SENDERS || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
