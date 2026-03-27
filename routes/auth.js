@@ -475,6 +475,10 @@ router.post("/auth/login", async (req, res) => {
         .json({ success: false, message: "Invalid credentials" });
     }
 
+    // ✅ update last login time
+    user.lastLogin = new Date();
+    await user.save();
+
     return res.json({
       success: true,
       message: "Login successful",
@@ -482,10 +486,11 @@ router.post("/auth/login", async (req, res) => {
         id: user._id,
         username: user.username, // internal use
         email: user.email, // tray email
-        firstName: user.firstName, // 👈 add
-        lastName: user.lastName, // 👈 add
+        firstName: user.firstName,
+        lastName: user.lastName,
         permissions: user.permissions || [],
         credits: user.credits ?? 0,
+        lastLogin: user.lastLogin, // optional, if you want to send it to frontend
       },
     });
   } catch (err) {

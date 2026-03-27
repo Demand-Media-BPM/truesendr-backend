@@ -30,6 +30,7 @@ const { validateSMTP, validateSMTPStable } = require("./utils/smtpValidator");
 const authRoutes = require("./routes/auth");
 const phoneValidatorRoutes = require("./routes/phoneValidator");
 const deliverabilityRoutes = require("./routes/deliverability");
+const profileRoutes = require("./routes/profile");
 
 // ─────────────────────────────────────────────────────────────────────────────
 // App / HTTP / WS
@@ -797,6 +798,7 @@ app.use("/api/toxicity", ToxicityCheckerRouter);
 app.use("/api/training", TrainingRouter);
 app.use("/api/phone", phoneValidatorRoutes);
 app.use("/api/payment", paymentRoutes);
+app.use("/api/profile", profileRoutes);
 
 
 /* ✅ NEW: deliverability route must be mounted as factory to receive deps */

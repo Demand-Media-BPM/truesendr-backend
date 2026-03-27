@@ -16,6 +16,7 @@ const userSchema = new mongoose.Schema(
     credits:   { type: Number, default: 100 },
     singleTimestamp: { type: Date, default: null },
     lastPasswordUpdate: { type: Date, default: null },
+    lastLogin: { type: Date, default: null },
   },
   { timestamps: true, collection: "users" } 
 );
