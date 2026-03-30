@@ -29,7 +29,6 @@ const {
   classifyDomain,
   getDomainCategory,
   hasBankWordInDomain,
-  isOrgEduGovDomain,
   isTwDomain,
   // isHighRiskDomain, // (optional) not required, Yash also doesn't actually use it in worker
 } = require("../utils/domainClassifier");
@@ -1628,17 +1627,22 @@ module.exports = function bulkValidatorRouter(deps) {
         const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
         const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
 
-        // ── EARLY EXIT: .edu/.org/.gov and bank/healthcare only ──────
+        // ── EARLY EXIT: .edu/.gov and bank/healthcare only ──────
+        // (.org should continue through normal SMTP/SendGrid flow)
         // IMPORTANT:
         // ccTLD domains should NOT be marked risky here anymore.
         // They should flow into SendGrid-direct decision:
         //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
-        if (isOrgEduGovDomain(domain) || isBankOrHealthcare) {
-          const subStatus = isOrgEduGovDomain(domain)
-            ? 'org_edu_gov_domain'
+        const isEduGovDomain =
+          String(domain || "").toLowerCase().endsWith(".edu") ||
+          String(domain || "").toLowerCase().endsWith(".gov");
+
+        if (isEduGovDomain || isBankOrHealthcare) {
+          const subStatus = isEduGovDomain
+            ? 'edu_gov_domain'
             : 'bank_healthcare_domain';
-          const message = isOrgEduGovDomain(domain)
-            ? 'This address belongs to an organizational, educational, or government domain (.org/.edu/.gov). Sending cold emails to these domains is risky.'
+          const message = isEduGovDomain
+            ? 'This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky.'
             : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
           console.log(`[BULK][early_risky] ${E} → domain "${domain}" is ${subStatus} → returning Risky directly`);
@@ -2676,19 +2680,25 @@ const history = await getHistoryCached(E);
         }
 
         // ─────────────────────────────────────────────────────────
-        // 🏛️ .org / .edu / .gov domain override: if validation returned
-        //    Valid AND domain ends with .org, .edu, or .gov → downgrade
-        //    to Risky. These are organizational, educational, and
-        //    government domains that are high-risk for cold email sending.
+        // 🏛️ .edu / .gov domain override
+        // (.org now goes through normal SMTP/SendGrid verification flow)
         // ─────────────────────────────────────────────────────────
-        if (final && final.category !== "invalid" && categoryFromStatus(final.status || "") !== "invalid" && isOrgEduGovDomain(domain)) {
-          console.log(`[BULK][org_edu_gov_override] ${E} → domain "${domain}" ends with .org/.edu/.gov/.mx, overriding ${final.category} → Risky`);
+        if (
+          final &&
+          final.category !== "invalid" &&
+          categoryFromStatus(final.status || "") !== "invalid" &&
+          (
+            String(domain || "").toLowerCase().endsWith(".edu") ||
+            String(domain || "").toLowerCase().endsWith(".gov")
+          )
+        ) {
+          console.log(`[BULK][edu_gov_override] ${E} → domain "${domain}" ends with .edu/.gov, overriding ${final.category} → Risky`);
           final.status = "Risky";
           final.category = "risky";
-          final.subStatus = "org_edu_gov_domain";
+          final.subStatus = "edu_gov_domain";
           final.score = Math.min(typeof final.score === "number" ? final.score : 50, 45);
           final.reason = "Restricted Domain TLD";
-          final.message = "This address belongs to an organizational, educational, government, or country-specific domain (.org/.edu/.gov/.mx). Sending cold emails to these domains is risky and may result in blocks or bounces.";
+          final.message = "This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky and may result in blocks or bounces.";
           // Persist the overridden result
           await replaceLatest(EmailLog, E, { email: E, ...final });
           await replaceLatest(UserEmailLog, E, { email: E, ...final });
