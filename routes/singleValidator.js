@@ -311,23 +311,6 @@ module.exports = function singleValidatorRouter(deps) {
       payload.message = "This address belongs to a banking/financial domain. Sending cold emails to banking domains is risky and may result in blocks or bounces.";
     }
 
-    // ─────────────────────────────────────────────────────────
-    // 🏛️ .edu / .gov domain override
-    // (.org now goes through SendGrid verification flow)
-    // ─────────────────────────────────────────────────────────
-    if (
-      payload.category !== "invalid" &&
-      (String(payload.domain || "").toLowerCase().endsWith(".edu") ||
-        String(payload.domain || "").toLowerCase().endsWith(".gov"))
-    ) {
-      console.log(`[single][edu_gov_override] ${E} → domain "${payload.domain}" ends with .edu/.gov, overriding ${payload.category} → Risky`);
-      payload.status = "Risky";
-      payload.category = "risky";
-      payload.subStatus = "edu_gov_domain";
-      payload.score = Math.min(payload.score, 45);
-      payload.reason = "Restricted Domain TLD";
-      payload.message = "This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky and may result in blocks or bounces.";
-    }
 
 
     // persist in both global + user DB
@@ -584,23 +567,16 @@ module.exports = function singleValidatorRouter(deps) {
     const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
     const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
 
-    // ── EARLY EXIT: .edu/.gov and bank/healthcare only ─────────────
-    // (.org should continue to SendGrid verification flow)
+    // ── EARLY EXIT: bank/healthcare only ─────────────
+    // .org/.edu/.gov should continue to normal validation flow.
     // IMPORTANT:
     // ccTLD domains should NOT be marked risky here anymore.
     // They should flow into SendGrid-direct decision:
     //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
-    const isEduGovDomain =
-      String(domain || "").toLowerCase().endsWith(".edu") ||
-      String(domain || "").toLowerCase().endsWith(".gov");
-
-    if (isEduGovDomain || isBankOrHealthcare) {
+    if (isBankOrHealthcare) {
       const earlyLogger = mkLogger(sessionId, E, username);
-      const subStatus = isEduGovDomain ? 'edu_gov_domain'
-        : 'bank_healthcare_domain';
-      const message = isEduGovDomain
-        ? 'This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky.'
-        : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
+      const subStatus = 'bank_healthcare_domain';
+      const message = 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
       earlyLogger('early_risky', `Domain ${domain} is ${subStatus} → returning Risky directly`, 'info');
 
@@ -2189,23 +2165,6 @@ module.exports = function singleValidatorRouter(deps) {
         prelimPayload.message = "This address belongs to a banking/financial domain. Sending cold emails to banking domains is risky and may result in blocks or bounces.";
       }
 
-      // ─────────────────────────────────────────────────────────
-      // 🏛️ .edu / .gov domain override (prelim stage)
-      // (.org now goes through SendGrid verification flow)
-      // ─────────────────────────────────────────────────────────
-      if (
-        prelimPayload.category !== "invalid" &&
-        (String(prelimPayload.domain || "").toLowerCase().endsWith(".edu") ||
-          String(prelimPayload.domain || "").toLowerCase().endsWith(".gov"))
-      ) {
-        console.log(`[single][edu_gov_override][prelim] ${E} → domain "${prelimPayload.domain}" ends with .edu/.gov, overriding ${prelimPayload.category} → Risky`);
-        prelimPayload.status = "Risky";
-        prelimPayload.category = "risky";
-        prelimPayload.subStatus = "edu_gov_domain";
-        prelimPayload.score = Math.min(prelimPayload.score, 45);
-        prelimPayload.reason = "Restricted Domain TLD";
-        prelimPayload.message = "This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky and may result in blocks or bounces.";
-      }
 
       // NOTE: ccTLD risky handling is applied in early-gating logic only
       // (restricted providers/custom domains). Do not unconditionally
@@ -2349,7 +2308,7 @@ module.exports = function singleValidatorRouter(deps) {
             (String(finalPayload.domain || "").toLowerCase().endsWith(".edu") ||
               String(finalPayload.domain || "").toLowerCase().endsWith(".gov"))
           ) {
-            console.log(`[single][edu_gov_override][stable] ${E} → domain "${finalPayload.domain}" ends with .edu/.gov, overriding ${finalPayload.category} → Risky`);
+            // removed .edu/.gov forced-risky override to align with .org normal flow
             finalPayload.status = "Risky";
             finalPayload.category = "risky";
             finalPayload.subStatus = "edu_gov_domain";

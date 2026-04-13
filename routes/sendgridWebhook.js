@@ -157,6 +157,10 @@ module.exports = function sendgridWebhookRouter(deps) {
       r.includes('sender blocked') ||        // Generic: sender blocked by policy
       r.includes('ip blocked') ||            // Generic: IP address blocked
       r.includes('ip reputation') ||         // Generic: IP reputation block
+      r.includes('poor reputation') ||       // Generic: poor sender/domain reputation
+      r.includes('domain reputation') ||     // Generic: domain reputation block
+      r.includes('reputation of a domain') ||// Provider wording for domain reputation rejection
+      r.includes('poor reputation of a domain used in message transfer') || // Exact rejection text seen in SMTP 554 blocks
       r.includes('blacklisted') ||           // Generic: sender/IP blacklisted
       r.includes('dnsbl') ||                 // Generic: DNS blacklist rejection
       r.includes('policy violation') ||      // Generic: policy violation

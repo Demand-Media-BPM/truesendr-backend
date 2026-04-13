@@ -1627,23 +1627,15 @@ module.exports = function bulkValidatorRouter(deps) {
         const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
         const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
 
-        // ── EARLY EXIT: .edu/.gov and bank/healthcare only ──────
-        // (.org should continue through normal SMTP/SendGrid flow)
+        // ── EARLY EXIT: bank/healthcare only ──────
         // IMPORTANT:
+        // .org/.edu/.gov should continue through normal SMTP/SendGrid flow.
         // ccTLD domains should NOT be marked risky here anymore.
         // They should flow into SendGrid-direct decision:
         //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
-        const isEduGovDomain =
-          String(domain || "").toLowerCase().endsWith(".edu") ||
-          String(domain || "").toLowerCase().endsWith(".gov");
-
-        if (isEduGovDomain || isBankOrHealthcare) {
-          const subStatus = isEduGovDomain
-            ? 'edu_gov_domain'
-            : 'bank_healthcare_domain';
-          const message = isEduGovDomain
-            ? 'This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky.'
-            : 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
+        if (isBankOrHealthcare) {
+          const subStatus = 'bank_healthcare_domain';
+          const message = 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
           console.log(`[BULK][early_risky] ${E} → domain "${domain}" is ${subStatus} → returning Risky directly`);
 
@@ -2679,30 +2671,6 @@ const history = await getHistoryCached(E);
           await replaceLatest(UserEmailLog, E, { email: E, ...final });
         }
 
-        // ─────────────────────────────────────────────────────────
-        // 🏛️ .edu / .gov domain override
-        // (.org now goes through normal SMTP/SendGrid verification flow)
-        // ─────────────────────────────────────────────────────────
-        if (
-          final &&
-          final.category !== "invalid" &&
-          categoryFromStatus(final.status || "") !== "invalid" &&
-          (
-            String(domain || "").toLowerCase().endsWith(".edu") ||
-            String(domain || "").toLowerCase().endsWith(".gov")
-          )
-        ) {
-          console.log(`[BULK][edu_gov_override] ${E} → domain "${domain}" ends with .edu/.gov, overriding ${final.category} → Risky`);
-          final.status = "Risky";
-          final.category = "risky";
-          final.subStatus = "edu_gov_domain";
-          final.score = Math.min(typeof final.score === "number" ? final.score : 50, 45);
-          final.reason = "Restricted Domain TLD";
-          final.message = "This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky and may result in blocks or bounces.";
-          // Persist the overridden result
-          await replaceLatest(EmailLog, E, { email: E, ...final });
-          await replaceLatest(UserEmailLog, E, { email: E, ...final });
-        }
 
         // NOTE:
         // ccTLD domains (e.g., .be/.de/.fr) should NOT be force-marked risky.

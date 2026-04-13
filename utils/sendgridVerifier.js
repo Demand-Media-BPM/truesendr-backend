@@ -12,7 +12,9 @@ const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
 const DEFAULT_SENDGRID_SENDERS = [
   'david.g@mailjournals.com',
   'max.j@mailrant.com',
-  'john.doe@mailverite.com'
+  'john.doe@mailverite.com',
+  'martina@maildictator.com',
+  'rebecca@mailvariant.com'
 ];
 const SENDGRID_VERIFIED_SENDER = process.env.SENDGRID_VERIFIED_SENDER || 'david.g@mailjournals.com';
 const SENDGRID_VERIFIED_SENDERS = (process.env.SENDGRID_VERIFIED_SENDERS || '')
