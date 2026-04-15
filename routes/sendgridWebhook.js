@@ -36,7 +36,27 @@ module.exports = function sendgridWebhookRouter(deps) {
       s === 'sendgrid_soft_bounce' ||
       s === 'sendgrid_blocked' ||
       s === 'sendgrid_dropped' ||
-      s === 'sendgrid_policy_block'
+      s === 'sendgrid_policy_block' ||
+      s === 'sendgrid_recipient_not_found_edu_gov'
+    );
+  }
+
+  function isEduGovEmail(email) {
+    const d = extractDomainFromEmail(email);
+    return d.endsWith('.edu') || d.endsWith('.gov');
+  }
+
+  function isRecipientNotFound510(reason) {
+    if (!reason) return false;
+    const r = String(reason).toLowerCase().replace(/\s+/g, ' ').trim();
+    return (
+      /5[.\s-]?1[.\s-]?10/.test(r) ||
+      r.includes('resolver.adr.recipientnotfound') ||
+      r.includes('resolver adr recipientnotfound') ||
+      r.includes('recipientnotfound') ||
+      r.includes('recipient not found by smtp address lookup') ||
+      (r.includes('recipient not found') && r.includes('smtp address lookup')) ||
+      (r.includes('recipient not found') && r.includes('smtp'))
     );
   }
 
@@ -209,6 +229,39 @@ module.exports = function sendgridWebhookRouter(deps) {
     const SendGridPending = mongoose.model('SendGridPending');
     const pending = await SendGridPending.findOne({ messageId });
 
+    // If this messageId already has a FINAL verdict, ignore contradictory late events
+    // (e.g. delivered/open/click arriving after final bounce/dropped/deferred/blocked).
+    let existingFinalLog = null;
+    if (messageId) {
+      try {
+        existingFinalLog = await SendGridLog.findOne({
+          messageId,
+          finalCategory: { $in: ['valid', 'invalid', 'risky'] },
+          finalStatus: { $exists: true, $ne: null },
+        })
+          .sort({ updatedAt: -1, createdAt: -1 })
+          .lean();
+
+        if (existingFinalLog) {
+          const lateNonFinalEvent =
+            eventType === 'processed' ||
+            eventType === 'delivered' ||
+            eventType === 'open' ||
+            eventType === 'click' ||
+            eventType === 'unsubscribe';
+
+          if (lateNonFinalEvent) {
+            console.log(
+              `ℹ️ [SendGrid Webhook] Ignoring late ${eventType} for finalized messageId ${messageId} (final: ${existingFinalLog.finalStatus}/${existingFinalLog.finalCategory})`
+            );
+            return;
+          }
+        }
+      } catch (e) {
+        console.warn('Final-state check failed:', e.message);
+      }
+    }
+
     if (!pending) {
       console.log(`ℹ️ [SendGrid Webhook] No pending record found for messageId: ${messageId}, email: ${E}, event: ${eventType} - checking if bulk email`);
       
@@ -252,6 +305,12 @@ module.exports = function sendgridWebhookRouter(deps) {
                   finalSubStatus = 'sendgrid_policy_block';
                   finalCategory = 'risky';
                   confidence = 0.80;
+                } else if (isEduGovEmail(E) && isRecipientNotFound510(reason)) {
+                  // Special policy: for .edu/.gov domains, treat RecipientNotFound (5.1.10) as Risky.
+                  finalStatus = 'Risky';
+                  finalSubStatus = 'sendgrid_recipient_not_found_edu_gov';
+                  finalCategory = 'risky';
+                  confidence = 0.78;
                 } else {
                   // Hard bounce: mailbox does not exist — treat as Invalid
                   finalStatus = 'Invalid';
@@ -467,23 +526,38 @@ module.exports = function sendgridWebhookRouter(deps) {
         }
       }
       
-      // Not found in pending or bulk - just update SendGridLog if exists
+      // Not found in pending or bulk - just update SendGridLog if exists,
+      // but never overwrite/append contradictory non-final events once final exists.
       if (messageId) {
         try {
-          await SendGridLog.findOneAndUpdate(
-            { messageId },
-            {
-              $set: {
-                webhookEvent: eventType,
-                webhookTimestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
-                webhookReason: reason,
-                webhookType: type,
-                webhookResponse: response,
-                webhookStatus: status,
-                webhookAttempt: attempt,
+          const hasFinal = existingFinalLog && existingFinalLog.finalCategory && existingFinalLog.finalStatus;
+          const lateNonFinalEvent =
+            eventType === 'processed' ||
+            eventType === 'delivered' ||
+            eventType === 'open' ||
+            eventType === 'click' ||
+            eventType === 'unsubscribe';
+
+          if (hasFinal && lateNonFinalEvent) {
+            console.log(
+              `ℹ️ [SendGrid Webhook] Skipping SendGridLog non-final update for finalized messageId ${messageId} (${eventType})`
+            );
+          } else {
+            await SendGridLog.findOneAndUpdate(
+              { messageId },
+              {
+                $set: {
+                  webhookEvent: eventType,
+                  webhookTimestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
+                  webhookReason: reason,
+                  webhookType: type,
+                  webhookResponse: response,
+                  webhookStatus: status,
+                  webhookAttempt: attempt,
+                }
               }
-            }
-          );
+            );
+          }
         } catch (e) {
           console.warn('SendGridLog update failed:', e.message);
         }
@@ -529,6 +603,12 @@ module.exports = function sendgridWebhookRouter(deps) {
           finalSubStatus = 'sendgrid_policy_block';
           finalCategory = 'risky';
           confidence = 0.80;
+        } else if (isEduGovEmail(E) && isRecipientNotFound510(reason)) {
+          // Special policy: for .edu/.gov domains, treat RecipientNotFound (5.1.10) as Risky.
+          finalStatus = 'Risky';
+          finalSubStatus = 'sendgrid_recipient_not_found_edu_gov';
+          finalCategory = 'risky';
+          confidence = 0.78;
         } else {
           // Hard bounce: mailbox does not exist — treat as Invalid
           finalStatus = 'Invalid';

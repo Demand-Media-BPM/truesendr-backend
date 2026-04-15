@@ -29,7 +29,7 @@ const SendGridLog = require("../models/SendGridLog");
 const dns = require("dns").promises;
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
-const { classifyDomain, getDomainCategory, hasBankWordInDomain, isTwDomain } = require("../utils/domainClassifier");
+const { classifyDomain, getDomainCategory, hasBankWordInDomain, isTwDomain, isManualHighRiskDomain } = require("../utils/domainClassifier");
 
 // ── SendGrid result cache TTL: 15 days ────────────────────────────────────────
 // Email addresses validated via SendGrid are stored for 15 days so that
@@ -541,6 +541,7 @@ module.exports = function singleValidatorRouter(deps) {
     const isMimecast = await isMimecastDomain(domain);
 
     const tld = String(domain || "").toLowerCase().split(".").pop() || "";
+    const isEduGovDomain = tld === "edu" || tld === "gov";
     const isTargetSendgridSuffix =
       tld === "us" ||
       tld === "uk" ||
@@ -613,15 +614,19 @@ module.exports = function singleValidatorRouter(deps) {
     }
 
     const shouldSendgridDirect =
-      isBankOrHealthcare || ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
+      isEduGovDomain ||
+      isBankOrHealthcare ||
+      ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
 
     if (!shouldSendgridDirect) return null;
 
-    const domainCategory = isBankOrHealthcare
-      ? getDomainCategory(domain)
-      : isMimecast
-        ? "Mimecast Email Security"
-        : "Proofpoint Email Protection";
+    const domainCategory = isEduGovDomain
+      ? "Educational/Government Domain"
+      : isBankOrHealthcare
+        ? getDomainCategory(domain)
+        : isMimecast
+          ? "Mimecast Email Security"
+          : "Proofpoint Email Protection";
 
     const logger = mkLogger(sessionId, E, username);
 
@@ -637,45 +642,49 @@ module.exports = function singleValidatorRouter(deps) {
     // ── CATCH-ALL CHECK for Proofpoint/Mimecast domains ──────────────────────
     // Before sending via SendGrid, probe a random address on the domain.
     // If the domain is catch-all → return Risky immediately (skip SendGrid).
-    logger('catchall_check', `Checking if ${domain} is catch-all before SendGrid`, 'info');
-    try {
-      // probeIfNotCached: false — Proofpoint/Mimecast gateways always accept
-      // emails at SMTP level, so an SMTP probe is meaningless AND very slow
-      // (60-90s across multiple MX hosts). Only check the in-memory cache here.
-      const isCatchAll = await checkDomainCatchAll(domain, { logger, probeIfNotCached: false });
-      if (isCatchAll) {
-        logger('catchall_check', `Domain ${domain} is catch-all → returning Risky directly`, 'warn');
-        const catchAllPayload = {
-          email: E,
-          status: 'Risky',
-          subStatus: 'catch_all',
-          confidence: 0.75,
-          category: 'risky',
-          reason: 'Catch-All Domain',
-          message: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
-          domain,
-          domainProvider: domainCategory,
-          isDisposable: false,
-          isFree: false,
-          isRoleBased: false,
-          score: 30,
-          timestamp: new Date(),
-          section: 'single',
-        };
-        await replaceLatest(EmailLog, E, catchAllPayload);
-        await replaceLatest(UserEmailLog2, E, catchAllPayload);
-        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: catchAllPayload });
-        const catchAllCredits = await debitOneCreditIfNeeded(username, catchAllPayload.status, E, idemKey, 'single');
-        sendStatusToFrontend(E, catchAllPayload.status, catchAllPayload.timestamp, {
-          domain: catchAllPayload.domain, provider: catchAllPayload.domainProvider,
-          isDisposable: false, isFree: false, isRoleBased: false, score: catchAllPayload.score,
-          subStatus: catchAllPayload.subStatus, confidence: catchAllPayload.confidence,
-          category: catchAllPayload.category, message: catchAllPayload.message, reason: catchAllPayload.reason,
-        }, sessionId, true, username, 'single');
-        return res.json({ ...catchAllPayload, via: 'catch-all-check', cached: false, inProgress: false, credits: catchAllCredits });
+    if (!isEduGovDomain) {
+      logger('catchall_check', `Checking if ${domain} is catch-all before SendGrid`, 'info');
+      try {
+        // probeIfNotCached: false — Proofpoint/Mimecast gateways always accept
+        // emails at SMTP level, so an SMTP probe is meaningless AND very slow
+        // (60-90s across multiple MX hosts). Only check the in-memory cache here.
+        const isCatchAll = await checkDomainCatchAll(domain, { logger, probeIfNotCached: false });
+        if (isCatchAll) {
+          logger('catchall_check', `Domain ${domain} is catch-all → returning Risky directly`, 'warn');
+          const catchAllPayload = {
+            email: E,
+            status: 'Risky',
+            subStatus: 'catch_all',
+            confidence: 0.75,
+            category: 'risky',
+            reason: 'Catch-All Domain',
+            message: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
+            domain,
+            domainProvider: domainCategory,
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            score: 30,
+            timestamp: new Date(),
+            section: 'single',
+          };
+          await replaceLatest(EmailLog, E, catchAllPayload);
+          await replaceLatest(UserEmailLog2, E, catchAllPayload);
+          if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: catchAllPayload });
+          const catchAllCredits = await debitOneCreditIfNeeded(username, catchAllPayload.status, E, idemKey, 'single');
+          sendStatusToFrontend(E, catchAllPayload.status, catchAllPayload.timestamp, {
+            domain: catchAllPayload.domain, provider: catchAllPayload.domainProvider,
+            isDisposable: false, isFree: false, isRoleBased: false, score: catchAllPayload.score,
+            subStatus: catchAllPayload.subStatus, confidence: catchAllPayload.confidence,
+            category: catchAllPayload.category, message: catchAllPayload.message, reason: catchAllPayload.reason,
+          }, sessionId, true, username, 'single');
+          return res.json({ ...catchAllPayload, via: 'catch-all-check', cached: false, inProgress: false, credits: catchAllCredits });
+        }
+      } catch (catchAllErr) {
+        logger('catchall_check_error', `Catch-all check failed: ${catchAllErr.message} → proceeding with SendGrid`, 'warn');
       }
-    } catch (catchAllErr) {
-      logger('catchall_check_error', `Catch-all check failed: ${catchAllErr.message} → proceeding with SendGrid`, 'warn');
+    } else {
+      logger('catchall_check', `Skipping catch-all probe for .edu/.gov domain ${domain} and proceeding directly to SendGrid`, 'info');
     }
 
     // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
@@ -701,8 +710,10 @@ module.exports = function singleValidatorRouter(deps) {
       // Get user for credits display
       const user = await User.findOne({ username });
       
-      const viaLabel =
-        isBankOrHealthcare && isProofpoint
+    const viaLabel =
+      isEduGovDomain
+        ? "sendgrid-edu-gov"
+        : isBankOrHealthcare && isProofpoint
           ? "sendgrid-bank-healthcare-proofpoint"
           : isBankOrHealthcare
             ? "sendgrid-bank-healthcare"
@@ -731,12 +742,14 @@ module.exports = function singleValidatorRouter(deps) {
     // ✅ No duplicate found - proceed with SendGrid verification
     const sgResult = await verifySendGrid(E, { logger });
 
-    const viaLabel =
-      isBankOrHealthcare && isProofpoint
-        ? "sendgrid-bank-healthcare-proofpoint"
-        : isBankOrHealthcare
-          ? "sendgrid-bank-healthcare"
-          : "sendgrid-proofpoint";
+      const viaLabel =
+        isEduGovDomain
+          ? "sendgrid-edu-gov"
+          : isBankOrHealthcare && isProofpoint
+            ? "sendgrid-bank-healthcare-proofpoint"
+            : isBankOrHealthcare
+              ? "sendgrid-bank-healthcare"
+              : "sendgrid-proofpoint";
 
     // ✅ Check if result is pending (awaiting webhook)
     if (sgResult.awaitingWebhook && sgResult.messageId) {
@@ -1349,6 +1362,7 @@ module.exports = function singleValidatorRouter(deps) {
       // exists -> proceed | invalid -> stop invalid | unknown -> proceed
       // ─────────────────────────────────────────────────────────
       const domain = extractDomain(E);
+      const isEduGovDomain = String(domain || "").toLowerCase().endsWith(".edu") || String(domain || "").toLowerCase().endsWith(".gov");
       const domainCheck = await checkDomainExistence(domain);
       if (domainCheck.state === "invalid") {
         const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
@@ -1423,6 +1437,42 @@ module.exports = function singleValidatorRouter(deps) {
       }
 
       // ─────────────────────────────────────────────────────────
+      // 🧨 Manual high-risk domain direct Risky: skip all validation entirely.
+      //    Any domain listed in MANUAL_HIGH_RISK_DOMAINS should return Risky
+      //    immediately without SMTP/SendGrid probing.
+      // ─────────────────────────────────────────────────────────
+      if (isManualHighRiskDomain(extractDomain(E))) {
+        const riskyDomain = extractDomain(E);
+        console.log(`[single][manual_high_risk_direct] ${E} → domain "${riskyDomain}" is in manual high-risk list, returning Risky directly (no SMTP/SendGrid)`);
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        let manualProvider = "Unavailable";
+        try {
+          manualProvider = String((await detectProviderByMX(riskyDomain)) || "Unavailable");
+        } catch (_) {
+          manualProvider = "Unavailable";
+        }
+
+        const manualRiskyPayload = {
+          email: E, status: "Risky", subStatus: "high_risk_domain", confidence: 0.95,
+          category: "risky", reason: "Manual High-Risk Domain",
+          message: "This domain is configured under manual high-risk domains. Email is marked risky directly without validation.",
+          domain: riskyDomain, domainProvider: manualProvider, isDisposable: false,
+          isFree: false, isRoleBased: false, score: 25, timestamp: new Date(), section: "single",
+        };
+        await replaceLatest(EmailLog, E, manualRiskyPayload);
+        await replaceLatest(UserEmailLog2, E, manualRiskyPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: manualRiskyPayload });
+        const credits = await debitOneCreditIfNeeded(username, manualRiskyPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, manualRiskyPayload.status, manualRiskyPayload.timestamp, {
+          domain: manualRiskyPayload.domain, provider: manualRiskyPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: manualRiskyPayload.score,
+          subStatus: manualRiskyPayload.subStatus, confidence: manualRiskyPayload.confidence,
+          category: manualRiskyPayload.category, message: manualRiskyPayload.message, reason: manualRiskyPayload.reason,
+        }, sessionId, true, username, "single");
+        return res.json({ ...manualRiskyPayload, via: "manual-high-risk-direct", cached: false, credits });
+      }
+
+      // ─────────────────────────────────────────────────────────
       // 🇹🇼 .tw domain direct Risky: skip all validation entirely.
       //    SMTP cannot probe .tw domains reliably — return Risky immediately.
       // ─────────────────────────────────────────────────────────
@@ -1461,7 +1511,7 @@ module.exports = function singleValidatorRouter(deps) {
         E,
       );
 
-      if (cachedDb) {
+      if (cachedDb && !isEduGovDomain) {
         const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
         // SendGrid-validated results use a 3-day freshness window; others use FRESH_DB_MS.
         const isSgCached = cachedDb.subStatus && String(cachedDb.subStatus).startsWith('sendgrid_');
@@ -1679,6 +1729,7 @@ module.exports = function singleValidatorRouter(deps) {
       // exists -> proceed | invalid -> stop invalid | unknown -> proceed
       // ─────────────────────────────────────────────────────────
       const verifyDomain = extractDomain(E);
+      const isEduGovDomainVerify = String(verifyDomain || "").toLowerCase().endsWith(".edu") || String(verifyDomain || "").toLowerCase().endsWith(".gov");
       const verifyDomainCheck = await checkDomainExistence(verifyDomain);
       if (verifyDomainCheck.state === "invalid") {
         const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
@@ -1762,6 +1813,41 @@ module.exports = function singleValidatorRouter(deps) {
       }
 
       // ─────────────────────────────────────────────────────────
+      // 🧨 Manual high-risk domain direct Risky (verify-smart): skip all validation.
+      // ─────────────────────────────────────────────────────────
+      if (isManualHighRiskDomain(extractDomain(E))) {
+        const riskyDomain = extractDomain(E);
+        console.log(`[single][manual_high_risk_direct][verify-smart] ${E} → domain "${riskyDomain}" is in manual high-risk list, returning Risky directly`);
+        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        let manualProvider = "Unavailable";
+        try {
+          manualProvider = String((await detectProviderByMX(riskyDomain)) || "Unavailable");
+        } catch (_) {
+          manualProvider = "Unavailable";
+        }
+
+        const manualRiskyPayload = {
+          email: E, status: "Risky", subStatus: "high_risk_domain", confidence: 0.95,
+          category: "risky", reason: "Manual High-Risk Domain",
+          message: "This domain is configured under manual high-risk domains. Email is marked risky directly without validation.",
+          domain: riskyDomain, domainProvider: manualProvider, isDisposable: false,
+          isFree: false, isRoleBased: false, score: 25, timestamp: new Date(), section: "single",
+        };
+        await replaceLatest(EmailLog, E, manualRiskyPayload);
+        await replaceLatest(UserEmailLog2, E, manualRiskyPayload);
+        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: manualRiskyPayload });
+        const manualCredits = await debitOneCreditIfNeeded(username, manualRiskyPayload.status, E, idemKey, "single");
+        sendStatusToFrontend(E, manualRiskyPayload.status, manualRiskyPayload.timestamp, {
+          domain: manualRiskyPayload.domain, provider: manualRiskyPayload.domainProvider,
+          isDisposable: false, isFree: false, isRoleBased: false, score: manualRiskyPayload.score,
+          subStatus: manualRiskyPayload.subStatus, confidence: manualRiskyPayload.confidence,
+          category: manualRiskyPayload.category, message: manualRiskyPayload.message, reason: manualRiskyPayload.reason,
+        }, sessionId, true, username, "single");
+        await markPendingDone(username, E);
+        return res.json({ ...manualRiskyPayload, via: "manual-high-risk-direct", cached: false, inProgress: false, credits: manualCredits });
+      }
+
+      // ─────────────────────────────────────────────────────────
       // 🇹🇼 .tw domain direct Risky (verify-smart): skip all validation.
       // ─────────────────────────────────────────────────────────
       if (isTwDomain(extractDomain(E))) {
@@ -1829,7 +1915,7 @@ module.exports = function singleValidatorRouter(deps) {
         E,
       );
 
-      if (cachedDb) {
+      if (cachedDb && !isEduGovDomainVerify) {
         const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
         // SendGrid-validated results use a 3-day freshness window; others use FRESH_DB_MS.
         const isSgCached = cachedDb.subStatus && String(cachedDb.subStatus).startsWith('sendgrid_');
@@ -1954,7 +2040,7 @@ module.exports = function singleValidatorRouter(deps) {
 
       // stable cache hit — skip if result is unknown (must re-validate)
       const hit = stableCache ? stableCache.get(E) : null;
-      if (hit && hit.until > Date.now() && hit.result?.category !== 'unknown') {
+      if (!isEduGovDomainVerify && hit && hit.until > Date.now() && hit.result?.category !== 'unknown') {
         const { EmailLog: UserEmailLog2 } = getUserDb(
           mongoose,
           EmailLog,
@@ -2299,23 +2385,6 @@ module.exports = function singleValidatorRouter(deps) {
             finalPayload.message = "This address belongs to a banking/financial domain. Sending cold emails to banking domains is risky and may result in blocks or bounces.";
           }
 
-          // ─────────────────────────────────────────────────────────
-          // 🏛️ .edu / .gov domain override (stable background stage)
-          // (.org now goes through SendGrid verification flow)
-          // ─────────────────────────────────────────────────────────
-          if (
-            finalPayload.category !== "invalid" &&
-            (String(finalPayload.domain || "").toLowerCase().endsWith(".edu") ||
-              String(finalPayload.domain || "").toLowerCase().endsWith(".gov"))
-          ) {
-            // removed .edu/.gov forced-risky override to align with .org normal flow
-            finalPayload.status = "Risky";
-            finalPayload.category = "risky";
-            finalPayload.subStatus = "edu_gov_domain";
-            finalPayload.score = Math.min(finalPayload.score, 45);
-            finalPayload.reason = "Restricted Domain TLD";
-            finalPayload.message = "This address belongs to an educational or government domain (.edu/.gov). Sending cold emails to these domains is risky and may result in blocks or bounces.";
-          }
 
           // NOTE: ccTLD risky handling is applied in early-gating logic only
           // (restricted providers/custom domains). Do not unconditionally

@@ -480,6 +480,46 @@ const HEALTHCARE_DOMAINS = [
 ];
 
 /**
+ * Manual high-risk domain override list.
+ * Add domains here to force risky classification immediately.
+ */
+const MANUAL_HIGH_RISK_DOMAINS = [
+  // Add exact domains in lowercase (no @), e.g.:
+  // 'dea.gov',
+  // 'fbi.gov',
+
+  'shandleykanedental.com',
+  'bhpediatricdentistry.com',
+  'whfamilydentistry.com',
+  'jeffersonhealthcare.org',
+  'yahoo.com',
+  'safecare.com',
+  'petronas.com',
+  'shell.com',
+  'atos.net',
+  'nationwide.co.uk',
+  'experian.com',
+  'rolls-royce.com',
+  'lloydsbanking.com',
+  'lloydsbanking.com',
+  'pacificlife.com',
+  'christianacare.org',
+  'elesa.com',
+  'faac.it',
+  'fatebenefratelli.it',
+  'liujo.it',
+  'theglobeandmail.com',
+  'mbll.ca',
+  'alarm.com',
+  'dksh.com', 
+  'dea.gov', 
+  'bancogalicia.com',
+  'zig.fun',
+  'niu.edu'
+  
+];
+
+/**
  * Keywords that indicate bank/financial domains
  */
 const BANK_KEYWORDS = [
@@ -662,6 +702,15 @@ function hasHealthcareKeywords(domain) {
 }
 
 /**
+ * Check if domain is manually marked as high-risk.
+ */
+function isManualHighRiskDomain(domain) {
+  const d = String(domain || '').toLowerCase().trim();
+  if (!d || d === 'n/a') return false;
+  return MANUAL_HIGH_RISK_DOMAINS.includes(d);
+}
+
+/**
  * Main classifier: Determine if domain is bank or healthcare
  * Returns: { isBank: boolean, isHealthcare: boolean, reason: string }
  */
@@ -670,6 +719,11 @@ function classifyDomain(domain) {
   
   if (!d || d === 'n/a') {
     return { isBank: false, isHealthcare: false, reason: null };
+  }
+
+  // Manual override list (highest priority)
+  if (isManualHighRiskDomain(d)) {
+    return { isBank: false, isHealthcare: false, reason: 'manual_high_risk_domain' };
   }
 
   // Check known lists first (most reliable)
@@ -698,7 +752,11 @@ function classifyDomain(domain) {
  */
 function isHighRiskDomain(domain) {
   const classification = classifyDomain(domain);
-  return classification.isBank || classification.isHealthcare;
+  return (
+    classification.isBank ||
+    classification.isHealthcare ||
+    classification.reason === 'manual_high_risk_domain'
+  );
 }
 
 /**
@@ -727,8 +785,10 @@ module.exports = {
   isTwDomain,
   isCcTLDDomain,
   hasHealthcareKeywords,
+  isManualHighRiskDomain,
   
   // Lists (for reference/extension)
+  MANUAL_HIGH_RISK_DOMAINS,
   BANK_DOMAINS,
   HEALTHCARE_DOMAINS,
   BANK_KEYWORDS,

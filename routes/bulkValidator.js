@@ -30,6 +30,7 @@ const {
   getDomainCategory,
   hasBankWordInDomain,
   isTwDomain,
+  isManualHighRiskDomain,
   // isHighRiskDomain, // (optional) not required, Yash also doesn't actually use it in worker
 } = require("../utils/domainClassifier");
 
@@ -1076,14 +1077,12 @@ module.exports = function bulkValidatorRouter(deps) {
 
     // Fetch updated EmailLog entries for all emails.
     // Sort by updatedAt descending so the most recent record comes first.
-    // Only keep the first (newest) record per email to avoid stale results
-    // from previous bulk jobs or sections overwriting the webhook result.
+    // Only keep the first (newest) record per email to avoid stale results.
     const emails = toValidate.map((item) => item.email);
     const updatedLogs = await UserEmailLog.find({
       email: { $in: emails },
     }).sort({ updatedAt: -1, createdAt: -1 }).lean();
 
-    // Create a map for quick lookup — first record wins (most recent)
     const logMap = new Map();
     updatedLogs.forEach((log) => {
       if (!logMap.has(log.email)) {
@@ -1091,9 +1090,7 @@ module.exports = function bulkValidatorRouter(deps) {
       }
     });
 
-    // Also check global EmailLog as a fallback — the webhook handler always
-    // updates the global EmailLog, so if the user-specific one is stale,
-    // the global one will have the correct (post-webhook) result.
+    // Global fallback
     const globalLogs = await EmailLog.find({
       email: { $in: emails },
     }).sort({ updatedAt: -1, createdAt: -1 }).lean();
@@ -1101,10 +1098,8 @@ module.exports = function bulkValidatorRouter(deps) {
     globalLogs.forEach((log) => {
       const existing = logMap.get(log.email);
       if (!existing) {
-        // No user-specific record — use global
         logMap.set(log.email, log);
       } else {
-        // Use whichever is more recent
         const existingTime = new Date(existing.updatedAt || existing.createdAt || 0).getTime();
         const globalTime = new Date(log.updatedAt || log.createdAt || 0).getTime();
         if (globalTime > existingTime) {
@@ -1112,6 +1107,77 @@ module.exports = function bulkValidatorRouter(deps) {
         }
       }
     });
+
+    // Final SendGrid override for .edu/.gov:
+    // if SendGridLog has finalStatus/finalCategory, prefer that over EmailLog snapshot.
+    const sendGridFinals = await SendGridLog.find({
+      email: { $in: emails },
+      finalStatus: { $exists: true, $ne: null },
+      finalCategory: { $in: ["valid", "invalid", "risky"] },
+    })
+      .sort({ updatedAt: -1, createdAt: -1 })
+      .lean();
+
+    const sgFinalMap = new Map();
+    for (const r of sendGridFinals) {
+      const e = String(r.email || "").toLowerCase();
+      if (!e) continue;
+      if (!sgFinalMap.has(e)) sgFinalMap.set(e, r);
+    }
+
+    for (const e of emails) {
+      const lower = String(e || "").toLowerCase();
+      const isEduGov = lower.endsWith(".edu") || lower.endsWith(".gov");
+      if (!isEduGov) continue;
+
+      const sg = sgFinalMap.get(lower);
+      if (!sg) continue;
+
+      const existing = logMap.get(lower) || {};
+      const built = buildReasonAndMessage(sg.finalStatus, sg.finalSubStatus || null, {
+        isDisposable: !!existing.isDisposable,
+        isRoleBased: !!existing.isRoleBased,
+        isFree: !!existing.isFree,
+      });
+
+      const mergedFinal = {
+        ...existing,
+        email: lower,
+        status: sg.finalStatus,
+        category: sg.finalCategory,
+        subStatus: sg.finalSubStatus || existing.subStatus || null,
+        reason: sg.webhookReason || existing.reason || built.reasonLabel,
+        message:
+          existing.message ||
+          (sg.webhookEvent
+            ? `SendGrid ${sg.webhookEvent}: ${sg.webhookReason || built.message}`
+            : built.message),
+        confidence:
+          typeof existing.confidence === "number"
+            ? existing.confidence
+            : sg.finalCategory === "valid"
+              ? 0.95
+              : sg.finalCategory === "invalid"
+                ? 0.98
+                : 0.78,
+        score:
+          typeof existing.score === "number"
+            ? existing.score
+            : sg.finalCategory === "valid"
+              ? 90
+              : sg.finalCategory === "invalid"
+                ? 5
+                : 45,
+        timestamp:
+          sg.webhookTimestamp ||
+          sg.updatedAt ||
+          sg.createdAt ||
+          existing.timestamp ||
+          new Date(),
+      };
+
+      logMap.set(lower, mergedFinal);
+    }
 
     // Build result rows with updated data
     const printable = toValidate.map((item) => {
@@ -1557,6 +1623,76 @@ module.exports = function bulkValidatorRouter(deps) {
         }
 
         // ─────────────────────────────────────────────────────────
+        // 🧨 Manual high-risk domain direct Risky: skip all validation entirely.
+        //    Any domain listed in MANUAL_HIGH_RISK_DOMAINS should return Risky
+        //    immediately without SMTP/SendGrid probing.
+        // ─────────────────────────────────────────────────────────
+        if (isManualHighRiskDomain(domain)) {
+          console.log(`[BULK][manual_high_risk_direct] ${E} → domain "${domain}" is in manual high-risk list, returning Risky directly (no SMTP/SendGrid)`);
+          let manualProvider = "Unavailable";
+          try {
+            manualProvider = String((await getProviderCached(domain)) || "Unavailable");
+          } catch (_) {
+            manualProvider = "Unavailable";
+          }
+
+          const manualFinal = {
+            email: E,
+            status: "Risky",
+            subStatus: "high_risk_domain",
+            confidence: 0.95,
+            category: "risky",
+            reason: "Manual High-Risk Domain",
+            message: "This domain is configured under manual high-risk domains. Email is marked risky directly without validation.",
+            domain,
+            domainProvider: manualProvider,
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            score: 25,
+            timestamp: new Date(),
+            section: "bulk",
+          };
+          await replaceLatest(EmailLog, E, { email: E, ...manualFinal });
+          await replaceLatest(UserEmailLog, E, { email: E, ...manualFinal });
+
+          const manualCat = getOutcomeCategory(manualFinal);
+          await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, manualCat);
+          try {
+            sendStatusToFrontend(E, manualFinal.status, manualFinal.timestamp, {
+              domain: manualFinal.domain,
+              provider: manualFinal.domainProvider,
+              isDisposable: false,
+              isFree: false,
+              isRoleBased: false,
+              score: manualFinal.score,
+              subStatus: manualFinal.subStatus,
+              confidence: manualFinal.confidence,
+              category: manualFinal.category,
+              message: manualFinal.message,
+              reason: manualFinal.reason,
+            }, sessionId, true, username);
+          } catch {}
+          return {
+            Email: E,
+            Status: "Risky",
+            Timestamp: new Date(manualFinal.timestamp).toLocaleString(),
+            Domain: domain,
+            Provider: manualProvider,
+            Disposable: "No",
+            Free: "No",
+            RoleBased: "No",
+            Score: 25,
+            SubStatus: "high_risk_domain",
+            Confidence: 0.95,
+            Category: "risky",
+            Message: manualFinal.message,
+            Reason: manualFinal.reason,
+            Source: "Live",
+          };
+        }
+
+        // ─────────────────────────────────────────────────────────
         // 🇹🇼 .tw domain direct Risky: skip all validation entirely.
         //    SMTP cannot probe .tw domains reliably — return Risky immediately.
         // ─────────────────────────────────────────────────────────
@@ -1633,7 +1769,13 @@ module.exports = function bulkValidatorRouter(deps) {
         // ccTLD domains should NOT be marked risky here anymore.
         // They should flow into SendGrid-direct decision:
         //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
-        if (isBankOrHealthcare) {
+        // Also, .edu/.gov must not take this early return so webhook-final
+        // SendGrid outcome can be used consistently (single + bulk parity).
+        if (
+          isBankOrHealthcare &&
+          !String(domain || "").toLowerCase().endsWith(".edu") &&
+          !String(domain || "").toLowerCase().endsWith(".gov")
+        ) {
           const subStatus = 'bank_healthcare_domain';
           const message = 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
 
@@ -1781,6 +1923,7 @@ module.exports = function bulkValidatorRouter(deps) {
           };
         } else {
           const tld = String(domain || "").toLowerCase().split(".").pop() || "";
+          const isEduGovDomain = tld === "edu" || tld === "gov";
           const isTargetSendgridSuffix =
             tld === "us" ||
             tld === "uk" ||
@@ -1791,17 +1934,21 @@ module.exports = function bulkValidatorRouter(deps) {
             tld === "br";
 
           const shouldSendgridDirect =
-            isBankOrHealthcare || ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
+            isEduGovDomain ||
+            isBankOrHealthcare ||
+            ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
 
         // ───────────────────────────────────────────────────────
-        // 1) BANK/HEALTHCARE OR (PROOFPOINT/MIMECAST + target suffix) → SENDGRID FIRST
+        // 1) .EDU/.GOV OR BANK/HEALTHCARE OR (PROOFPOINT/MIMECAST + target suffix) → SENDGRID FIRST
         // ───────────────────────────────────────────────────────
           if (shouldSendgridDirect) {
-            const domainCategory = isBankOrHealthcare
-              ? getDomainCategory(domain)
-              : isMimecast
-                ? "Mimecast Email Security"
-                : "Proofpoint Email Protection";
+            const domainCategory = isEduGovDomain
+              ? "Educational/Government Domain"
+              : isBankOrHealthcare
+                ? getDomainCategory(domain)
+                : isMimecast
+                  ? "Mimecast Email Security"
+                  : "Proofpoint Email Protection";
 
             console.log(`\n${"=".repeat(60)}`);
             if (isBankOrHealthcare && (isProofpoint || isMimecast)) {
@@ -1946,52 +2093,56 @@ module.exports = function bulkValidatorRouter(deps) {
             // ── CATCH-ALL CHECK for Proofpoint/Mimecast domains ──────────────────
             // Before sending via SendGrid, probe a random address on the domain.
             // If the domain is catch-all → return Risky immediately (skip SendGrid).
-            logger('catchall_check', `Checking if ${domain} is catch-all before SendGrid`, 'info');
-            try {
-              // probeIfNotCached: false — Proofpoint/Mimecast gateways always accept
-              // emails at SMTP level, so an SMTP probe is meaningless AND very slow
-              // (60-90s across multiple MX hosts). Only check the in-memory cache here.
-              const isCatchAll = await checkDomainCatchAll(domain, { logger, probeIfNotCached: false });
-              if (isCatchAll) {
-                logger('catchall_check', `Domain ${domain} is catch-all → returning Risky directly`, 'warn');
-                const catchAllFinal = {
-                  email: E,
-                  status: 'Risky',
-                  subStatus: 'catch_all',
-                  confidence: 0.75,
-                  category: 'risky',
-                  reason: 'Catch-All Domain',
-                  message: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
-                  domain,
-                  domainProvider: domainCategory,
-                  isDisposable: false,
-                  isFree: false,
-                  isRoleBased: false,
-                  score: 30,
-                  timestamp: new Date(),
-                  section: 'bulk',
-                };
-                await replaceLatest(EmailLog, E, { email: E, ...catchAllFinal });
-                await replaceLatest(UserEmailLog, E, { email: E, ...catchAllFinal });
-                const catchAllCat = getOutcomeCategory(catchAllFinal);
-                await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, catchAllCat);
-                try {
-                  sendStatusToFrontend(E, catchAllFinal.status, catchAllFinal.timestamp, {
-                    domain: catchAllFinal.domain, provider: catchAllFinal.domainProvider,
-                    isDisposable: false, isFree: false, isRoleBased: false, score: catchAllFinal.score,
-                    subStatus: catchAllFinal.subStatus, confidence: catchAllFinal.confidence,
-                    category: catchAllFinal.category, message: catchAllFinal.message, reason: catchAllFinal.reason,
-                  }, sessionId, true, username);
-                } catch {}
-                return {
-                  Email: E, Status: 'Risky', Timestamp: new Date(catchAllFinal.timestamp).toLocaleString(),
-                  Domain: domain, Provider: domainCategory, Disposable: 'No', Free: 'No',
-                  RoleBased: 'No', Score: 30, SubStatus: 'catch_all', Confidence: 0.75,
-                  Category: 'risky', Message: catchAllFinal.message, Reason: catchAllFinal.reason, Source: 'Live',
-                };
+            if (!isEduGovDomain) {
+              logger('catchall_check', `Checking if ${domain} is catch-all before SendGrid`, 'info');
+              try {
+                // probeIfNotCached: false — Proofpoint/Mimecast gateways always accept
+                // emails at SMTP level, so an SMTP probe is meaningless AND very slow
+                // (60-90s across multiple MX hosts). Only check the in-memory cache here.
+                const isCatchAll = await checkDomainCatchAll(domain, { logger, probeIfNotCached: false });
+                if (isCatchAll) {
+                  logger('catchall_check', `Domain ${domain} is catch-all → returning Risky directly`, 'warn');
+                  const catchAllFinal = {
+                    email: E,
+                    status: 'Risky',
+                    subStatus: 'catch_all',
+                    confidence: 0.75,
+                    category: 'risky',
+                    reason: 'Catch-All Domain',
+                    message: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
+                    domain,
+                    domainProvider: domainCategory,
+                    isDisposable: false,
+                    isFree: false,
+                    isRoleBased: false,
+                    score: 30,
+                    timestamp: new Date(),
+                    section: 'bulk',
+                  };
+                  await replaceLatest(EmailLog, E, { email: E, ...catchAllFinal });
+                  await replaceLatest(UserEmailLog, E, { email: E, ...catchAllFinal });
+                  const catchAllCat = getOutcomeCategory(catchAllFinal);
+                  await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, catchAllCat);
+                  try {
+                    sendStatusToFrontend(E, catchAllFinal.status, catchAllFinal.timestamp, {
+                      domain: catchAllFinal.domain, provider: catchAllFinal.domainProvider,
+                      isDisposable: false, isFree: false, isRoleBased: false, score: catchAllFinal.score,
+                      subStatus: catchAllFinal.subStatus, confidence: catchAllFinal.confidence,
+                      category: catchAllFinal.category, message: catchAllFinal.message, reason: catchAllFinal.reason,
+                    }, sessionId, true, username);
+                  } catch {}
+                  return {
+                    Email: E, Status: 'Risky', Timestamp: new Date(catchAllFinal.timestamp).toLocaleString(),
+                    Domain: domain, Provider: domainCategory, Disposable: 'No', Free: 'No',
+                    RoleBased: 'No', Score: 30, SubStatus: 'catch_all', Confidence: 0.75,
+                    Category: 'risky', Message: catchAllFinal.message, Reason: catchAllFinal.reason, Source: 'Live',
+                  };
+                }
+              } catch (catchAllErr) {
+                logger('catchall_check_error', `Catch-all check failed: ${catchAllErr.message} → proceeding with SendGrid`, 'warn');
               }
-            } catch (catchAllErr) {
-              logger('catchall_check_error', `Catch-all check failed: ${catchAllErr.message} → proceeding with SendGrid`, 'warn');
+            } else {
+              logger('catchall_check', `Skipping catch-all probe for .edu/.gov domain ${domain} and proceeding directly to SendGrid`, 'info');
             }
 
             // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
