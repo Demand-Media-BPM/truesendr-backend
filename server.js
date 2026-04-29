@@ -165,18 +165,17 @@ app.use(compression());
 // ✅ Razorpay webhook needs RAW body for signature verification
 app.use("/api/payment", bodyParser.raw({ type: "application/json" }));
 
-
 app.use((req, res, next) => {
-  // ✅ Razorpay webhook must keep raw body untouched
   if (req.originalUrl.startsWith("/api/payment")) return next();
 
-  // SNS sometimes sends text/plain
   if (req.headers["x-amz-sns-message-type"]) {
-    return bodyParser.text({ type: "*/*" })(req, res, next);
+    return bodyParser.text({ type: "*/*", limit: "25mb" })(req, res, next);
   }
 
-  return bodyParser.json()(req, res, next);
+  return bodyParser.json({ limit: "25mb" })(req, res, next);
 });
+
+app.use(bodyParser.urlencoded({ extended: true, limit: "25mb" }));
 
 
 const upload = multer({
