@@ -2408,6 +2408,7 @@ function confidenceFrom(result, enhancedSignals) {
   if (result.status === 'deliverable') c = 0.85;
   if (result.status === 'undeliverable') c = 0.95;
   if (result.status === 'risky' && result.sub_status === 'catch_all') c = 0.75;
+  if (result.status === 'risky' && result.sub_status === 'antispam_system') c = 0.8;
   if (result.status === 'unknown') c = 0.4;
   if (enhancedSignals.realBetterThanBogus) c += 0.08;
   if (enhancedSignals.nullSenderAgreesDeliverable) c += 0.05;
@@ -2539,7 +2540,12 @@ async function checkMailbox(mxHost, sender, rcpt, provider, domain, gatewayName,
     realNullEnh: null,
     realBetterThanBogus: false,
     nullSenderAgreesDeliverable: false,
-    nullSenderAgreesUndeliverable: false
+    nullSenderAgreesUndeliverable: false,
+    antispamEvidence: {
+      providerFingerprint: false,
+      randomAcceptedCount: 0,
+      defensiveTempCount: 0
+    }
   };
   const trustedGateway = detectTrustedGateway(mxHost, provider, gatewayName);
 
@@ -2693,6 +2699,20 @@ async function checkMailbox(mxHost, sender, rcpt, provider, domain, gatewayName,
     const isCatchAll = b1IsCatchAll || (b2.code >= 200 && b2.code < 300);
     signals.bogusEnh = b1.enh || b2.enh || null;
 
+    const randomAcceptedCount = [b1, b2].filter((x) => x.code >= 200 && x.code < 300).length;
+    const defensiveTempCount = [b1, b2].filter((x) => x.code === 421 || x.code === 451).length;
+    const providerFingerprint =
+      !!gatewayName ||
+      /proofpoint|pphosted|ppe-hosted|mimecast|mcsv\.net|barracuda|trendmicro|messagelabs|topsec|sophos|iphmx|protection\.outlook\.com/i.test(
+        `${provider || ''} ${mxHost || ''}`
+      );
+
+    signals.antispamEvidence = {
+      providerFingerprint,
+      randomAcceptedCount,
+      defensiveTempCount
+    };
+
     // ── CACHE catch-all result for this domain ──────────────────────────────
     // Subsequent emails on the same domain will be served from cache instantly.
     catchAllCache.set(domain, { isCatchAll, until: Date.now() + CATCHALL_TTL_MS });
@@ -2707,9 +2727,22 @@ async function checkMailbox(mxHost, sender, rcpt, provider, domain, gatewayName,
       base = { status: 'risky', sub_status: 'catch_all' };
     }
 
-    // IMPORTANT: do NOT "upgrade" catch-all to accepted for Google Workspace
+    // Anti-spam inference (ZeroBounce-like behavior):
+    // known anti-spam gateway + random address acceptance / defensive temp responses
+    // => mark as risky antispam_system
+    const antispamDetected =
+      providerFingerprint &&
+      (randomAcceptedCount >= 1 || defensiveTempCount >= 1) &&
+      base.status !== 'undeliverable';
+
+    if (antispamDetected) {
+      base = { status: 'risky', sub_status: 'antispam_system' };
+    }
+
+    // IMPORTANT: do NOT "upgrade" catch-all or antispam domains to accepted
     if (
       isCatchAll &&
+      !antispamDetected &&
       betterThan(signals.realEnh, signals.bogusEnh) &&
       !providerIsMimecast &&
       !isGoogleProvider
@@ -2751,16 +2784,16 @@ async function checkMailbox(mxHost, sender, rcpt, provider, domain, gatewayName,
       socket.write('QUIT\r\n');
     } catch {}
 
-    // Trusted gateways (e.g. Proofpoint) with catch-all: keep 2xx as deliverable
-    if (isCatchAll && base.status === 'deliverable' && !signals.realBetterThanBogus) {
-      if (trustedGateway === 'proofpoint') {
-        const sub =
-          base.sub_status && base.sub_status !== 'catch_all'
-            ? base.sub_status
-            : 'gateway_accepted';
-        return { result: { ...base, status: 'deliverable', sub_status: sub }, signals };
-      }
-      return { result: { status: 'risky', sub_status: 'catch_all' }, signals };
+    // Trusted gateways (e.g. Proofpoint) with catch-all should remain risky,
+    // because random addresses are accepted and mailbox existence is masked.
+    if (isCatchAll && !signals.realBetterThanBogus) {
+      return {
+        result: {
+          status: 'risky',
+          sub_status: antispamDetected ? 'antispam_system' : 'catch_all',
+        },
+        signals
+      };
     }
     return { result: base, signals };
   } catch {
@@ -3323,6 +3356,11 @@ async function validateSMTP(email, opts = {}) {
       'Google Workspace catch-all domain; this mailbox cannot be reliably verified via SMTP and may not exist.';
   } else if (
     result.status === 'risky' &&
+    result.sub_status === 'antispam_system'
+  ) {
+    reason = 'SMTP behavior suggests an anti-spam gateway (random-address acceptance / defensive responses), so mailbox status is masked.';
+  } else if (
+    result.status === 'risky' &&
     String(result.sub_status).includes('catch_all')
   ) {
     reason = 'Domain accepts any address at RCPT (catch-all).';
@@ -3383,7 +3421,8 @@ async function validateSMTP(email, opts = {}) {
       result.sub_status === 'm365_ambiguous_5xx' ||
       result.sub_status === 'bank_domain_policy' ||
       result.sub_status === 'high_risk_domain_policy' ||
-      result.sub_status === 'trained_domain_high_risky_history')
+      result.sub_status === 'trained_domain_high_risky_history' ||
+      result.sub_status === 'antispam_system')
   )
     extras.provisional = true;
   if (result.status === 'unknown') extras.provisional = true;

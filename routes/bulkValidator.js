@@ -808,6 +808,26 @@ module.exports = function bulkValidatorRouter(deps) {
     return normalizeOutcomeCategory(final?.category || final?.status || "");
   }
 
+  function normalizeAntispamOutcome(payload) {
+    if (!payload || typeof payload !== "object") return payload;
+
+    const sub = String(
+      payload.subStatus || payload.sub_status || "",
+    ).toLowerCase();
+
+    if (sub !== "antispam_system") return payload;
+
+    const next = { ...payload };
+    next.status = "Risky";
+    next.category = "risky";
+    next.reason = "Antispam System";
+    next.message =
+      "Mailbox is protected by an anti-spam gateway, so direct SMTP verification is inconclusive. Classified as risky.";
+    if (typeof next.score !== "number" || Number.isNaN(next.score)) next.score = 40;
+
+    return next;
+  }
+
   // ───────────────────────────────────────────────────────────
   // helper: bump live counters + WS (can be immediate or batched by context)
   // ───────────────────────────────────────────────────────────
@@ -2242,7 +2262,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 isFree: !!merged.isFree,
               });
 
-              final = {
+              final = normalizeAntispamOutcome({
                 email: E,
                 status,
                 subStatus,
@@ -2261,7 +2281,7 @@ module.exports = function bulkValidatorRouter(deps) {
                     : (result.score ?? 50),
                 timestamp: new Date(),
                 section: "bulk",
-              };
+              });
 
               await replaceLatest(EmailLog, E, { email: E, ...final });
               await replaceLatest(UserEmailLog, E, { email: E, ...final });
@@ -2416,7 +2436,7 @@ const history = await getHistoryCached(E);
                   isFree: !!merged.isFree,
                 });
 
-                final = {
+                final = normalizeAntispamOutcome({
                   email: E,
                   status,
                   subStatus,
@@ -2435,7 +2455,7 @@ const history = await getHistoryCached(E);
                       : (sgTrueSendrResult.score ?? 50),
                   timestamp: new Date(),
                   section: "bulk",
-                };
+                });
 
                 await replaceLatest(EmailLog, E, { email: E, ...final });
                 await replaceLatest(UserEmailLog, E, { email: E, ...final });
@@ -2474,7 +2494,7 @@ const history = await getHistoryCached(E);
                   },
                 );
 
-                final = {
+                final = normalizeAntispamOutcome({
                   email: E,
                   status: prelim.status,
                   subStatus: subStatusP,
@@ -2496,7 +2516,7 @@ const history = await getHistoryCached(E);
                       ? prelim.score
                       : (prelimRaw.score ?? 0),
                   section: "bulk",
-                };
+                });
 
                 await replaceLatest(EmailLog, E, { email: E, ...final });
                 await replaceLatest(UserEmailLog, E, { email: E, ...final });
@@ -2662,7 +2682,7 @@ const history = await getHistoryCached(E);
                         isFree: !!merged.isFree,
                       });
 
-                      final = {
+                      final = normalizeAntispamOutcome({
                         email: E,
                         status,
                         subStatus,
@@ -2682,7 +2702,7 @@ const history = await getHistoryCached(E);
                             : (sgTrueSendrResult.score ?? 50),
                         timestamp: new Date(),
                         section: "bulk",
-                      };
+                      });
 
                       await replaceLatest(EmailLog, E, { email: E, ...final });
                       await replaceLatest(UserEmailLog, E, {
@@ -2737,7 +2757,7 @@ const history = await getHistoryCached(E);
                       },
                     );
 
-                    final = {
+                    final = normalizeAntispamOutcome({
                       email: E,
                       status: stable.status,
                       subStatus: subStatusS,
@@ -2757,7 +2777,7 @@ const history = await getHistoryCached(E);
                       score:
                         typeof stable.score === "number" ? stable.score : 0,
                       section: "bulk",
-                    };
+                    });
 
                     await replaceLatest(EmailLog, E, { email: E, ...final });
                     await replaceLatest(UserEmailLog, E, {

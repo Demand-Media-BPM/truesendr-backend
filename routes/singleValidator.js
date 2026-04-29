@@ -267,11 +267,20 @@ module.exports = function singleValidatorRouter(deps) {
           ? rawResult.confidence
           : null;
 
-    const built = buildReasonAndMessage(status, subStatus, {
-      isDisposable: !!merged.isDisposable,
-      isRoleBased: !!merged.isRoleBased,
-      isFree: !!merged.isFree,
-    });
+      const built = buildReasonAndMessage(status, subStatus, {
+        isDisposable: !!merged.isDisposable,
+        isRoleBased: !!merged.isRoleBased,
+        isFree: !!merged.isFree,
+      });
+
+      const mappedCategory =
+        String(subStatus || "").toLowerCase() === "antispam_system"
+          ? "risky"
+          : category;
+      const mappedStatus =
+        String(subStatus || "").toLowerCase() === "antispam_system"
+          ? "Risky"
+          : status;
 
     const domain = merged.domain || extractDomain(E);
     const provider =
@@ -279,10 +288,10 @@ module.exports = function singleValidatorRouter(deps) {
 
     const payload = {
       email: E,
-      status,
+      status: mappedStatus,
       subStatus,
       confidence,
-      category,
+      category: mappedCategory,
       reason: merged.reason || built.reasonLabel,
       message: merged.message || built.message,
       domain,
@@ -294,6 +303,12 @@ module.exports = function singleValidatorRouter(deps) {
       timestamp: rawResult.timestamp instanceof Date ? rawResult.timestamp : new Date(),
       section: "single",
     };
+
+    if (String(payload.subStatus || "").toLowerCase() === "antispam_system") {
+      payload.reason = "Antispam System";
+      payload.message =
+        "Mailbox is protected by an anti-spam gateway, so direct SMTP verification is inconclusive. Classified as risky.";
+    }
 
     // ─────────────────────────────────────────────────────────
     // 🏦 Bank domain override: if validation returned Valid AND
