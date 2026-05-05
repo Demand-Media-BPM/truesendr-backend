@@ -305,6 +305,45 @@ module.exports = function bulkValidatorRouter(deps) {
     };
   }
 
+  function syntaxInvalidResultRow(rawEmail) {
+    const E = String(rawEmail || "").trim();
+    return {
+      Email: E,
+      Status: "Invalid",
+      Timestamp: new Date().toLocaleString(),
+      Domain: extractDomain(E),
+      Provider: "Unavailable",
+      Disposable: "No",
+      Free: "No",
+      RoleBased: "No",
+      Score: 0,
+      SubStatus: "invalid_syntax",
+      Confidence: 1,
+      Category: "invalid",
+      Message: "Invalid email syntax. This address was skipped from SMTP validation.",
+      Reason: "Invalid Syntax",
+      Source: "Syntax",
+    };
+  }
+
+  function collectSyntaxInvalidResultRows(rows, emailCol) {
+    const resultRows = [];
+
+    for (const r of rows || []) {
+      if (isEmptyOrJunkRow(r, emailCol)) continue;
+
+      const raw = String(r[emailCol] ?? "").trim();
+      if (!raw) continue;
+
+      const e = normEmail(raw);
+      if (EMAIL_RE.test(e)) continue;
+
+      resultRows.push(syntaxInvalidResultRow(raw));
+    }
+
+    return resultRows;
+  }
+
   async function checkDomainExistence(domain) {
     const d = String(domain || "").toLowerCase().trim();
     if (!d || d === "n/a") return { state: "invalid", reason: "missing_domain" };
@@ -1090,6 +1129,7 @@ module.exports = function bulkValidatorRouter(deps) {
     UserEmailLog,
     UserBulkStat,
     toValidate,
+    syntaxInvalidResultRows = [],
   ) {
     console.log(
       `🔄 [BULK][${bulkId}] Regenerating result file with updated statuses...`,
@@ -1247,6 +1287,10 @@ module.exports = function bulkValidatorRouter(deps) {
       };
     });
 
+    if (syntaxInvalidResultRows.length) {
+      printable.push(...syntaxInvalidResultRows);
+    }
+
     // Recalculate category counts
     const catCounts = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
     for (const row of printable) {
@@ -1325,6 +1369,17 @@ module.exports = function bulkValidatorRouter(deps) {
 
     const initialTotal =
       meta.uniqueValid || meta.creditsRequired || meta.cleanedRows || 0;
+    const syntaxInvalidCharge =
+      skipInvalidFormat && meta.state === "needs_fix"
+        ? meta.invalidFormatRemaining || meta.invalidFormat || 0
+        : 0;
+    const creditsNeededForRun = initialTotal + syntaxInvalidCharge;
+
+    const user = await User.findOne({ username });
+    if (!user) return res.status(404).send("User not found");
+    if ((user.credits || 0) < creditsNeededForRun) {
+      return res.status(400).send("You don't have enough credits");
+    }
 
     await UserBulkStat.updateOne(
       { bulkId },
@@ -1405,6 +1460,34 @@ module.exports = function bulkValidatorRouter(deps) {
       }
 
       const total = toValidate.length;
+
+      let syntaxInvalidResultRows = [];
+      if (
+        skipInvalidFormat &&
+        (meta.invalidFormatRemaining || meta.invalidFormat) > 0 &&
+        meta.originalFileId
+      ) {
+        try {
+          const originalBuffer = await readGridFSToBuffer(
+            username,
+            meta.originalFileId,
+          );
+          const originalParsed = readWorkbookFromBuffer(originalBuffer);
+          const originalEmailCol =
+            meta.emailCol || detectEmailCol(originalParsed.rows);
+          if (originalEmailCol) {
+            syntaxInvalidResultRows = collectSyntaxInvalidResultRows(
+              originalParsed.rows,
+              originalEmailCol,
+            );
+          }
+        } catch (e) {
+          console.warn(
+            `[BULK][${bulkId}] Unable to collect syntax-invalid rows:`,
+            e.message,
+          );
+        }
+      }
 
       // ---- init progress (WS + DB) ----
       sendProgressToFrontend(0, total, sessionId, username, bulkId);
@@ -2998,6 +3081,7 @@ const history = await getHistoryCached(E);
               UserEmailLog,
               UserBulkStat,
               toValidate,
+              syntaxInvalidResultRows,
             );
 
           const finalCreditsUsed =
@@ -3088,7 +3172,9 @@ const history = await getHistoryCached(E);
             `✅ [BULK][${bulkId}] No SendGrid emails - completing immediately`,
           );
 
-          const printable = processed.filter(Boolean);
+          const printable = processed
+            .filter(Boolean)
+            .concat(syntaxInvalidResultRows);
           const catCounts = { valid: 0, invalid: 0, risky: 0, unknown: 0 };
           for (const row of printable) {
             const k = String(row.Category || "unknown").toLowerCase();
@@ -3342,16 +3428,20 @@ const history = await getHistoryCached(E);
     const items = docs.map((d) => {
       const processedCounts =
         (d.valid || 0) + (d.invalid || 0) + (d.risky || 0) + (d.unknown || 0);
+      const completedResultTotal =
+        d.state === "done" && processedCounts > 0 ? processedCounts : 0;
 
       const processed =
-        typeof d.progressCurrent === "number"
+        completedResultTotal ||
+        (typeof d.progressCurrent === "number"
           ? d.progressCurrent
-          : processedCounts;
+          : processedCounts);
 
       const total =
-        typeof d.progressTotal === "number" && d.progressTotal > 0
+        completedResultTotal ||
+        (typeof d.progressTotal === "number" && d.progressTotal > 0
           ? d.progressTotal
-          : d.uniqueValid || d.creditsRequired || 0;
+          : d.uniqueValid || d.creditsRequired || 0);
 
       const pct =
         total > 0 ? Math.min(100, Math.round((processed / total) * 100)) : 0;
@@ -3647,20 +3737,28 @@ const history = await getHistoryCached(E);
         )
         .lean();
 
-      const items = docs.map((d) => ({
-        bulkId: d.bulkId,
-        name: d.originalName || "EnteredManually",
-        emails: d.uniqueValid || d.creditsRequired || 0,
-        status: d.state,
-        createdAt: d.createdAt || null,
-        startedAt: d.startedAt || null,
-        completedAt: d.finishedAt || null,
-        canDownload: !!d.resultFileId,
-        valid: d.valid || 0,
-        invalid: d.invalid || 0,
-        risky: d.risky || 0,
-        unknown: d.unknown || 0,
-      }));
+      const items = docs.map((d) => {
+        const resultTotal =
+          (d.valid || 0) + (d.invalid || 0) + (d.risky || 0) + (d.unknown || 0);
+
+        return {
+          bulkId: d.bulkId,
+          name: d.originalName || "EnteredManually",
+          emails:
+            d.state === "done" && resultTotal > 0
+              ? resultTotal
+              : d.uniqueValid || d.creditsRequired || 0,
+          status: d.state,
+          createdAt: d.createdAt || null,
+          startedAt: d.startedAt || null,
+          completedAt: d.finishedAt || null,
+          canDownload: !!d.resultFileId,
+          valid: d.valid || 0,
+          invalid: d.invalid || 0,
+          risky: d.risky || 0,
+          unknown: d.unknown || 0,
+        };
+      });
 
       res.json({ items });
     } catch (err) {
