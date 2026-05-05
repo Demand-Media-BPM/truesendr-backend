@@ -23,6 +23,7 @@ const {
 const { checkDomainCatchAll } = require("../utils/smtpValidator");
 
 const SendGridLog = require("../models/SendGridLog");
+const Domain = require("../models/Domain");
 const dns = require("dns").promises;
 
 const {
@@ -2193,59 +2194,138 @@ module.exports = function bulkValidatorRouter(deps) {
               }
             }
 
-            // ── CATCH-ALL CHECK for Proofpoint/Mimecast domains ──────────────────
-            // Before sending via SendGrid, probe a random address on the domain.
-            // If the domain is catch-all → return Risky immediately (skip SendGrid).
+            // ── ANTISPAM DOMAIN MEMORY + RANDOM PROBE (for direct SendGrid domains) ──
             if (!isEduGovDomain) {
-              logger('catchall_check', `Checking if ${domain} is catch-all before SendGrid`, 'info');
               try {
-                // probeIfNotCached: false — Proofpoint/Mimecast gateways always accept
-                // emails at SMTP level, so an SMTP probe is meaningless AND very slow
-                // (60-90s across multiple MX hosts). Only check the in-memory cache here.
-                const isCatchAll = await checkDomainCatchAll(domain, { logger, probeIfNotCached: false });
-                if (isCatchAll) {
-                  logger('catchall_check', `Domain ${domain} is catch-all → returning Risky directly`, 'warn');
-                  const catchAllFinal = {
+                const domainLower = String(domain || "").toLowerCase().trim();
+
+                const knownAntispamDomain = await Domain.findOne({
+                  domain: domainLower,
+                  $or: [
+                    { isAntiSpamSystem: true },
+                    { category: "antispam_system" },
+                    { category: "antispam" },
+                    { category: "risky_antispam" },
+                    { status: "antispam_system" },
+                  ],
+                }).lean();
+
+                if (knownAntispamDomain) {
+                  logger("antispam_domain_cache", `Domain ${domainLower} already recorded as antispam_system`, "info");
+                  const antispamFinal = {
                     email: E,
-                    status: 'Risky',
-                    subStatus: 'catch_all',
-                    confidence: 0.75,
-                    category: 'risky',
-                    reason: 'Catch-All Domain',
-                    message: 'Domain accepts any randomly generated address at SMTP (catch-all). All emails on this domain are marked risky.',
+                    status: "Risky",
+                    subStatus: "antispam_system",
+                    confidence: 0.85,
+                    category: "risky",
+                    reason: "Antispam System",
+                    message: "This domain is recorded as anti-spam protected (random mailbox accepted earlier), so all addresses are treated as risky.",
                     domain,
                     domainProvider: domainCategory,
                     isDisposable: false,
                     isFree: false,
                     isRoleBased: false,
-                    score: 30,
+                    score: 35,
                     timestamp: new Date(),
-                    section: 'bulk',
+                    section: "bulk",
                   };
-                  await replaceLatest(EmailLog, E, { email: E, ...catchAllFinal });
-                  await replaceLatest(UserEmailLog, E, { email: E, ...catchAllFinal });
-                  const catchAllCat = getOutcomeCategory(catchAllFinal);
-                  await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, catchAllCat);
+                  await replaceLatest(EmailLog, E, { email: E, ...antispamFinal });
+                  await replaceLatest(UserEmailLog, E, { email: E, ...antispamFinal });
+
+                  const antispamCat = getOutcomeCategory(antispamFinal);
+                  await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, antispamCat);
                   try {
-                    sendStatusToFrontend(E, catchAllFinal.status, catchAllFinal.timestamp, {
-                      domain: catchAllFinal.domain, provider: catchAllFinal.domainProvider,
-                      isDisposable: false, isFree: false, isRoleBased: false, score: catchAllFinal.score,
-                      subStatus: catchAllFinal.subStatus, confidence: catchAllFinal.confidence,
-                      category: catchAllFinal.category, message: catchAllFinal.message, reason: catchAllFinal.reason,
+                    sendStatusToFrontend(E, antispamFinal.status, antispamFinal.timestamp, {
+                      domain: antispamFinal.domain,
+                      provider: antispamFinal.domainProvider,
+                      isDisposable: false,
+                      isFree: false,
+                      isRoleBased: false,
+                      score: antispamFinal.score,
+                      subStatus: antispamFinal.subStatus,
+                      confidence: antispamFinal.confidence,
+                      category: antispamFinal.category,
+                      message: antispamFinal.message,
+                      reason: antispamFinal.reason,
                     }, sessionId, true, username);
                   } catch {}
+
                   return {
-                    Email: E, Status: 'Risky', Timestamp: new Date(catchAllFinal.timestamp).toLocaleString(),
-                    Domain: domain, Provider: domainCategory, Disposable: 'No', Free: 'No',
-                    RoleBased: 'No', Score: 30, SubStatus: 'catch_all', Confidence: 0.75,
-                    Category: 'risky', Message: catchAllFinal.message, Reason: catchAllFinal.reason, Source: 'Live',
+                    Email: E, Status: "Risky", Timestamp: new Date(antispamFinal.timestamp).toLocaleString(),
+                    Domain: domain, Provider: domainCategory, Disposable: "No", Free: "No",
+                    RoleBased: "No", Score: 35, SubStatus: "antispam_system", Confidence: 0.85,
+                    Category: "risky", Message: antispamFinal.message, Reason: antispamFinal.reason, Source: "Live",
+                  };
+                }
+
+                logger("antispam_probe", `Running random-address probe for domain ${domainLower}`, "info");
+                const isCatchAll = await checkDomainCatchAll(domainLower, { logger, probeIfNotCached: true });
+
+                if (isCatchAll) {
+                  logger("antispam_probe", `Random address accepted for ${domainLower}; recording domain as antispam_system`, "warn");
+
+                  try {
+                    await Domain.findOneAndUpdate(
+                      { domain: domainLower },
+                      {
+                        $setOnInsert: { domain: domainLower },
+                        $set: {
+                          isAntiSpamSystem: true,
+                          category: "antispam_system",
+                          status: "antispam_system",
+                          source: "random_sendgrid_probe",
+                          updatedAt: new Date(),
+                        },
+                      },
+                      { upsert: true, new: true }
+                    );
+                  } catch (persistErr) {
+                    logger("antispam_domain_persist_error", `Failed to persist antispam domain memory: ${persistErr.message}`, "warn");
+                  }
+
+                  const antispamFinal = {
+                    email: E,
+                    status: "Risky",
+                    subStatus: "antispam_system",
+                    confidence: 0.85,
+                    category: "risky",
+                    reason: "Antispam System",
+                    message: "Random mailbox on this domain was accepted, indicating anti-spam/catch-all shielding. Marked as risky.",
+                    domain,
+                    domainProvider: domainCategory,
+                    isDisposable: false,
+                    isFree: false,
+                    isRoleBased: false,
+                    score: 35,
+                    timestamp: new Date(),
+                    section: "bulk",
+                  };
+                  await replaceLatest(EmailLog, E, { email: E, ...antispamFinal });
+                  await replaceLatest(UserEmailLog, E, { email: E, ...antispamFinal });
+
+                  const antispamCat = getOutcomeCategory(antispamFinal);
+                  await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, antispamCat);
+                  try {
+                    sendStatusToFrontend(E, antispamFinal.status, antispamFinal.timestamp, {
+                      domain: antispamFinal.domain, provider: antispamFinal.domainProvider,
+                      isDisposable: false, isFree: false, isRoleBased: false, score: antispamFinal.score,
+                      subStatus: antispamFinal.subStatus, confidence: antispamFinal.confidence,
+                      category: antispamFinal.category, message: antispamFinal.message, reason: antispamFinal.reason,
+                    }, sessionId, true, username);
+                  } catch {}
+
+                  return {
+                    Email: E, Status: "Risky", Timestamp: new Date(antispamFinal.timestamp).toLocaleString(),
+                    Domain: domain, Provider: domainCategory, Disposable: "No", Free: "No",
+                    RoleBased: "No", Score: 35, SubStatus: "antispam_system", Confidence: 0.85,
+                    Category: "risky", Message: antispamFinal.message, Reason: antispamFinal.reason, Source: "Live",
                   };
                 }
               } catch (catchAllErr) {
-                logger('catchall_check_error', `Catch-all check failed: ${catchAllErr.message} → proceeding with SendGrid`, 'warn');
+                logger("antispam_probe_error", `Antispam random-address probe failed: ${catchAllErr.message} → proceeding with SendGrid`, "warn");
               }
             } else {
-              logger('catchall_check', `Skipping catch-all probe for .edu/.gov domain ${domain} and proceeding directly to SendGrid`, 'info');
+              logger("antispam_probe", `Skipping random-address antispam probe for .edu/.gov domain ${domain}`, "info");
             }
 
             // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
