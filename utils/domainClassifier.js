@@ -638,6 +638,17 @@ const MANUAL_HIGH_RISK_DOMAINS = [
   'cort.com',
   'uscellular.com',
   'kearney.com',
+  'nsmu.edu',
+  'buffalostate.edu',
+  'colorado.edu',
+  'uconn.edu',
+  'nsu.edu',
+  'gatech.edu',
+  'gwcu.org',
+  'tscbank.com',
+  'publicisgroupe.com',
+  'eaton.com',
+  
 
 ];
 
