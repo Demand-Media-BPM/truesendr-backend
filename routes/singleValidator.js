@@ -557,7 +557,7 @@ module.exports = function singleValidatorRouter(deps) {
     const isMimecast = await isMimecastDomain(domain);
 
     const tld = String(domain || "").toLowerCase().split(".").pop() || "";
-    const isEduGovDomain = tld === "edu" || tld === "gov";
+    const isEduGovOrgDomain = tld === "edu" || tld === "gov" || tld === "org";
     const isTargetSendgridSuffix =
       tld === "us" ||
       tld === "uk" ||
@@ -630,14 +630,14 @@ module.exports = function singleValidatorRouter(deps) {
     }
 
     const shouldSendgridDirect =
-      isEduGovDomain ||
+      isEduGovOrgDomain ||
       isBankOrHealthcare ||
       ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
 
     if (!shouldSendgridDirect) return null;
 
-    const domainCategory = isEduGovDomain
-      ? "Educational/Government Domain"
+    const domainCategory = isEduGovOrgDomain
+      ? "Educational/Government/Organization Domain"
       : isBankOrHealthcare
         ? getDomainCategory(domain)
         : isMimecast
@@ -645,6 +645,51 @@ module.exports = function singleValidatorRouter(deps) {
           : "Proofpoint Email Protection";
 
     const logger = mkLogger(sessionId, E, username);
+
+    // Exception rule:
+    // For .edu domains, if SMTP says mailbox_not_found, do NOT send via SendGrid.
+    // Return SMTP result directly.
+    if (tld === "edu") {
+      try {
+        logger("edu_smtp_precheck", `Running SMTP pre-check for .edu before SendGrid routing`, "info");
+        const eduSmtp = await validateSMTP(E, { logger });
+        const eduSub = String(eduSmtp?.sub_status || eduSmtp?.subStatus || "").toLowerCase();
+
+        if (eduSub === "mailbox_not_found") {
+          logger("edu_smtp_precheck", `SMTP returned mailbox_not_found for .edu; skipping SendGrid`, "info");
+
+          const { EmailLog: UserEmailLog2 } = getUserDb(
+            mongoose,
+            EmailLog,
+            RegionStat,
+            DomainReputation,
+            username,
+          );
+
+          const historyEdu = await buildHistoryForEmail(E);
+          return finalizeAndRespond({
+            E,
+            rawResult: {
+              ...eduSmtp,
+              domain: eduSmtp.domain || domain,
+              provider: eduSmtp.provider || eduSmtp.domainProvider || "Unavailable",
+            },
+            history: historyEdu,
+            idemKey,
+            username,
+            sessionId,
+            EmailLogModel: EmailLog,
+            UserEmailLogModel: UserEmailLog2,
+            via: "smtp-edu-mailbox-not-found",
+            cached: false,
+            res,
+            shouldCache: true,
+          });
+        }
+      } catch (eduCheckErr) {
+        logger("edu_smtp_precheck_error", `SMTP pre-check failed for .edu: ${eduCheckErr.message}. Continuing SendGrid flow.`, "warn");
+      }
+    }
 
     // Resolve user DB model
     const { EmailLog: UserEmailLog2 } = getUserDb(
@@ -661,7 +706,7 @@ module.exports = function singleValidatorRouter(deps) {
     //    random email on same domain.
     // 2) If accepted, record domain as antispam.
     // 3) Future validations on that domain should always be Risky/antispam_system.
-    if (!isEduGovDomain) {
+    if (!isEduGovOrgDomain) {
       try {
         const domainLower = String(domain || "").toLowerCase().trim();
 
@@ -822,7 +867,7 @@ module.exports = function singleValidatorRouter(deps) {
         logger("antispam_probe_error", `Antispam random-address probe failed: ${antispamErr.message} → proceeding with normal SendGrid flow`, "warn");
       }
     } else {
-      logger("antispam_probe", `Skipping random-address antispam probe for .edu/.gov domain ${domain}`, "info");
+      logger("antispam_probe", `Skipping random-address antispam probe for .edu/.gov/.org domain ${domain}`, "info");
     }
 
     // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
@@ -849,8 +894,8 @@ module.exports = function singleValidatorRouter(deps) {
       const user = await User.findOne({ username });
       
     const viaLabel =
-      isEduGovDomain
-        ? "sendgrid-edu-gov"
+      isEduGovOrgDomain
+        ? "sendgrid-edu-gov-org"
         : isBankOrHealthcare && isProofpoint
           ? "sendgrid-bank-healthcare-proofpoint"
           : isBankOrHealthcare
@@ -881,8 +926,8 @@ module.exports = function singleValidatorRouter(deps) {
     const sgResult = await verifySendGrid(E, { logger });
 
       const viaLabel =
-        isEduGovDomain
-          ? "sendgrid-edu-gov"
+        isEduGovOrgDomain
+          ? "sendgrid-edu-gov-org"
           : isBankOrHealthcare && isProofpoint
             ? "sendgrid-bank-healthcare-proofpoint"
             : isBankOrHealthcare
@@ -1179,15 +1224,22 @@ module.exports = function singleValidatorRouter(deps) {
     // New rule (provider-based):
     // If provider is Google/Outlook family, invoke SendGrid only when SMTP is risky
     // and domain reputation is not in bad/high-risk state.
-    if (isGoogleOrOutlookProvider) {
-      const cat = String(smtpRaw.category || categoryFromStatus(smtpRaw.status || "")).toLowerCase();
-      if (cat !== "risky") return null;
+    const tld = String(domain || "").toLowerCase().split(".").pop() || "";
+    const isEduGovOrgDomain = tld === "edu" || tld === "gov" || tld === "org";
+    const smtpCategoryLower = String(
+      smtpRaw.category || categoryFromStatus(smtpRaw.status || "")
+    ).toLowerCase();
+
+    if (isEduGovOrgDomain) {
+      // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
+      if (smtpCategoryLower !== "risky" && smtpCategoryLower !== "unknown") return null;
+    } else if (isGoogleOrOutlookProvider) {
+      if (smtpCategoryLower !== "risky") return null;
 
       const repCheck = await checkHighBounceDomain(domain);
       if (repCheck?.block) return null;
     } else {
-      const cat = smtpRaw.category || categoryFromStatus(smtpRaw.status || "");
-      if (String(cat).toLowerCase() !== "unknown") return null;
+      if (smtpCategoryLower !== "unknown") return null;
     }
 
     const logger = mkLogger(sessionId, E, username);

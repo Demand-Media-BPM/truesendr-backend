@@ -2027,7 +2027,7 @@ module.exports = function bulkValidatorRouter(deps) {
           };
         } else {
           const tld = String(domain || "").toLowerCase().split(".").pop() || "";
-          const isEduGovDomain = tld === "edu" || tld === "gov";
+          const isEduGovOrgDomain = tld === "edu" || tld === "gov" || tld === "org";
           const isTargetSendgridSuffix =
             tld === "us" ||
             tld === "uk" ||
@@ -2038,7 +2038,7 @@ module.exports = function bulkValidatorRouter(deps) {
             tld === "br";
 
           const shouldSendgridDirect =
-            isEduGovDomain ||
+            isEduGovOrgDomain ||
             isBankOrHealthcare ||
             ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
 
@@ -2046,13 +2046,117 @@ module.exports = function bulkValidatorRouter(deps) {
         // 1) .EDU/.GOV OR BANK/HEALTHCARE OR (PROOFPOINT/MIMECAST + target suffix) → SENDGRID FIRST
         // ───────────────────────────────────────────────────────
           if (shouldSendgridDirect) {
-            const domainCategory = isEduGovDomain
-              ? "Educational/Government Domain"
+            const domainCategory = isEduGovOrgDomain
+              ? "Educational/Government/Organization Domain"
               : isBankOrHealthcare
                 ? getDomainCategory(domain)
                 : isMimecast
                   ? "Mimecast Email Security"
                   : "Proofpoint Email Protection";
+
+            // Exception rule:
+            // For .edu domains, if SMTP says mailbox_not_found, do NOT send via SendGrid.
+            // Return SMTP result directly.
+            if (tld === "edu") {
+              try {
+                logger("edu_smtp_precheck", `Running SMTP pre-check for .edu before SendGrid routing`, "info");
+                const eduSmtpRaw = await validateSMTP(E, {
+                  logger,
+                  trainingTag: "bulk",
+                });
+
+                const eduHistory = await getHistoryCached(E);
+                const eduMerged = mergeSMTPWithHistory(eduSmtpRaw, eduHistory, {
+                  domain: eduSmtpRaw.domain || extractDomain(E),
+                  provider: eduSmtpRaw.provider || "Unavailable",
+                });
+
+                const eduSubStatus = String(
+                  eduMerged.sub_status || eduMerged.subStatus || "",
+                ).toLowerCase();
+
+                if (eduSubStatus === "mailbox_not_found") {
+                  logger("edu_smtp_precheck", `SMTP returned mailbox_not_found for .edu; skipping SendGrid`, "info");
+
+                  const eduCat = eduMerged.category || categoryFromStatus(eduMerged.status);
+                  const eduBuilt = buildReasonAndMessage(
+                    eduMerged.status,
+                    eduMerged.sub_status || eduMerged.subStatus || null,
+                    {
+                      isDisposable: !!eduMerged.isDisposable,
+                      isRoleBased: !!eduMerged.isRoleBased,
+                      isFree: !!eduMerged.isFree,
+                    },
+                  );
+
+                  const eduFinal = {
+                    email: E,
+                    status: eduMerged.status || "Invalid",
+                    subStatus: eduMerged.sub_status || eduMerged.subStatus || "mailbox_not_found",
+                    confidence:
+                      typeof eduMerged.confidence === "number"
+                        ? eduMerged.confidence
+                        : null,
+                    category: eduCat || "invalid",
+                    reason: eduMerged.reason || eduBuilt.reasonLabel,
+                    message: eduMerged.message || eduBuilt.message,
+                    domain: eduMerged.domain || domain,
+                    domainProvider: eduMerged.provider || "Unavailable",
+                    isDisposable: !!eduMerged.isDisposable,
+                    isFree: !!eduMerged.isFree,
+                    isRoleBased: !!eduMerged.isRoleBased,
+                    score:
+                      typeof eduMerged.score === "number"
+                        ? eduMerged.score
+                        : 0,
+                    timestamp: new Date(),
+                    section: "bulk",
+                  };
+
+                  await replaceLatest(EmailLog, E, { email: E, ...eduFinal });
+                  await replaceLatest(UserEmailLog, E, { email: E, ...eduFinal });
+
+                  const eduOutcomeCat = getOutcomeCategory(eduFinal);
+                  await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, eduOutcomeCat);
+
+                  try {
+                    sendStatusToFrontend(E, eduFinal.status, eduFinal.timestamp, {
+                      domain: eduFinal.domain,
+                      provider: eduFinal.domainProvider,
+                      isDisposable: !!eduFinal.isDisposable,
+                      isFree: !!eduFinal.isFree,
+                      isRoleBased: !!eduFinal.isRoleBased,
+                      score: eduFinal.score,
+                      subStatus: eduFinal.subStatus,
+                      confidence: eduFinal.confidence,
+                      category: eduFinal.category,
+                      message: eduFinal.message,
+                      reason: eduFinal.reason,
+                    }, sessionId, true, username);
+                  } catch {}
+
+                  return {
+                    Email: E,
+                    Status: eduFinal.status ? eduFinal.status.replace(/^[^a-zA-Z0-9]+/, "") : "Invalid",
+                    Timestamp: new Date(eduFinal.timestamp).toLocaleString(),
+                    Domain: eduFinal.domain,
+                    Provider: eduFinal.domainProvider,
+                    Disposable: eduFinal.isDisposable ? "Yes" : "No",
+                    Free: eduFinal.isFree ? "Yes" : "No",
+                    RoleBased: eduFinal.isRoleBased ? "Yes" : "No",
+                    Score: typeof eduFinal.score === "number" ? eduFinal.score : 0,
+                    SubStatus: eduFinal.subStatus || "",
+                    Confidence: typeof eduFinal.confidence === "number" ? eduFinal.confidence : "",
+                    Category: eduFinal.category || "invalid",
+                    Message: eduFinal.message || "",
+                    Reason: eduFinal.reason || "",
+                    Source: "Live",
+                  };
+                }
+              } catch (eduCheckErr) {
+                logger("edu_smtp_precheck_error", `SMTP pre-check failed for .edu: ${eduCheckErr.message}. Continuing SendGrid flow.`, "warn");
+              }
+            }
 
             console.log(`\n${"=".repeat(60)}`);
             if (isBankOrHealthcare && (isProofpoint || isMimecast)) {
@@ -2195,7 +2299,7 @@ module.exports = function bulkValidatorRouter(deps) {
             }
 
             // ── ANTISPAM DOMAIN MEMORY + RANDOM PROBE (for direct SendGrid domains) ──
-            if (!isEduGovDomain) {
+            if (!isEduGovOrgDomain) {
               try {
                 const domainLower = String(domain || "").toLowerCase().trim();
 
@@ -2325,7 +2429,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 logger("antispam_probe_error", `Antispam random-address probe failed: ${catchAllErr.message} → proceeding with SendGrid`, "warn");
               }
             } else {
-              logger("antispam_probe", `Skipping random-address antispam probe for .edu/.gov domain ${domain}`, "info");
+              logger("antispam_probe", `Skipping random-address antispam probe for .edu/.gov/.org domain ${domain}`, "info");
             }
 
             // Proofpoint / Mimecast: skip SMTP (they greylist/block probes) → go directly to SendGrid
@@ -2488,9 +2592,17 @@ module.exports = function bulkValidatorRouter(deps) {
             const isGoogleOrOutlookProviderPrelim =
               /google|gmail|outlook|microsoft/.test(prelimProviderText);
 
+            const prelimCategoryLower = String(prelimRaw.category || "").toLowerCase();
+            const prelimTld = String(domain || "").toLowerCase().split(".").pop() || "";
+            const isEduGovOrgPrelim = prelimTld === "edu" || prelimTld === "gov" || prelimTld === "org";
+
             let shouldRunSendGridFallbackPrelim = false;
-            if (isGoogleOrOutlookProviderPrelim) {
-              if (String(prelimRaw.category || "").toLowerCase() === "risky") {
+            if (isEduGovOrgPrelim) {
+              // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
+              shouldRunSendGridFallbackPrelim =
+                prelimCategoryLower === "risky" || prelimCategoryLower === "unknown";
+            } else if (isGoogleOrOutlookProviderPrelim) {
+              if (prelimCategoryLower === "risky") {
                 const rep = await DomainReputation.findOne({ domain }).lean();
                 const sent = Number(rep?.sent || 0);
                 const invalid = Number(rep?.invalid || 0);
@@ -2499,8 +2611,7 @@ module.exports = function bulkValidatorRouter(deps) {
                 shouldRunSendGridFallbackPrelim = !isHighBounceBlocked;
               }
             } else {
-              shouldRunSendGridFallbackPrelim =
-                String(prelimRaw.category || "").toLowerCase() === "unknown";
+              shouldRunSendGridFallbackPrelim = prelimCategoryLower === "unknown";
             }
 
             if (shouldRunSendGridFallbackPrelim) {
@@ -2719,9 +2830,17 @@ const history = await getHistoryCached(E);
                   const isGoogleOrOutlookProviderStable =
                     /google|gmail|outlook|microsoft/.test(stableProviderText);
 
+                  const stableCategoryLower = String(stableRaw.category || "").toLowerCase();
+                  const stableTld = String(domain || "").toLowerCase().split(".").pop() || "";
+                  const isEduGovOrgStable = stableTld === "edu" || stableTld === "gov" || stableTld === "org";
+
                   let shouldRunSendGridFallbackStable = false;
-                  if (isGoogleOrOutlookProviderStable) {
-                    if (String(stableRaw.category || "").toLowerCase() === "risky") {
+                  if (isEduGovOrgStable) {
+                    // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
+                    shouldRunSendGridFallbackStable =
+                      stableCategoryLower === "risky" || stableCategoryLower === "unknown";
+                  } else if (isGoogleOrOutlookProviderStable) {
+                    if (stableCategoryLower === "risky") {
                       const rep = await DomainReputation.findOne({ domain }).lean();
                       const sent = Number(rep?.sent || 0);
                       const invalid = Number(rep?.invalid || 0);
@@ -2730,8 +2849,7 @@ const history = await getHistoryCached(E);
                       shouldRunSendGridFallbackStable = !isHighBounceBlocked;
                     }
                   } else {
-                    shouldRunSendGridFallbackStable =
-                      String(stableRaw.category || "").toLowerCase() === "unknown";
+                    shouldRunSendGridFallbackStable = stableCategoryLower === "unknown";
                   }
 
                   if (shouldRunSendGridFallbackStable) {
