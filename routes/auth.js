@@ -38,6 +38,16 @@ function normalizeNamePart(s) {
   );
 }
 
+function isStrongPassword(password) {
+  const value = String(password || "");
+  const hasMinLength = value.length >= 8;
+  const hasUppercase = /[A-Z]/.test(value);
+  const hasDigit = /\d/.test(value);
+  const hasSpecial = /[!@#$%^&*()\-_=+[{\]}\\|;:'",<.>/?`~]/.test(value);
+
+  return hasMinLength && hasUppercase && hasDigit && hasSpecial;
+}
+
 // ✅ Block free mail providers at signup (business email only)
 const FREE_EMAIL_DOMAINS = new Set([
   "gmail.com",
@@ -195,6 +205,14 @@ router.post("/auth/request-code", async (req, res) => {
       return res
         .status(400)
         .json({ ok: false, message: "All fields are required." });
+    }
+
+    if (!isStrongPassword(password)) {
+      return res.status(400).json({
+        ok: false,
+        message:
+          "Password must be at least 8 characters and include 1 uppercase letter, 1 number, and 1 special character.",
+      });
     }
 
     // reCAPTCHA check
@@ -577,10 +595,11 @@ router.post("/auth/reset-password", async (req, res) => {
         .status(400)
         .json({ ok: false, message: "Passwords do not match." });
     }
-    if (String(newPassword).length < 6) {
+    if (!isStrongPassword(newPassword)) {
       return res.status(400).json({
         ok: false,
-        message: "Password must be at least 6 characters.",
+        message:
+          "Password must be at least 8 characters and include 1 uppercase letter, 1 number, and 1 special character.",
       });
     }
 
