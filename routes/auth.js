@@ -38,6 +38,7 @@ function normalizeNamePart(s) {
   );
 }
 
+
 function isStrongPassword(password) {
   const value = String(password || "");
   const hasMinLength = value.length >= 8;
