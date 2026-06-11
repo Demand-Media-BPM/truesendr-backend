@@ -780,6 +780,8 @@ const EmailFinderRouter = require("./routes/EmailFinder");
 const ToxicityCheckerRouter = require("./routes/ToxicityChecker")(routeDeps);
 const FileCleanerRouter = require("./routes/fileCleaner");
 const paymentRoutes = require("./routes/payment")(routeDeps);
+const dbDeleteRouter = require("./routes/dbDelete")(routeDeps);
+
 
 
 // 🆕 NEW: Training / dataset routes (Bouncer import, domain stats)
@@ -798,6 +800,8 @@ app.use("/api/training", TrainingRouter);
 app.use("/api/phone", phoneValidatorRoutes);
 app.use("/api/payment", paymentRoutes);
 app.use("/api/profile", profileRoutes);
+app.use("/api/admin", dbDeleteRouter);
+
 
 
 /* ✅ NEW: deliverability route must be mounted as factory to receive deps */
