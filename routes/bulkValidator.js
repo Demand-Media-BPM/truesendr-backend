@@ -36,6 +36,7 @@ const {
 } = require("../utils/domainClassifier");
 
 const SENDGRID_VALID_SETTLE_MS = +(process.env.SENDGRID_VALID_SETTLE_MS || 5000);
+const TRAINING_SAMPLE_BYPASS_MS = 15 * 24 * 60 * 60 * 1000; // 15 days
 
 module.exports = function bulkValidatorRouter(deps) {
   const {
@@ -368,6 +369,67 @@ module.exports = function bulkValidatorRouter(deps) {
   // ───────────────────────────────────────────────────────────
   // Domain/provider + training history helper (MERGED)
   // ───────────────────────────────────────────────────────────
+  async function getFreshTrainingSampleByEmail(emailNorm) {
+    const E = normEmail(emailNorm);
+    const doc = await TrainingSample.findOne({ email: E }).lean();
+    if (!doc) return null;
+
+    const lastSeen = doc.lastSeenAt || doc.updatedAt || doc.createdAt || null;
+    if (!lastSeen) return null;
+
+    const isFresh = Date.now() - new Date(lastSeen).getTime() <= TRAINING_SAMPLE_BYPASS_MS;
+    if (!isFresh) return null;
+
+    return doc;
+  }
+
+  function mapTrainingLabelToResult(label) {
+    const l = String(label || "").toLowerCase();
+    if (l === "valid") {
+      return {
+        status: "Valid",
+        category: "valid",
+        subStatus: "training_sample_recent",
+        confidence: 0.9,
+        score: 85,
+        reason: "Recent Training Sample",
+        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+      };
+    }
+    if (l === "invalid") {
+      return {
+        status: "Invalid",
+        category: "invalid",
+        subStatus: "training_sample_recent",
+        confidence: 0.9,
+        score: 5,
+        reason: "Recent Training Sample",
+        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+      };
+    }
+    if (l === "risky") {
+      return {
+        status: "Risky",
+        category: "risky",
+        subStatus: "training_sample_recent",
+        confidence: 0.85,
+        score: 40,
+        reason: "Recent Training Sample",
+        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+      };
+    }
+
+    return {
+      status: "Unknown",
+      category: "unknown",
+      subStatus: "training_sample_recent_unknown",
+      confidence: 0.7,
+      score: 50,
+      reason: "Recent Training Sample",
+      message: "This email was found in recent training data (within 15 days) but mapped to unknown.",
+    };
+  }
+
   async function buildHistoryForEmail(emailNorm) {
     const E = normEmail(emailNorm);
     const domain = extractDomain(E);
@@ -1828,6 +1890,76 @@ module.exports = function bulkValidatorRouter(deps) {
             Category: "risky", Message: twFinal.message, Reason: twFinal.reason, Source: "Live",
           };
         }
+        const trainingSample = await getFreshTrainingSampleByEmail(E);
+        if (trainingSample) {
+          const mapped = mapTrainingLabelToResult(trainingSample.lastLabel);
+          const trainingFinal = {
+            email: E,
+            status: mapped.status,
+            subStatus: mapped.subStatus,
+            confidence: mapped.confidence,
+            category: mapped.category,
+            reason: mapped.reason,
+            message: mapped.message,
+            domain,
+            domainProvider: trainingSample.provider || "Training Sample",
+            isDisposable: false,
+            isFree: false,
+            isRoleBased: false,
+            score: mapped.score,
+            timestamp: new Date(),
+            section: "bulk",
+          };
+
+          await replaceLatest(EmailLog, E, { email: E, ...trainingFinal });
+          await replaceLatest(UserEmailLog, E, { email: E, ...trainingFinal });
+
+          const trainingCat = getOutcomeCategory(trainingFinal);
+          await bumpLiveCounts(UserBulkStat, bulkId, username, sessionId, trainingCat);
+
+          try {
+            sendStatusToFrontend(
+              E,
+              trainingFinal.status,
+              trainingFinal.timestamp,
+              {
+                domain: trainingFinal.domain,
+                provider: trainingFinal.domainProvider,
+                isDisposable: false,
+                isFree: false,
+                isRoleBased: false,
+                score: trainingFinal.score,
+                subStatus: trainingFinal.subStatus,
+                confidence: trainingFinal.confidence,
+                category: trainingFinal.category,
+                message: trainingFinal.message,
+                reason: trainingFinal.reason,
+              },
+              sessionId,
+              false,
+              username,
+            );
+          } catch {}
+
+          return {
+            Email: E,
+            Status: trainingFinal.status,
+            Timestamp: new Date(trainingFinal.timestamp).toLocaleString(),
+            Domain: trainingFinal.domain,
+            Provider: trainingFinal.domainProvider,
+            Disposable: "No",
+            Free: "No",
+            RoleBased: "No",
+            Score: trainingFinal.score,
+            SubStatus: trainingFinal.subStatus || "",
+            Confidence: trainingFinal.confidence,
+            Category: trainingFinal.category,
+            Message: trainingFinal.message,
+            Reason: trainingFinal.reason,
+            Source: "Training Sample",
+          };
+        }
+
         const domainClassification = classifyDomain(domain) || {};
         const isBankOrHealthcare =
           !!domainClassification &&

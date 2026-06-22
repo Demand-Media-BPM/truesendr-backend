@@ -31,12 +31,18 @@ const dns = require("dns").promises;
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
 const { classifyDomain, getDomainCategory, hasBankWordInDomain, isTwDomain, isManualHighRiskDomain } = require("../utils/domainClassifier");
+const { remember, DEFAULT_TTLS } = require("../utils/validationCache");
+const {
+  evaluateEarlyRisk,
+  shouldUseSendGridDirect,
+} = require("../utils/antispamDecisionEngine");
 
 // ── SendGrid result cache TTL: 15 days ────────────────────────────────────────
 // Email addresses validated via SendGrid are stored for 15 days so that
 // re-validation within that window returns the cached result instead of
 // re-sending through SendGrid.
 const SENDGRID_CACHE_TTL_MS = 15 * 24 * 60 * 60 * 1000; // 1 296 000 000 ms
+const TRAINING_SAMPLE_BYPASS_MS = 15 * 24 * 60 * 60 * 1000; // 15 days
 const DOMAIN_REP_MIN_SAMPLES = +(process.env.DOMAIN_REP_MIN_SAMPLES || 20);
 const DOMAIN_REP_BOUNCE_THRESHOLD = +(process.env.DOMAIN_REP_BOUNCE_THRESHOLD || 0.60);
 const SENDGRID_VALID_SETTLE_MS = +(process.env.SENDGRID_VALID_SETTLE_MS || 5000);
@@ -129,27 +135,31 @@ module.exports = function singleValidatorRouter(deps) {
     const d = String(domain || "").toLowerCase().trim();
     if (!d || d === "n/a") return { state: "invalid", reason: "missing_domain" };
 
-    try {
-      const mx = await dns.resolveMx(d);
-      if (Array.isArray(mx) && mx.length > 0) return { state: "exists" };
-      return { state: "invalid", reason: "no_mx" };
-    } catch (err) {
-      const code = String(err?.code || "").toUpperCase();
-      if (["ENOTFOUND", "NXDOMAIN", "ENODATA", "NOTFOUND"].includes(code)) {
-        return { state: "invalid", reason: "dns_not_found", code };
+    return remember("domainExistence", d, DEFAULT_TTLS.domainExistenceMs, async () => {
+      try {
+        const mx = await dns.resolveMx(d);
+        if (Array.isArray(mx) && mx.length > 0) return { state: "exists" };
+        return { state: "invalid", reason: "no_mx" };
+      } catch (err) {
+        const code = String(err?.code || "").toUpperCase();
+        if (["ENOTFOUND", "NXDOMAIN", "ENODATA", "NOTFOUND"].includes(code)) {
+          return { state: "invalid", reason: "dns_not_found", code };
+        }
+        if (["ETIMEOUT", "ESERVFAIL", "SERVFAIL", "EAI_AGAIN", "REFUSED", "FORMERR"].includes(code)) {
+          return { state: "unknown", reason: "dns_transient", code };
+        }
+        return { state: "unknown", reason: "dns_unknown_error", code };
       }
-      if (["ETIMEOUT", "ESERVFAIL", "SERVFAIL", "EAI_AGAIN", "REFUSED", "FORMERR"].includes(code)) {
-        return { state: "unknown", reason: "dns_transient", code };
-      }
-      return { state: "unknown", reason: "dns_unknown_error", code };
-    }
+    });
   }
 
   async function checkHighBounceDomain(domain) {
     const d = String(domain || "").toLowerCase().trim();
     if (!d || d === "n/a") return { block: false };
 
-    const rep = await DomainReputation.findOne({ domain: d }).lean();
+    const rep = await remember("domainReputation", d, DEFAULT_TTLS.reputationMs, () =>
+      DomainReputation.findOne({ domain: d }).lean()
+    );
     if (!rep) return { block: false };
 
     const sent = Number(rep.sent || 0);
@@ -166,6 +176,139 @@ module.exports = function singleValidatorRouter(deps) {
   // ────────────────────────────────────────────────────────────
   // Helper: build domain/provider + training history
   // ────────────────────────────────────────────────────────────
+  async function getFreshTrainingSampleByEmail(emailNorm) {
+    const E = normEmail(emailNorm);
+    const doc = await TrainingSample.findOne({ email: E }).lean();
+    if (!doc) return null;
+
+    const lastSeen = doc.lastSeenAt || doc.updatedAt || doc.createdAt || null;
+    if (!lastSeen) return null;
+
+    const isFresh = Date.now() - new Date(lastSeen).getTime() <= TRAINING_SAMPLE_BYPASS_MS;
+    if (!isFresh) return null;
+
+    return doc;
+  }
+
+  function mapTrainingLabelToResult(label) {
+    const l = String(label || "").toLowerCase();
+    if (l === "valid") {
+      return {
+        status: "Valid",
+        category: "valid",
+        subStatus: "training_sample_recent",
+        confidence: 0.9,
+        score: 85,
+        reason: "Recent Training Sample",
+        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+      };
+    }
+    if (l === "invalid") {
+      return {
+        status: "Invalid",
+        category: "invalid",
+        subStatus: "training_sample_recent",
+        confidence: 0.9,
+        score: 5,
+        reason: "Recent Training Sample",
+        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+      };
+    }
+    if (l === "risky") {
+      return {
+        status: "Risky",
+        category: "risky",
+        subStatus: "training_sample_recent",
+        confidence: 0.85,
+        score: 40,
+        reason: "Recent Training Sample",
+        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+      };
+    }
+
+    return {
+      status: "Unknown",
+      category: "unknown",
+      subStatus: "training_sample_recent_unknown",
+      confidence: 0.7,
+      score: 50,
+      reason: "Recent Training Sample",
+      message: "This email was found in recent training data (within 15 days) but mapped to unknown.",
+    };
+  }
+
+  async function maybeBypassWithRecentTrainingSample({
+    E,
+    username,
+    sessionId,
+    idemKey,
+    EmailLogModel,
+    UserEmailLogModel,
+    res,
+    logger,
+  }) {
+    const training = await getFreshTrainingSampleByEmail(E);
+    if (!training) return null;
+
+    const mapped = mapTrainingLabelToResult(training.lastLabel);
+    const domain = extractDomain(E);
+    const payload = {
+      email: E,
+      status: mapped.status,
+      subStatus: mapped.subStatus,
+      confidence: mapped.confidence,
+      category: mapped.category,
+      reason: mapped.reason,
+      message: mapped.message,
+      domain,
+      domainProvider: training.provider || "Training Sample",
+      isDisposable: false,
+      isFree: false,
+      isRoleBased: false,
+      score: mapped.score,
+      timestamp: new Date(),
+      section: "single",
+    };
+
+    await replaceLatest(EmailLogModel, E, payload);
+    await replaceLatest(UserEmailLogModel, E, payload);
+
+    if (stableCache && payload.category !== "unknown") {
+      stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: payload });
+    }
+
+    const credits = await debitOneCreditIfNeeded(username, payload.status, E, idemKey, "single");
+
+    sendStatusToFrontend(
+      E,
+      payload.status,
+      payload.timestamp,
+      {
+        domain: payload.domain,
+        provider: payload.domainProvider,
+        isDisposable: payload.isDisposable,
+        isFree: payload.isFree,
+        isRoleBased: payload.isRoleBased,
+        score: payload.score,
+        subStatus: payload.subStatus,
+        confidence: payload.confidence,
+        category: payload.category,
+        message: payload.message,
+        reason: payload.reason,
+      },
+      sessionId,
+      false,
+      username,
+      "single"
+    );
+
+    if (logger) {
+      logger("training_sample_bypass", "Recent training sample hit (<=15 days) → returning directly without live verification", "info");
+    }
+
+    return res.json({ ...payload, via: "training-sample-bypass", cached: true, credits });
+  }
+
   async function buildHistoryForEmail(emailNorm) {
     const E = normEmail(emailNorm);
     const domain = extractDomain(E);
@@ -629,10 +772,12 @@ module.exports = function singleValidatorRouter(deps) {
       return res.json({ ...riskyEarlyPayload, via: 'early-risky', cached: false, inProgress: false, credits: earlyCredits });
     }
 
-    const shouldSendgridDirect =
-      isEduGovOrgDomain ||
-      isBankOrHealthcare ||
-      ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
+    const shouldSendgridDirect = shouldUseSendGridDirect({
+      tld,
+      isBankOrHealthcare,
+      isProofpoint,
+      isMimecast,
+    });
 
     if (!shouldSendgridDirect) return null;
 
@@ -1594,101 +1739,89 @@ module.exports = function singleValidatorRouter(deps) {
       // ─────────────────────────────────────────────────────────
       const repDomain = extractDomain(E);
       const repCheck = await checkHighBounceDomain(repDomain);
-      if (repCheck.block) {
+      const earlyRiskDecision = evaluateEarlyRisk({
+        domain: repDomain,
+        isManualHighRisk: isManualHighRiskDomain(repDomain),
+        isTwDomain: isTwDomain(repDomain),
+        isBankOrHealthcare: false,
+        highBounce: repCheck,
+      });
+
+      if (earlyRiskDecision) {
         const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
+        let providerName = "Unavailable";
+        try {
+          providerName = String((await remember("provider", repDomain, DEFAULT_TTLS.providerMs, () => detectProviderByMX(repDomain))) || "Unavailable");
+        } catch (_) {
+          providerName = "Unavailable";
+        }
+
         const riskyPayload = {
           email: E,
-          status: "Risky",
-          subStatus: "high_bounce_domain_reputation",
-          confidence: 0.92,
-          category: "risky",
-          reason: "High Bounce Domain Reputation",
-          message: `Domain ${repDomain} has high historical bounce rate (${(repCheck.bounceRate * 100).toFixed(1)}% across ${repCheck.sent} sends). Marked risky before sending.`,
+          status: earlyRiskDecision.status,
+          subStatus: earlyRiskDecision.subStatus,
+          confidence: earlyRiskDecision.confidence,
+          category: earlyRiskDecision.category,
+          reason: earlyRiskDecision.reason,
+          message: earlyRiskDecision.message,
           domain: repDomain,
-          domainProvider: "Domain Reputation",
+          domainProvider:
+            earlyRiskDecision.subStatus === "high_bounce_domain_reputation"
+              ? "Domain Reputation"
+              : providerName,
           isDisposable: false,
           isFree: false,
           isRoleBased: false,
-          score: 20,
+          score: earlyRiskDecision.score,
           timestamp: new Date(),
           section: "single",
         };
+
         await replaceLatest(EmailLog, E, riskyPayload);
         await replaceLatest(UserEmailLog2, E, riskyPayload);
         if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: riskyPayload });
         const credits = await debitOneCreditIfNeeded(username, riskyPayload.status, E, idemKey, "single");
         sendStatusToFrontend(E, riskyPayload.status, riskyPayload.timestamp, {
-          domain: riskyPayload.domain, provider: riskyPayload.domainProvider,
-          isDisposable: false, isFree: false, isRoleBased: false, score: riskyPayload.score,
-          subStatus: riskyPayload.subStatus, confidence: riskyPayload.confidence,
-          category: riskyPayload.category, message: riskyPayload.message, reason: riskyPayload.reason,
+          domain: riskyPayload.domain,
+          provider: riskyPayload.domainProvider,
+          isDisposable: false,
+          isFree: false,
+          isRoleBased: false,
+          score: riskyPayload.score,
+          subStatus: riskyPayload.subStatus,
+          confidence: riskyPayload.confidence,
+          category: riskyPayload.category,
+          message: riskyPayload.message,
+          reason: riskyPayload.reason,
         }, sessionId, true, username, "single");
-        return res.json({ ...riskyPayload, via: "domain-reputation-gate", cached: false, credits });
-      }
 
-      // ─────────────────────────────────────────────────────────
-      // 🧨 Manual high-risk domain direct Risky: skip all validation entirely.
-      //    Any domain listed in MANUAL_HIGH_RISK_DOMAINS should return Risky
-      //    immediately without SMTP/SendGrid probing.
-      // ─────────────────────────────────────────────────────────
-      if (isManualHighRiskDomain(extractDomain(E))) {
-        const riskyDomain = extractDomain(E);
-        console.log(`[single][manual_high_risk_direct] ${E} → domain "${riskyDomain}" is in manual high-risk list, returning Risky directly (no SMTP/SendGrid)`);
-        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
-        let manualProvider = "Unavailable";
-        try {
-          manualProvider = String((await detectProviderByMX(riskyDomain)) || "Unavailable");
-        } catch (_) {
-          manualProvider = "Unavailable";
-        }
-
-        const manualRiskyPayload = {
-          email: E, status: "Risky", subStatus: "high_risk_domain", confidence: 0.95,
-          category: "risky", reason: "Manual High-Risk Domain",
-          message: "This domain is configured under manual high-risk domains. Email is marked risky directly without validation.",
-          domain: riskyDomain, domainProvider: manualProvider, isDisposable: false,
-          isFree: false, isRoleBased: false, score: 25, timestamp: new Date(), section: "single",
+        const viaMap = {
+          high_bounce_domain_reputation: "domain-reputation-gate",
+          high_risk_domain: "manual-high-risk-direct",
+          tw_domain: "tw-direct",
         };
-        await replaceLatest(EmailLog, E, manualRiskyPayload);
-        await replaceLatest(UserEmailLog2, E, manualRiskyPayload);
-        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: manualRiskyPayload });
-        const credits = await debitOneCreditIfNeeded(username, manualRiskyPayload.status, E, idemKey, "single");
-        sendStatusToFrontend(E, manualRiskyPayload.status, manualRiskyPayload.timestamp, {
-          domain: manualRiskyPayload.domain, provider: manualRiskyPayload.domainProvider,
-          isDisposable: false, isFree: false, isRoleBased: false, score: manualRiskyPayload.score,
-          subStatus: manualRiskyPayload.subStatus, confidence: manualRiskyPayload.confidence,
-          category: manualRiskyPayload.category, message: manualRiskyPayload.message, reason: manualRiskyPayload.reason,
-        }, sessionId, true, username, "single");
-        return res.json({ ...manualRiskyPayload, via: "manual-high-risk-direct", cached: false, credits });
+        return res.json({ ...riskyPayload, via: viaMap[riskyPayload.subStatus] || "early-risky", cached: false, credits });
       }
 
-      // ─────────────────────────────────────────────────────────
-      // 🇹🇼 .tw domain direct Risky: skip all validation entirely.
-      //    SMTP cannot probe .tw domains reliably — return Risky immediately.
-      // ─────────────────────────────────────────────────────────
-      if (isTwDomain(extractDomain(E))) {
-        const twDomain = extractDomain(E);
-        console.log(`[single][tw_direct_risky] ${E} → domain "${twDomain}" ends with .tw, returning Risky directly (no SMTP/SendGrid)`);
-        const { EmailLog: UserEmailLog2 } = getUserDb(mongoose, EmailLog, RegionStat, DomainReputation, username);
-        const twPayload = {
-          email: E, status: "Risky", subStatus: "tw_domain", confidence: 0.9,
-          category: "risky", reason: "Restricted Country TLD",
-          message: "This address belongs to a Taiwanese domain (.tw). SMTP probing is unreliable for .tw domains and sending cold emails is risky.",
-          domain: twDomain, domainProvider: "Taiwan (.tw)", isDisposable: false,
-          isFree: false, isRoleBased: false, score: 30, timestamp: new Date(), section: "single",
-        };
-        await replaceLatest(EmailLog, E, twPayload);
-        await replaceLatest(UserEmailLog2, E, twPayload);
-        if (stableCache) stableCache.set(E, { until: Date.now() + (CACHE_TTL_MS || 0), result: twPayload });
-        const credits = await debitOneCreditIfNeeded(username, twPayload.status, E, idemKey, "single");
-        sendStatusToFrontend(E, twPayload.status, twPayload.timestamp, {
-          domain: twPayload.domain, provider: twPayload.domainProvider,
-          isDisposable: false, isFree: false, isRoleBased: false, score: twPayload.score,
-          subStatus: twPayload.subStatus, confidence: twPayload.confidence,
-          category: twPayload.category, message: twPayload.message, reason: twPayload.reason,
-        }, sessionId, true, username, "single");
-        return res.json({ ...twPayload, via: "tw-direct", cached: false, credits });
-      }
+      const { EmailLog: UserEmailLogBypass } = getUserDb(
+        mongoose,
+        EmailLog,
+        RegionStat,
+        DomainReputation,
+        username,
+      );
+
+      const trainingBypass = await maybeBypassWithRecentTrainingSample({
+        E,
+        username,
+        sessionId,
+        idemKey,
+        EmailLogModel: EmailLog,
+        UserEmailLogModel: UserEmailLogBypass,
+        res,
+        logger,
+      });
+      if (trainingBypass) return trainingBypass;
 
       // Freshest cache (global + user)
       const { best: cachedDb, UserEmailLog } = await getFreshestFromDBs(
@@ -2063,6 +2196,30 @@ module.exports = function singleValidatorRouter(deps) {
         }, sessionId, true, username, "single");
         await markPendingDone(username, E);
         return res.json({ ...twPayload, via: "tw-direct", cached: false, inProgress: false, credits: twCredits });
+      }
+
+      // training-sample bypass (recent <= 15 days) before cache/SMTP/SendGrid
+      const { EmailLog: UserEmailLogBypass } = getUserDb(
+        mongoose,
+        EmailLog,
+        RegionStat,
+        DomainReputation,
+        username,
+      );
+
+      const trainingBypass = await maybeBypassWithRecentTrainingSample({
+        E,
+        username,
+        sessionId,
+        idemKey,
+        EmailLogModel: EmailLog,
+        UserEmailLogModel: UserEmailLogBypass,
+        res,
+        logger,
+      });
+      if (trainingBypass) {
+        await markPendingDone(username, E);
+        return trainingBypass;
       }
 
       // OPTIONAL UI pending (does not affect validation logic)
