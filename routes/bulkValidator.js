@@ -3320,7 +3320,7 @@ const history = await getHistoryCached(E);
       try {
         const processed = await mapWithConcurrency(
           toValidate,
-          Number(process.env.BULK_CONCURRENCY || 8),
+          200,
           worker,
           (done, total0) =>
             sendProgressToFrontend(done, total0, sessionId, username, bulkId),

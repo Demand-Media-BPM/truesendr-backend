@@ -1374,10 +1374,27 @@ module.exports = function singleValidatorRouter(deps) {
     const smtpCategoryLower = String(
       smtpRaw.category || categoryFromStatus(smtpRaw.status || "")
     ).toLowerCase();
+    const smtpSubStatusLower = String(
+      smtpRaw.sub_status || smtpRaw.subStatus || ""
+    ).toLowerCase();
 
     if (isEduGovOrgDomain) {
-      // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
+      // New requirement:
+      // For .org/.edu/.gov + Outlook provider + antispam_system, trust SMTP result directly.
+      // Only send via SendGrid when SMTP category is unknown.
+      if (
+        isGoogleOrOutlookProvider &&
+        smtpSubStatusLower === "antispam_system" &&
+        smtpCategoryLower !== "unknown"
+      ) {
+        return null;
+      }
+
       if (smtpCategoryLower !== "risky" && smtpCategoryLower !== "unknown") return null;
+
+      if (isGoogleOrOutlookProvider && smtpCategoryLower === "risky") {
+        return null;
+      }
     } else if (isGoogleOrOutlookProvider) {
       if (smtpCategoryLower !== "risky") return null;
 

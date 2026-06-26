@@ -3073,6 +3073,16 @@ async function validateSMTP(email, opts = {}) {
 
   // PROBING across MX hosts with our core checkMailboxWithEscalation
   let probe;
+
+  // Aggregate outcomes across all probed MX/profile attempts.
+  // This prevents "last probe wins" (e.g., accepted on one MX but unknown(network) on another).
+  const aggregate = {
+    seenDeliverableAccepted: false,
+    seenUndeliverable: false,
+    seenRisky: false,
+    seenUnknownNetwork: false,
+    networkFailedMxHosts: new Set(),
+  };
   try {
     const toTry = hosts.slice(0, 3).map((h) => h.exchange);
     outerLoop: for (const mxHost of (toTry.length ? toTry : [meta.domain])) {
@@ -3099,6 +3109,18 @@ async function validateSMTP(email, opts = {}) {
         probe = pr1;
         result.status = pr1.result.status;
         result.sub_status = pr1.result.sub_status;
+
+        if (pr1.result.status === 'deliverable' && pr1.result.sub_status === 'accepted') {
+          aggregate.seenDeliverableAccepted = true;
+        } else if (pr1.result.status === 'undeliverable') {
+          aggregate.seenUndeliverable = true;
+        } else if (pr1.result.status === 'risky') {
+          aggregate.seenRisky = true;
+        } else if (pr1.result.status === 'unknown' && pr1.result.sub_status === 'network') {
+          aggregate.seenUnknownNetwork = true;
+          aggregate.networkFailedMxHosts.add(mxHost);
+        }
+
         logger(
           'rcpt',
           `Result on ${mxHost} (profile ${idx + 1}): ${pr1.result.status} (${pr1.result.sub_status})`
@@ -3133,6 +3155,18 @@ async function validateSMTP(email, opts = {}) {
           probe = prX;
           result.status = prX.result.status;
           result.sub_status = prX.result.sub_status;
+
+          if (prX.result.status === 'deliverable' && prX.result.sub_status === 'accepted') {
+            aggregate.seenDeliverableAccepted = true;
+          } else if (prX.result.status === 'undeliverable') {
+            aggregate.seenUndeliverable = true;
+          } else if (prX.result.status === 'risky') {
+            aggregate.seenRisky = true;
+          } else if (prX.result.status === 'unknown' && prX.result.sub_status === 'network') {
+            aggregate.seenUnknownNetwork = true;
+            aggregate.networkFailedMxHosts.add(mxHost);
+          }
+
           logger(
             'rcpt',
             `Result on ${mxHost} (profile ${idx + 1}, attempt ${attempt}): ${prX.result.status} (${prX.result.sub_status})`
@@ -3408,6 +3442,17 @@ async function validateSMTP(email, opts = {}) {
   } else {
     reason = 'Network/unknown response.';
   }
+
+  if (
+    result.status === 'deliverable' &&
+    aggregate.seenUnknownNetwork &&
+    aggregate.networkFailedMxHosts.size > 0
+  ) {
+    reason += ` Some MX hosts were unreachable during probing: ${Array.from(
+      aggregate.networkFailedMxHosts
+    ).join(', ')}.`;
+  }
+
   if (owner?.exists) reason += ' Owner verification strengthened confidence';
 
   const extras = { confidence, reason, owner };
@@ -3426,6 +3471,14 @@ async function validateSMTP(email, opts = {}) {
   )
     extras.provisional = true;
   if (result.status === 'unknown') extras.provisional = true;
+
+  if (
+    result.status === 'deliverable' &&
+    aggregate.seenUnknownNetwork &&
+    aggregate.networkFailedMxHosts.size > 0
+  ) {
+    extras.provisional = true;
+  }
 
   const shaped = toServerShape(result, extras);
   logger('finish', `SMTP decision: ${shaped.category} (${shaped.sub_status})`);
