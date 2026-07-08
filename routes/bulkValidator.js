@@ -2159,7 +2159,8 @@ module.exports = function bulkValidatorRouter(deps) {
           };
         } else {
           const tld = String(domain || "").toLowerCase().split(".").pop() || "";
-          const isEduGovOrgDomain = tld === "edu" || tld === "gov" || tld === "org";
+          const isOutlookProviderDomain = /outlook|microsoft/.test(normalizedProvider);
+          const isEduGovOrgDomain = (tld === "edu" || tld === "gov" || tld === "org") && !isOutlookProviderDomain;
           const isTargetSendgridSuffix =
             tld === "us" ||
             tld === "uk" ||
@@ -2723,8 +2724,11 @@ module.exports = function bulkValidatorRouter(deps) {
             ).toLowerCase();
             const isGoogleOrOutlookProviderPrelim =
               /google|gmail|outlook|microsoft/.test(prelimProviderText);
+            const isOutlookProviderPrelim =
+              /outlook|microsoft/.test(prelimProviderText);
 
             const prelimCategoryLower = String(prelimRaw.category || "").toLowerCase();
+            const prelimSubStatusLower = String(prelimRaw.sub_status || prelimRaw.subStatus || "").toLowerCase();
             const prelimTld = String(domain || "").toLowerCase().split(".").pop() || "";
             const isEduGovOrgPrelim = prelimTld === "edu" || prelimTld === "gov" || prelimTld === "org";
 
@@ -2733,6 +2737,19 @@ module.exports = function bulkValidatorRouter(deps) {
               // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
               shouldRunSendGridFallbackPrelim =
                 prelimCategoryLower === "risky" || prelimCategoryLower === "unknown";
+            } else if (isOutlookProviderPrelim) {
+              const antispamFailLike =
+                prelimSubStatusLower === "antispam_system" ||
+                prelimSubStatusLower.includes("antispam") ||
+                prelimSubStatusLower.includes("spam") ||
+                prelimSubStatusLower.includes("greylist") ||
+                prelimSubStatusLower.includes("block") ||
+                prelimSubStatusLower.includes("reject");
+              const antispamUnknownLike =
+                prelimCategoryLower === "unknown" ||
+                prelimSubStatusLower.includes("unknown") ||
+                prelimSubStatusLower.includes("inconclusive");
+              shouldRunSendGridFallbackPrelim = antispamFailLike || antispamUnknownLike;
             } else if (isGoogleOrOutlookProviderPrelim) {
               if (prelimCategoryLower === "risky") {
                 const rep = await DomainReputation.findOne({ domain }).lean();
@@ -2961,8 +2978,11 @@ const history = await getHistoryCached(E);
                   ).toLowerCase();
                   const isGoogleOrOutlookProviderStable =
                     /google|gmail|outlook|microsoft/.test(stableProviderText);
+                  const isOutlookProviderStable =
+                    /outlook|microsoft/.test(stableProviderText);
 
                   const stableCategoryLower = String(stableRaw.category || "").toLowerCase();
+                  const stableSubStatusLower = String(stableRaw.sub_status || stableRaw.subStatus || "").toLowerCase();
                   const stableTld = String(domain || "").toLowerCase().split(".").pop() || "";
                   const isEduGovOrgStable = stableTld === "edu" || stableTld === "gov" || stableTld === "org";
 
@@ -2971,6 +2991,19 @@ const history = await getHistoryCached(E);
                     // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
                     shouldRunSendGridFallbackStable =
                       stableCategoryLower === "risky" || stableCategoryLower === "unknown";
+                  } else if (isOutlookProviderStable) {
+                    const antispamFailLike =
+                      stableSubStatusLower === "antispam_system" ||
+                      stableSubStatusLower.includes("antispam") ||
+                      stableSubStatusLower.includes("spam") ||
+                      stableSubStatusLower.includes("greylist") ||
+                      stableSubStatusLower.includes("block") ||
+                      stableSubStatusLower.includes("reject");
+                    const antispamUnknownLike =
+                      stableCategoryLower === "unknown" ||
+                      stableSubStatusLower.includes("unknown") ||
+                      stableSubStatusLower.includes("inconclusive");
+                    shouldRunSendGridFallbackStable = antispamFailLike || antispamUnknownLike;
                   } else if (isGoogleOrOutlookProviderStable) {
                     if (stableCategoryLower === "risky") {
                       const rep = await DomainReputation.findOne({ domain }).lean();

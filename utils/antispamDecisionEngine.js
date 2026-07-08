@@ -97,6 +97,7 @@ function shouldUseSendGridDirect({
   isBankOrHealthcare,
   isProofpoint,
   isMimecast,
+  isOutlookProvider = false,
 }) {
   const isEduGovOrgDomain = tld === "edu" || tld === "gov" || tld === "org";
   const isTargetSendgridSuffix =
@@ -108,8 +109,10 @@ function shouldUseSendGridDirect({
     tld === "ca" ||
     tld === "br";
 
+  const shouldUseEduGovOrgDirect = isEduGovOrgDomain && !isOutlookProvider;
+
   return (
-    isEduGovOrgDomain ||
+    shouldUseEduGovOrgDirect ||
     isBankOrHealthcare ||
     ((isProofpoint || isMimecast) && isTargetSendgridSuffix)
   );

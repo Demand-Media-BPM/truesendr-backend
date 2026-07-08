@@ -700,7 +700,6 @@ module.exports = function singleValidatorRouter(deps) {
     const isMimecast = await isMimecastDomain(domain);
 
     const tld = String(domain || "").toLowerCase().split(".").pop() || "";
-    const isEduGovOrgDomain = tld === "edu" || tld === "gov" || tld === "org";
     const isTargetSendgridSuffix =
       tld === "us" ||
       tld === "uk" ||
@@ -721,6 +720,8 @@ module.exports = function singleValidatorRouter(deps) {
     }
 
     const normalizedProvider = detectedProvider.toLowerCase();
+    const isOutlookProvider = /outlook|microsoft/.test(normalizedProvider);
+    const isEduGovOrgDomain = (tld === "edu" || tld === "gov" || tld === "org") && !isOutlookProvider;
     const isKnownPublicProvider =
       /gmail|google|outlook|microsoft|yahoo|icloud|zoho|aol|gmx|yandex|proton|fastmail/.test(normalizedProvider);
 
@@ -777,6 +778,7 @@ module.exports = function singleValidatorRouter(deps) {
       isBankOrHealthcare,
       isProofpoint,
       isMimecast,
+      isOutlookProvider,
     });
 
     if (!shouldSendgridDirect) return null;
@@ -1365,6 +1367,8 @@ module.exports = function singleValidatorRouter(deps) {
 
     const isGoogleOrOutlookProvider =
       /google|gmail|outlook|microsoft/.test(providerText);
+    const isOutlookProvider =
+      /outlook|microsoft/.test(providerText);
 
     // New rule (provider-based):
     // If provider is Google/Outlook family, invoke SendGrid only when SMTP is risky
@@ -1393,6 +1397,22 @@ module.exports = function singleValidatorRouter(deps) {
       if (smtpCategoryLower !== "risky" && smtpCategoryLower !== "unknown") return null;
 
       if (isGoogleOrOutlookProvider && smtpCategoryLower === "risky") {
+        return null;
+      }
+    } else if (isOutlookProvider) {
+      const antispamFailLike =
+        smtpSubStatusLower === "antispam_system" ||
+        smtpSubStatusLower.includes("antispam") ||
+        smtpSubStatusLower.includes("spam") ||
+        smtpSubStatusLower.includes("greylist") ||
+        smtpSubStatusLower.includes("block") ||
+        smtpSubStatusLower.includes("reject");
+      const antispamUnknownLike =
+        smtpCategoryLower === "unknown" ||
+        smtpSubStatusLower.includes("unknown") ||
+        smtpSubStatusLower.includes("inconclusive");
+
+      if (!antispamFailLike && !antispamUnknownLike) {
         return null;
       }
     } else if (isGoogleOrOutlookProvider) {

@@ -3,6 +3,7 @@ const express = require("express");
 const router = express.Router();
 const XLSX = require("xlsx");
 const TrainingSample = require("../models/TrainingSample");
+const DomainReputation = require("../models/DomainReputation");
 
 module.exports = function trainingRouter(deps) {
   const { upload, extractDomain } = deps;
@@ -106,6 +107,7 @@ module.exports = function trainingRouter(deps) {
       let invalidFormat = 0;
 
       const bulkOps = [];
+      const domainRepIncrements = new Map();
 
       for (const row of rows) {
         const emailRaw = row[emailCol];
@@ -127,6 +129,14 @@ module.exports = function trainingRouter(deps) {
           (extractDomain && extractDomain(email)) || email.split("@")[1];
         const provider =
           (providerCol && row[providerCol]) ? String(row[providerCol]).trim() : null;
+
+        const d = String(domain || "").toLowerCase().trim();
+        if (d) {
+          const prev = domainRepIncrements.get(d) || { sent: 0, invalid: 0 };
+          prev.sent += 1;
+          if (label === "invalid") prev.invalid += 1;
+          domainRepIncrements.set(d, prev);
+        }
 
         bulkOps.push({
           updateOne: {
@@ -159,6 +169,29 @@ module.exports = function trainingRouter(deps) {
         });
         inserted = resBulk.upsertedCount || 0;
         updated = (resBulk.modifiedCount || 0) + (resBulk.matchedCount || 0);
+      }
+
+      if (domainRepIncrements.size) {
+        const repOps = [];
+        for (const [domain, counts] of domainRepIncrements.entries()) {
+          repOps.push({
+            updateOne: {
+              filter: { domain },
+              update: {
+                $setOnInsert: { domain },
+                $inc: {
+                  sent: counts.sent || 0,
+                  invalid: counts.invalid || 0,
+                },
+              },
+              upsert: true,
+            },
+          });
+        }
+
+        if (repOps.length) {
+          await DomainReputation.bulkWrite(repOps, { ordered: false });
+        }
       }
 
       return res.json({
