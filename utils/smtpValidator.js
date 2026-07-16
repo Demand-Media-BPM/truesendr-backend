@@ -3693,7 +3693,72 @@ async function checkDomainCatchAll(domain, opts = {}) {
   }
 }
 
-module.exports = { validateSMTP, validateSMTPStable, checkDomainCatchAll };
+async function validateSMTPForTestingTab(email, opts = {}) {
+  const logger = typeof opts.logger === 'function' ? opts.logger : () => {};
+  const startedAt = Date.now();
+  const base = await validateSMTP(email, opts);
+
+  const sub = String(base?.sub_status || '').toLowerCase();
+  const provider = String(base?.provider || '').toLowerCase();
+  const domain = String(base?.domain || (String(email || '').split('@')[1] || '')).toLowerCase();
+  const isGoogleDomain = domain === 'gmail.com' || provider.includes('google');
+
+  let category = String(base?.category || '').toLowerCase();
+  let status = String(base?.status || 'Unknown');
+  let reason = String(base?.reason || '');
+  let confidence = typeof base?.confidence === 'number' ? base.confidence : null;
+
+  if (isGoogleDomain) {
+    if (
+      sub.includes('policy') ||
+      sub.includes('gateway') ||
+      sub.includes('greylist') ||
+      sub.includes('antispam')
+    ) {
+      category = 'unknown';
+      status = 'Unknown';
+      if (confidence == null || confidence > 0.55) confidence = 0.5;
+      reason = reason || 'Google policy/temporary gateway behavior detected; mailbox validity is inconclusive.';
+    }
+
+    if (sub === 'catch_all' || sub === 'gworkspace_catchall_ambiguous') {
+      category = 'risky';
+      status = 'Risky';
+      if (confidence == null || confidence > 0.75) confidence = 0.7;
+      reason = reason || 'Google/Workspace catch-all behavior suspected; mailbox-level certainty is reduced.';
+    }
+
+    if (sub === 'mailbox_not_found' && provider.includes('google') && confidence != null && confidence < 0.9) {
+      category = 'unknown';
+      status = 'Unknown';
+      reason = reason || 'Google hard-fail signal not strong enough; marked unknown for safer accuracy.';
+      confidence = 0.6;
+    }
+  }
+
+  const smtpDiagnostics = {
+    provider: base?.provider || 'Unavailable',
+    domain: base?.domain || domain || 'N/A',
+    subStatus: base?.sub_status || null,
+    provisional: !!base?.provisional,
+    confidenceSource: isGoogleDomain ? 'google_tuned_tab' : 'default',
+    elapsedMs: Date.now() - startedAt
+  };
+
+  logger('smtp_testing_tab', `Testing-tab tuned result => ${status} (${category}) sub=${sub}`, 'info');
+
+  return {
+    ...base,
+    status,
+    category,
+    confidence,
+    reason,
+    smtpDiagnostics,
+    testingTuned: true
+  };
+}
+
+module.exports = { validateSMTP, validateSMTPStable, checkDomainCatchAll, validateSMTPForTestingTab };
 
 
 

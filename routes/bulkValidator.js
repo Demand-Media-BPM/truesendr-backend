@@ -910,6 +910,33 @@ module.exports = function bulkValidatorRouter(deps) {
     return normalizeOutcomeCategory(final?.category || final?.status || "");
   }
 
+  function shouldFallbackToSendGridForOutlook({ smtpStatus, smtpCategory, smtpSubStatus }) {
+    const status = String(smtpStatus || "").toLowerCase();
+    const category = String(smtpCategory || "").toLowerCase();
+    const sub = String(smtpSubStatus || "").toLowerCase();
+
+    // strict rule: definitive SMTP valid/invalid should never fallback
+    if (status === "valid" || status === "invalid") return false;
+    if (category === "valid" || category === "invalid") return false;
+
+    // fallback only on risky/unknown-like or antispam-like outcomes
+    const antispamFailLike =
+      sub === "antispam_system" ||
+      sub.includes("antispam") ||
+      sub.includes("spam") ||
+      sub.includes("greylist") ||
+      sub.includes("block") ||
+      sub.includes("reject");
+
+    const unknownLike =
+      category === "risky" ||
+      category === "unknown" ||
+      sub.includes("unknown") ||
+      sub.includes("inconclusive");
+
+    return antispamFailLike || unknownLike;
+  }
+
   function normalizeAntispamOutcome(payload) {
     if (!payload || typeof payload !== "object") return payload;
 
@@ -2738,18 +2765,11 @@ module.exports = function bulkValidatorRouter(deps) {
               shouldRunSendGridFallbackPrelim =
                 prelimCategoryLower === "risky" || prelimCategoryLower === "unknown";
             } else if (isOutlookProviderPrelim) {
-              const antispamFailLike =
-                prelimSubStatusLower === "antispam_system" ||
-                prelimSubStatusLower.includes("antispam") ||
-                prelimSubStatusLower.includes("spam") ||
-                prelimSubStatusLower.includes("greylist") ||
-                prelimSubStatusLower.includes("block") ||
-                prelimSubStatusLower.includes("reject");
-              const antispamUnknownLike =
-                prelimCategoryLower === "unknown" ||
-                prelimSubStatusLower.includes("unknown") ||
-                prelimSubStatusLower.includes("inconclusive");
-              shouldRunSendGridFallbackPrelim = antispamFailLike || antispamUnknownLike;
+              shouldRunSendGridFallbackPrelim = shouldFallbackToSendGridForOutlook({
+                smtpStatus: prelimRaw.status,
+                smtpCategory: prelimCategoryLower,
+                smtpSubStatus: prelimSubStatusLower,
+              });
             } else if (isGoogleOrOutlookProviderPrelim) {
               if (prelimCategoryLower === "risky") {
                 const rep = await DomainReputation.findOne({ domain }).lean();
@@ -2992,18 +3012,11 @@ const history = await getHistoryCached(E);
                     shouldRunSendGridFallbackStable =
                       stableCategoryLower === "risky" || stableCategoryLower === "unknown";
                   } else if (isOutlookProviderStable) {
-                    const antispamFailLike =
-                      stableSubStatusLower === "antispam_system" ||
-                      stableSubStatusLower.includes("antispam") ||
-                      stableSubStatusLower.includes("spam") ||
-                      stableSubStatusLower.includes("greylist") ||
-                      stableSubStatusLower.includes("block") ||
-                      stableSubStatusLower.includes("reject");
-                    const antispamUnknownLike =
-                      stableCategoryLower === "unknown" ||
-                      stableSubStatusLower.includes("unknown") ||
-                      stableSubStatusLower.includes("inconclusive");
-                    shouldRunSendGridFallbackStable = antispamFailLike || antispamUnknownLike;
+                    shouldRunSendGridFallbackStable = shouldFallbackToSendGridForOutlook({
+                      smtpStatus: stableRaw.status,
+                      smtpCategory: stableCategoryLower,
+                      smtpSubStatus: stableSubStatusLower,
+                    });
                   } else if (isGoogleOrOutlookProviderStable) {
                     if (stableCategoryLower === "risky") {
                       const rep = await DomainReputation.findOne({ domain }).lean();

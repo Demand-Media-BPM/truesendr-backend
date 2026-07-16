@@ -24,7 +24,7 @@ const {
 } = require("../utils/sendgridVerifier");
 
 // Catch-all domain probe (used before Proofpoint/Mimecast SendGrid path)
-const { checkDomainCatchAll } = require("../utils/smtpValidator");
+const { checkDomainCatchAll, validateSMTPForTestingTab } = require("../utils/smtpValidator");
 const SendGridLog = require("../models/SendGridLog");
 const Domain = require("../models/Domain");
 const dns = require("dns").promises;
@@ -1353,6 +1353,32 @@ module.exports = function singleValidatorRouter(deps) {
     });
   }
 
+  function shouldFallbackToSendGridForOutlook({ smtpStatus, smtpCategory, smtpSubStatus }) {
+    const status = String(smtpStatus || "").toLowerCase();
+    const category = String(smtpCategory || "").toLowerCase();
+    const sub = String(smtpSubStatus || "").toLowerCase();
+
+    // strict rule: if SMTP is definitive valid/invalid, never fallback
+    if (status === "valid" || status === "invalid") return false;
+    if (category === "valid" || category === "invalid") return false;
+
+    // only risky/unknown-ish paths may fallback
+    const antispamFailLike =
+      sub === "antispam_system" ||
+      sub.includes("antispam") ||
+      sub.includes("spam") ||
+      sub.includes("greylist") ||
+      sub.includes("block") ||
+      sub.includes("reject");
+    const unknownLike =
+      category === "unknown" ||
+      category === "risky" ||
+      sub.includes("unknown") ||
+      sub.includes("inconclusive");
+
+    return antispamFailLike || unknownLike;
+  }
+
   async function maybeSendgridFallbackOnUnknown({ E, username, sessionId, smtpRaw, idemKey }) {
     if (!smtpRaw) return null;
 
@@ -1400,21 +1426,13 @@ module.exports = function singleValidatorRouter(deps) {
         return null;
       }
     } else if (isOutlookProvider) {
-      const antispamFailLike =
-        smtpSubStatusLower === "antispam_system" ||
-        smtpSubStatusLower.includes("antispam") ||
-        smtpSubStatusLower.includes("spam") ||
-        smtpSubStatusLower.includes("greylist") ||
-        smtpSubStatusLower.includes("block") ||
-        smtpSubStatusLower.includes("reject");
-      const antispamUnknownLike =
-        smtpCategoryLower === "unknown" ||
-        smtpSubStatusLower.includes("unknown") ||
-        smtpSubStatusLower.includes("inconclusive");
+      const shouldFallback = shouldFallbackToSendGridForOutlook({
+        smtpStatus: smtpRaw.status,
+        smtpCategory: smtpCategoryLower,
+        smtpSubStatus: smtpSubStatusLower,
+      });
 
-      if (!antispamFailLike && !antispamUnknownLike) {
-        return null;
-      }
+      if (!shouldFallback) return null;
     } else if (isGoogleOrOutlookProvider) {
       if (smtpCategoryLower !== "risky") return null;
 
@@ -1672,7 +1690,7 @@ module.exports = function singleValidatorRouter(deps) {
         "info",
       );
 
-      const smtpResult = await validateSMTP(E, { logger });
+      const smtpResult = await validateSMTPForTestingTab(E, { logger });
 
       return res.json({
         email: E,
@@ -1695,7 +1713,9 @@ module.exports = function singleValidatorRouter(deps) {
         score: typeof smtpResult.score === "number" ? smtpResult.score : 0,
         timestamp: new Date(),
         section: "single",
-        via: "smtp-only-admin-testing",
+        smtpDiagnostics: smtpResult.smtpDiagnostics || null,
+        testingTuned: !!smtpResult.testingTuned,
+        via: "smtp-only-admin-testing-google-tuned",
         cached: false,
         inProgress: false,
       });
