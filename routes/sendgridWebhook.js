@@ -22,6 +22,7 @@ module.exports = function sendgridWebhookRouter(deps) {
 
   const SendGridLog = require('../models/SendGridLog');
   const DomainReputation = deps.DomainReputation || require('../models/DomainReputation');
+  const { isGoogleEmail } = require('../utils/domainClassifier');
 
   function extractDomainFromEmail(email) {
     const e = String(email || '').toLowerCase();
@@ -192,6 +193,79 @@ module.exports = function sendgridWebhookRouter(deps) {
     );
   }
 
+  function isGoogleProvider(provider) {
+    const p = String(provider || '').toLowerCase().trim();
+    return (
+      p === 'google.com' ||
+      p === 'google' ||
+      p.includes('google.com') ||
+      p.includes('gmail / google workspace') ||
+      p.includes('google workspace') ||
+      p.includes('google')
+    );
+  }
+
+  function isGmailLowReputationBlock(email, reason, bounceClassification, eventType, bounceType, provider) {
+    const evt = String(eventType || '').toLowerCase();
+    const typ = String(bounceType || '').toLowerCase();
+    const classification = String(bounceClassification || '').toLowerCase();
+    const r = String(reason || '').toLowerCase();
+
+    const isGoogleMailbox = isGoogleEmail(email);
+    const isGoogleMxProvider = isGoogleProvider(provider);
+
+    const hasGmailFingerprint =
+      r.includes('gmail has detected') ||
+      r.includes('gsmtp') ||
+      r.includes('google.com/mail/answer/188131');
+
+    const hasLowReputationSignal =
+      r.includes('very low reputation of the sending ip address') ||
+      r.includes('very low reputation of the sending ip') ||
+      r.includes('low reputation of the sending ip') ||
+      (r.includes('low reputation') && r.includes('sending ip'));
+
+    const hasStatus571 = /(^|[\s;])5[.\s-]?7[.\s-]?1([\s;]|$)/.test(r);
+
+    // Core classification signal from SendGrid/Gmail
+    const hasReputationClassification =
+      classification === 'reputation' ||
+      r.includes('reputation of the sending ip') ||
+      r.includes('low reputation');
+
+    // Accept when either source indicates Google OR reason text is clearly Gmail-specific.
+    const googleContext = isGoogleMailbox || isGoogleMxProvider || hasGmailFingerprint;
+
+    return (
+      evt === 'bounce' &&
+      (typ === 'blocked' || typ === 'soft' || typ === '') &&
+      googleContext &&
+      hasLowReputationSignal &&
+      hasReputationClassification &&
+      (hasGmailFingerprint || hasStatus571)
+    );
+  }
+
+  function applyGmailReputationPolicy(payload) {
+    const safeScore = typeof payload.score === 'number' ? payload.score : 90;
+    const penalizedScore = Math.max(55, Math.min(safeScore - 30, 70));
+
+    return {
+      ...payload,
+      status: 'Valid',
+      category: 'valid',
+      subStatus: 'sendgrid_gmail_reputation_block_valid_with_risk',
+      score: penalizedScore,
+      reason: 'Gmail Reputation Block',
+      message:
+        'Mailbox appears valid, but Gmail blocked delivery due to low sender IP reputation. Marked valid with deliverability risk.',
+      deliverabilityState: 'temporarily_blocked',
+      riskFlags: ['gmail_reputation_block'],
+      riskMessage: 'Gmail blocked due to sender IP reputation',
+      providerRisk: 'google_reputation',
+    };
+  }
+
   /**
    * Process individual webhook event
    * @param {object} event - SendGrid event data
@@ -290,35 +364,41 @@ module.exports = function sendgridWebhookRouter(deps) {
                 confidence = eventType === 'click' || eventType === 'open' ? 0.99 : 0.95;
                 break;
 
-              case 'bounce':
-                if (type === 'soft') {
-                  // Soft bounce: mailbox may be temporarily full/unavailable — treat as Risky
-                  finalStatus = 'Risky';
-                  finalSubStatus = 'sendgrid_soft_bounce';
-                  finalCategory = 'risky';
-                  confidence = 0.75;
-                } else if (isPolicyBlock(reason)) {
-                  // Policy block: our sender was rejected by the recipient's mail gateway
-                  // (e.g. Mimecast blocked senders, IP reputation, SPF/DKIM/DMARC failure).
-                  // The mailbox may exist — this is a sender policy issue, not a missing mailbox.
-                  finalStatus = 'Risky';
-                  finalSubStatus = 'sendgrid_policy_block';
-                  finalCategory = 'risky';
-                  confidence = 0.80;
-                } else if (isEduGovEmail(E) && isRecipientNotFound510(reason)) {
-                  // Special policy: for .edu/.gov domains, treat RecipientNotFound (5.1.10) as Risky.
-                  finalStatus = 'Risky';
-                  finalSubStatus = 'sendgrid_recipient_not_found_edu_gov';
-                  finalCategory = 'risky';
-                  confidence = 0.78;
-                } else {
-                  // Hard bounce: mailbox does not exist — treat as Invalid
-                  finalStatus = 'Invalid';
-                  finalSubStatus = 'sendgrid_hard_bounce';
-                  finalCategory = 'invalid';
-                  confidence = 0.98;
-                }
-                break;
+      case 'bounce':
+        if (isGmailLowReputationBlock(E, reason, event.bounce_classification, eventType, type, sendGridLog.provider)) {
+          // Gmail reputation block policy: mailbox may still be valid; mark as Valid with risk.
+          finalStatus = 'Valid';
+          finalSubStatus = 'sendgrid_gmail_reputation_block_valid_with_risk';
+          finalCategory = 'valid';
+          confidence = 0.82;
+        } else if (type === 'soft') {
+          // Soft bounce: mailbox may be temporarily full/unavailable — treat as Risky
+          finalStatus = 'Risky';
+          finalSubStatus = 'sendgrid_soft_bounce';
+          finalCategory = 'risky';
+          confidence = 0.75;
+        } else if (isPolicyBlock(reason)) {
+          // Policy block: our sender was rejected by the recipient's mail gateway
+          // (e.g. Mimecast blocked senders, IP reputation, SPF/DKIM/DMARC failure).
+          // The mailbox may exist — this is a sender policy issue, not a missing mailbox.
+          finalStatus = 'Risky';
+          finalSubStatus = 'sendgrid_policy_block';
+          finalCategory = 'risky';
+          confidence = 0.80;
+        } else if (isEduGovEmail(E) && isRecipientNotFound510(reason)) {
+          // Special policy: for .edu/.gov domains, treat RecipientNotFound (5.1.10) as Risky.
+          finalStatus = 'Risky';
+          finalSubStatus = 'sendgrid_recipient_not_found_edu_gov';
+          finalCategory = 'risky';
+          confidence = 0.78;
+        } else {
+          // Hard bounce: mailbox does not exist — treat as Invalid
+          finalStatus = 'Invalid';
+          finalSubStatus = 'sendgrid_hard_bounce';
+          finalCategory = 'invalid';
+          confidence = 0.98;
+        }
+        break;
 
               case 'dropped':
                 // dropped = SendGrid suppression list (previously bounced address).
@@ -379,7 +459,7 @@ module.exports = function sendgridWebhookRouter(deps) {
               isFree: false,
             });
 
-            const finalPayload = {
+            let finalPayload = {
               email: E,
               status: finalStatus,
               subStatus: finalSubStatus,
@@ -396,6 +476,10 @@ module.exports = function sendgridWebhookRouter(deps) {
               timestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
               section: 'bulk',
             };
+
+            if (finalSubStatus === 'sendgrid_gmail_reputation_block_valid_with_risk') {
+              finalPayload = applyGmailReputationPolicy(finalPayload);
+            }
 
             // Update global EmailLog
             await replaceLatest(EmailLog, E, finalPayload);
@@ -589,7 +673,13 @@ module.exports = function sendgridWebhookRouter(deps) {
         break;
 
       case 'bounce':
-        if (type === 'soft') {
+        if (isGmailLowReputationBlock(E, reason, event.bounce_classification, eventType, type, pending.provider)) {
+          // Gmail reputation block policy: mailbox may still be valid; mark as Valid with risk.
+          finalStatus = 'Valid';
+          finalSubStatus = 'sendgrid_gmail_reputation_block_valid_with_risk';
+          finalCategory = 'valid';
+          confidence = 0.82;
+        } else if (type === 'soft') {
           // Soft bounce: mailbox may be temporarily full/unavailable — treat as Risky
           finalStatus = 'Risky';
           finalSubStatus = 'sendgrid_soft_bounce';
@@ -700,7 +790,7 @@ module.exports = function sendgridWebhookRouter(deps) {
       isFree: false,
     });
 
-    const finalPayload = {
+    let finalPayload = {
       email: E,
       status: finalStatus,
       subStatus: finalSubStatus,
@@ -717,6 +807,10 @@ module.exports = function sendgridWebhookRouter(deps) {
       timestamp: timestamp ? new Date(timestamp * 1000) : new Date(),
       section: 'single',
     };
+
+    if (finalSubStatus === 'sendgrid_gmail_reputation_block_valid_with_risk') {
+      finalPayload = applyGmailReputationPolicy(finalPayload);
+    }
 
     // Save to global EmailLog (always — so polling can read intermediate results)
     await replaceLatest(EmailLog, E, finalPayload);

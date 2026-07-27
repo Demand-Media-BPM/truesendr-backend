@@ -98,6 +98,7 @@ function shouldUseSendGridDirect({
   isProofpoint,
   isMimecast,
   isOutlookProvider = false,
+  isGoogleWorkspaceProvider = false,
 }) {
   const isEduGovOrgDomain = tld === "edu" || tld === "gov" || tld === "org";
   const isTargetSendgridSuffix =
@@ -109,7 +110,10 @@ function shouldUseSendGridDirect({
     tld === "ca" ||
     tld === "br";
 
-  const shouldUseEduGovOrgDirect = isEduGovOrgDomain && !isOutlookProvider;
+  // For .org/.edu/.gov domains hosted on Google Workspace,
+  // do NOT force direct SendGrid. Let SMTP-first flow decide.
+  const shouldUseEduGovOrgDirect =
+    isEduGovOrgDomain && !isOutlookProvider && !isGoogleWorkspaceProvider;
 
   return (
     shouldUseEduGovOrgDirect ||

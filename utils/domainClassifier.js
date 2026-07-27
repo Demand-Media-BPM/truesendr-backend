@@ -903,6 +903,23 @@ function getDomainCategory(domain) {
   return null;
 }
 
+function extractDomain(email) {
+  const e = String(email || '').toLowerCase().trim();
+  if (!e.includes('@')) return '';
+  return e.split('@')[1].trim();
+}
+
+function isGoogleConsumerDomain(domain) {
+  const d = String(domain || '').toLowerCase().trim();
+  return d === 'gmail.com' || d === 'googlemail.com';
+}
+
+function isGoogleEmail(emailOrDomain) {
+  const value = String(emailOrDomain || '').toLowerCase().trim();
+  const d = value.includes('@') ? extractDomain(value) : value;
+  return isGoogleConsumerDomain(d);
+}
+
 module.exports = {
   // Main functions
   classifyDomain,
@@ -919,6 +936,9 @@ module.exports = {
   isCcTLDDomain,
   hasHealthcareKeywords,
   isManualHighRiskDomain,
+  extractDomain,
+  isGoogleConsumerDomain,
+  isGoogleEmail,
   
   // Lists (for reference/extension)
   MANUAL_HIGH_RISK_DOMAINS,

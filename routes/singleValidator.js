@@ -721,9 +721,10 @@ module.exports = function singleValidatorRouter(deps) {
 
     const normalizedProvider = detectedProvider.toLowerCase();
     const isOutlookProvider = /outlook|microsoft/.test(normalizedProvider);
+    const isGoogleWorkspaceProvider = /google|gmail|google workspace|workspace/.test(normalizedProvider);
     const isEduGovOrgDomain = (tld === "edu" || tld === "gov" || tld === "org") && !isOutlookProvider;
     const isKnownPublicProvider =
-      /gmail|google|outlook|microsoft|yahoo|icloud|zoho|aol|gmx|yandex|proton|fastmail/.test(normalizedProvider);
+      /gmail|google|google workspace|workspace|outlook|microsoft|yahoo|icloud|zoho|aol|gmx|yandex|proton|fastmail/.test(normalizedProvider);
 
     const isRestrictedGatewayDomain = isProofpoint || isMimecast || isBarracuda;
     const isCustomDomain = !isRestrictedGatewayDomain && !isKnownPublicProvider;
@@ -779,6 +780,7 @@ module.exports = function singleValidatorRouter(deps) {
       isProofpoint,
       isMimecast,
       isOutlookProvider,
+      isGoogleWorkspaceProvider,
     });
 
     if (!shouldSendgridDirect) return null;
@@ -1379,6 +1381,21 @@ module.exports = function singleValidatorRouter(deps) {
     return antispamFailLike || unknownLike;
   }
 
+  function isGoogleDomainOrWorkspace({ domain = "", providerText = "" } = {}) {
+    const d = String(domain || "").toLowerCase().trim();
+    const p = String(providerText || "").toLowerCase();
+
+    // Domain-based (gmail/google owned domains)
+    if (d === "google.com" || d === "googlemail.com") return true;
+
+    // Provider-based (Google MX / Google Workspace)
+    // This is the primary requirement: treat any domain hosted on Google provider
+    // as google.com / google workspace path.
+    if (/google|gmail|google workspace|workspace/.test(p)) return true;
+
+    return false;
+  }
+
   async function maybeSendgridFallbackOnUnknown({ E, username, sessionId, smtpRaw, idemKey }) {
     if (!smtpRaw) return null;
 
@@ -1391,8 +1408,14 @@ module.exports = function singleValidatorRouter(deps) {
       ""
     ).toLowerCase();
 
+    const domainLower = String(domain || "").toLowerCase().trim();
+    const isGoogleWorkspaceDomain = isGoogleDomainOrWorkspace({
+      domain: domainLower,
+      providerText,
+    });
+
     const isGoogleOrOutlookProvider =
-      /google|gmail|outlook|microsoft/.test(providerText);
+      /google|gmail|google workspace|workspace|outlook|microsoft/.test(providerText);
     const isOutlookProvider =
       /outlook|microsoft/.test(providerText);
 
@@ -1408,7 +1431,14 @@ module.exports = function singleValidatorRouter(deps) {
       smtpRaw.sub_status || smtpRaw.subStatus || ""
     ).toLowerCase();
 
-    if (isEduGovOrgDomain) {
+    if (isGoogleWorkspaceDomain) {
+      // Explicit Google (google.com + workspace-style Google family) rule:
+      // - SMTP valid/invalid => trust SMTP directly (no SendGrid fallback)
+      // - SMTP risky/unknown => continue with SendGrid fallback
+      if (smtpCategoryLower !== "risky" && smtpCategoryLower !== "unknown") {
+        return null;
+      }
+    } else if (isEduGovOrgDomain) {
       // New requirement:
       // For .org/.edu/.gov + Outlook provider + antispam_system, trust SMTP result directly.
       // Only send via SendGrid when SMTP category is unknown.
@@ -1676,8 +1706,9 @@ module.exports = function singleValidatorRouter(deps) {
   // ────────────────────────────────────────────────────────────
   router.post("/validate-smtp-admin-testing", async (req, res) => {
     try {
-      const { email, sessionId, username } =
+      const { email, sessionId, username, forceLive } =
         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const shouldBypassCache = forceLive === true || String(forceLive).toLowerCase() === "true";
 
       if (!email) return res.status(400).json({ error: "Email is required" });
 
@@ -1732,8 +1763,9 @@ module.exports = function singleValidatorRouter(deps) {
       null;
 
     try {
-      const { email, sessionId, username } =
+      const { email, sessionId, username, forceLive } =
         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const shouldBypassCache = forceLive === true || String(forceLive).toLowerCase() === "true";
 
       if (!email) return res.status(400).json({ error: "Email is required" });
       if (!username) return res.status(400).json({ error: "Username is required" });
@@ -1891,7 +1923,7 @@ module.exports = function singleValidatorRouter(deps) {
         E,
       );
 
-      if (cachedDb && !isEduGovDomain) {
+      if (!shouldBypassCache && cachedDb && !isEduGovDomain) {
         const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
         // SendGrid-validated results use a 3-day freshness window; others use FRESH_DB_MS.
         const isSgCached = cachedDb.subStatus && String(cachedDb.subStatus).startsWith('sendgrid_');
@@ -2095,8 +2127,9 @@ module.exports = function singleValidatorRouter(deps) {
         (req.body && req.body.idempotencyKey) ||
         null;
 
-      const { email, sessionId, username } =
+      const { email, sessionId, username, forceLive } =
         typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+      const shouldBypassCache = forceLive === true || String(forceLive).toLowerCase() === "true";
 
       if (!email) return res.status(400).json({ error: "Email is required" });
       if (!username) return res.status(400).json({ error: "Username is required" });
@@ -2319,7 +2352,7 @@ module.exports = function singleValidatorRouter(deps) {
         E,
       );
 
-      if (cachedDb && !isEduGovDomainVerify) {
+      if (!shouldBypassCache && cachedDb && !isEduGovDomainVerify) {
         const cachedCategory = cachedDb.category || categoryFromStatus(cachedDb.status || '');
         // SendGrid-validated results use a 3-day freshness window; others use FRESH_DB_MS.
         const isSgCached = cachedDb.subStatus && String(cachedDb.subStatus).startsWith('sendgrid_');
@@ -2443,7 +2476,7 @@ module.exports = function singleValidatorRouter(deps) {
       }
 
       // stable cache hit — skip if result is unknown (must re-validate)
-      const hit = stableCache ? stableCache.get(E) : null;
+      const hit = shouldBypassCache ? null : (stableCache ? stableCache.get(E) : null);
       if (!isEduGovDomainVerify && hit && hit.until > Date.now() && hit.result?.category !== 'unknown') {
         const { EmailLog: UserEmailLog2 } = getUserDb(
           mongoose,

@@ -937,6 +937,18 @@ module.exports = function bulkValidatorRouter(deps) {
     return antispamFailLike || unknownLike;
   }
 
+  function isGoogleDomainOrWorkspace({ domain = "", providerText = "" } = {}) {
+    const d = String(domain || "").toLowerCase().trim();
+    const p = String(providerText || "").toLowerCase();
+
+    if (d === "google.com" || d === "googlemail.com") return true;
+
+    // Provider-based Google / Google Workspace detection
+    if (/google|gmail|google workspace|workspace/.test(p)) return true;
+
+    return false;
+  }
+
   function normalizeAntispamOutcome(payload) {
     if (!payload || typeof payload !== "object") return payload;
 
@@ -1421,7 +1433,7 @@ module.exports = function bulkValidatorRouter(deps) {
     const body =
       typeof req.body === "string" ? JSON.parse(req.body) : req.body || {};
 
-    const { bulkId, sessionId, skipInvalidFormat = false } = body;
+    const { bulkId, sessionId, skipInvalidFormat = false, forceLive = false } = body;
 
     const username =
       req.headers["x-user"] || body?.username || req.query?.username;
@@ -2123,7 +2135,7 @@ module.exports = function bulkValidatorRouter(deps) {
           fresh &&
           cachedCatForDecision === "unknown";
 
-        if (cached && fresh && !forceLiveBecauseCachedUnknown) {
+        if (cached && fresh && !forceLive && !forceLiveBecauseCachedUnknown) {
           usedCache = true;
 
           const builtCached = buildReasonAndMessage(
@@ -2197,8 +2209,9 @@ module.exports = function bulkValidatorRouter(deps) {
             tld === "ca" ||
             tld === "br";
 
+          const isGoogleWorkspaceProviderDirect = /google|gmail|google workspace|workspace/.test(normalizedProvider);
           const shouldSendgridDirect =
-            isEduGovOrgDomain ||
+            (isEduGovOrgDomain && !isGoogleWorkspaceProviderDirect) ||
             isBankOrHealthcare ||
             ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
 
@@ -2754,13 +2767,24 @@ module.exports = function bulkValidatorRouter(deps) {
             const isOutlookProviderPrelim =
               /outlook|microsoft/.test(prelimProviderText);
 
-            const prelimCategoryLower = String(prelimRaw.category || "").toLowerCase();
-            const prelimSubStatusLower = String(prelimRaw.sub_status || prelimRaw.subStatus || "").toLowerCase();
-            const prelimTld = String(domain || "").toLowerCase().split(".").pop() || "";
-            const isEduGovOrgPrelim = prelimTld === "edu" || prelimTld === "gov" || prelimTld === "org";
+          const prelimCategoryLower = String(prelimRaw.category || "").toLowerCase();
+          const prelimSubStatusLower = String(prelimRaw.sub_status || prelimRaw.subStatus || "").toLowerCase();
+          const prelimDomainLower = String(domain || "").toLowerCase().trim();
+          const isGoogleWorkspacePrelim = isGoogleDomainOrWorkspace({
+            domain: prelimDomainLower,
+            providerText: prelimProviderText,
+          });
+          const prelimTld = String(domain || "").toLowerCase().split(".").pop() || "";
+          const isEduGovOrgPrelim = prelimTld === "edu" || prelimTld === "gov" || prelimTld === "org";
 
-            let shouldRunSendGridFallbackPrelim = false;
-            if (isEduGovOrgPrelim) {
+          let shouldRunSendGridFallbackPrelim = false;
+          if (isGoogleWorkspacePrelim) {
+            // Explicit Google (google.com + workspace-style Google family) rule:
+            // SMTP valid/invalid => direct final from SMTP
+            // SMTP risky/unknown => go via SendGrid
+            shouldRunSendGridFallbackPrelim =
+              prelimCategoryLower === "risky" || prelimCategoryLower === "unknown";
+          } else if (isEduGovOrgPrelim) {
               // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
               shouldRunSendGridFallbackPrelim =
                 prelimCategoryLower === "risky" || prelimCategoryLower === "unknown";
@@ -3003,11 +3027,22 @@ const history = await getHistoryCached(E);
 
                   const stableCategoryLower = String(stableRaw.category || "").toLowerCase();
                   const stableSubStatusLower = String(stableRaw.sub_status || stableRaw.subStatus || "").toLowerCase();
+                  const stableDomainLower = String(domain || "").toLowerCase().trim();
+                  const isGoogleWorkspaceStable = isGoogleDomainOrWorkspace({
+                    domain: stableDomainLower,
+                    providerText: stableProviderText,
+                  });
                   const stableTld = String(domain || "").toLowerCase().split(".").pop() || "";
                   const isEduGovOrgStable = stableTld === "edu" || stableTld === "gov" || stableTld === "org";
 
                   let shouldRunSendGridFallbackStable = false;
-                  if (isEduGovOrgStable) {
+                  if (isGoogleWorkspaceStable) {
+                    // Explicit Google (google.com + workspace-style Google family) rule:
+                    // SMTP valid/invalid => direct final from SMTP
+                    // SMTP risky/unknown => go via SendGrid
+                    shouldRunSendGridFallbackStable =
+                      stableCategoryLower === "risky" || stableCategoryLower === "unknown";
+                  } else if (isEduGovOrgStable) {
                     // Requirement: for .org/.edu/.gov, even if SMTP is risky, still verify via SendGrid.
                     shouldRunSendGridFallbackStable =
                       stableCategoryLower === "risky" || stableCategoryLower === "unknown";
