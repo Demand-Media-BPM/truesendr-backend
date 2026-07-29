@@ -266,6 +266,20 @@ module.exports = function sendgridWebhookRouter(deps) {
     };
   }
 
+  function enforceGmailReputationPolicyIfMatched(payload, email, reason, bounceClassification, eventType, bounceType, provider) {
+    if (!isGmailLowReputationBlock(email, reason, bounceClassification, eventType, bounceType, provider)) {
+      return payload;
+    }
+    const patched = applyGmailReputationPolicy(payload || {});
+    return {
+      ...patched,
+      reason: reason || patched.reason,
+      message: reason
+        ? `SendGrid ${eventType}: ${reason}`
+        : patched.message,
+    };
+  }
+
   /**
    * Process individual webhook event
    * @param {object} event - SendGrid event data
@@ -480,6 +494,16 @@ module.exports = function sendgridWebhookRouter(deps) {
             if (finalSubStatus === 'sendgrid_gmail_reputation_block_valid_with_risk') {
               finalPayload = applyGmailReputationPolicy(finalPayload);
             }
+
+            finalPayload = enforceGmailReputationPolicyIfMatched(
+              finalPayload,
+              E,
+              reason,
+              event.bounce_classification,
+              eventType,
+              type,
+              sendGridLog.provider
+            );
 
             // Update global EmailLog
             await replaceLatest(EmailLog, E, finalPayload);
@@ -811,6 +835,16 @@ module.exports = function sendgridWebhookRouter(deps) {
     if (finalSubStatus === 'sendgrid_gmail_reputation_block_valid_with_risk') {
       finalPayload = applyGmailReputationPolicy(finalPayload);
     }
+
+    finalPayload = enforceGmailReputationPolicyIfMatched(
+      finalPayload,
+      E,
+      reason,
+      event.bounce_classification,
+      eventType,
+      type,
+      pending.provider
+    );
 
     // Save to global EmailLog (always — so polling can read intermediate results)
     await replaceLatest(EmailLog, E, finalPayload);
