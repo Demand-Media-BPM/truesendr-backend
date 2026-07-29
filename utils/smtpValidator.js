@@ -3131,8 +3131,8 @@ async function validateSMTP(email, opts = {}) {
           break outerLoop;
         }
 
-        if (result.status === 'deliverable' && result.sub_status !== 'catch_all' && !enterpriseProvider) {
-          // Clean valid on non-enterprise – stop early
+        if (result.status === 'deliverable') {
+          // User-requested behavior: once first probe says deliverable, do not probe further.
           break outerLoop;
         }
 
@@ -3175,7 +3175,7 @@ async function validateSMTP(email, opts = {}) {
           if (result.status === 'undeliverable') {
             break outerLoop;
           }
-          if (result.status === 'deliverable' && result.sub_status !== 'catch_all' && !enterpriseProvider) {
+          if (result.status === 'deliverable') {
             break outerLoop;
           }
         }
@@ -3189,7 +3189,7 @@ async function validateSMTP(email, opts = {}) {
       // If we reached here and got a clean deliverable (on enterprise) or risky/unknown,
       // we move to next MX unless already hard invalid / clear valid on non-enterprise.
       if (result.status === 'undeliverable') break;
-      if (result.status === 'deliverable' && result.sub_status !== 'catch_all' && !enterpriseProvider) break;
+      if (result.status === 'deliverable') break;
     }
   } catch {
     result.status = 'unknown';
