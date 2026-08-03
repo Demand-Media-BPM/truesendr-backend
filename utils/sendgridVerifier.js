@@ -14,7 +14,10 @@ const DEFAULT_SENDGRID_SENDERS = [
   'max.j@mailrant.com',
   'john.doe@mailverite.com',
   'martina@maildictator.com',
-  'rebecca@mailvariant.com'
+  'rebecca@mailvariant.com',
+  'william@mailnumerator.com',
+  'oliver@maildenominator.com',
+  'mia@mailsystematic.com'
 ];
 const SENDGRID_VERIFIED_SENDER = process.env.SENDGRID_VERIFIED_SENDER || 'david.g@mailjournals.com';
 const SENDGRID_VERIFIED_SENDERS = (process.env.SENDGRID_VERIFIED_SENDERS || '')
