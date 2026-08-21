@@ -26,7 +26,9 @@ module.exports = function dbDeleteRouter(deps) {
   }
 
   function isAllowedAdmin(req) {
-    const headerEmail = norm(req.headers["x-user-email"] || req.headers["x-email"]);
+    const headerEmail = norm(
+      req.headers["x-user-email"] || req.headers["x-email"]
+    );
     const bodyEmail = norm(req.body?.requesterEmail);
     const requesterEmail = headerEmail || bodyEmail;
     return ALLOWED_ADMIN_EMAILS.has(requesterEmail);
@@ -34,6 +36,37 @@ module.exports = function dbDeleteRouter(deps) {
 
   function getTargetEmail(req) {
     return norm(req.body?.email);
+  }
+
+  function getTargetEmails(req) {
+    const raw = Array.isArray(req.body?.emails) ? req.body.emails : [];
+    const seen = new Set();
+    const validEmails = [];
+    const invalidEmails = [];
+
+    for (const item of raw) {
+      const email = norm(item);
+      if (!email) continue;
+
+      if (!EMAIL_REGEX.test(email)) {
+        invalidEmails.push(email);
+        continue;
+      }
+
+      if (!seen.has(email)) {
+        seen.add(email);
+        validEmails.push(email);
+      }
+    }
+
+    return {
+      validEmails,
+      invalidEmails,
+      duplicateCount: Math.max(
+        0,
+        raw.filter(Boolean).length - validEmails.length - invalidEmails.length
+      ),
+    };
   }
 
   async function deleteFromAllUserDbs(targetEmail) {
@@ -55,6 +88,48 @@ module.exports = function dbDeleteRouter(deps) {
         );
 
         const del = await UserEmailLog.deleteMany({ email: targetEmail });
+        const deletedCount = Number(del?.deletedCount || 0);
+
+        totalUserEmailLogDeleted += deletedCount;
+        perUserResults.push({
+          username,
+          deletedEmailLogs: deletedCount,
+          ok: true,
+        });
+      } catch (err) {
+        perUserResults.push({
+          username,
+          deletedEmailLogs: 0,
+          ok: false,
+          error: err.message,
+        });
+      }
+    }
+
+    return { perUserResults, totalUserEmailLogDeleted };
+  }
+
+  async function deleteEmailsFromAllUserDbs(targetEmails) {
+    const users = await User.find({}, { username: 1, _id: 0 }).lean();
+    const perUserResults = [];
+    let totalUserEmailLogDeleted = 0;
+
+    for (const u of users) {
+      const username = String(u.username || "").trim();
+      if (!username) continue;
+
+      try {
+        const { EmailLog: UserEmailLog } = getUserDb(
+          mongoose,
+          EmailLog,
+          RegionStat,
+          DomainReputation,
+          username
+        );
+
+        const del = await UserEmailLog.deleteMany({
+          email: { $in: targetEmails },
+        });
         const deletedCount = Number(del?.deletedCount || 0);
 
         totalUserEmailLogDeleted += deletedCount;
@@ -128,6 +203,84 @@ module.exports = function dbDeleteRouter(deps) {
       });
     } catch (err) {
       console.error("❌ /api/admin/db-delete/email error:", err);
+      return res.status(500).json({
+        ok: false,
+        error: err.message || "Server error",
+      });
+    }
+  });
+
+  router.post("/db-delete/emails", async (req, res) => {
+    try {
+      if (!isAllowedAdmin(req)) {
+        return res.status(403).json({
+          ok: false,
+          error: "Forbidden: you are not allowed to access DB Delete.",
+        });
+      }
+
+      const { validEmails, invalidEmails, duplicateCount } =
+        getTargetEmails(req);
+
+      if (!validEmails.length) {
+        return res.status(400).json({
+          ok: false,
+          error: "At least one valid target email is required.",
+          invalidEmails,
+        });
+      }
+
+      const maxEmails = Number(process.env.DB_DELETE_MAX_EMAILS || 1000);
+      if (validEmails.length > maxEmails) {
+        return res.status(400).json({
+          ok: false,
+          error: `Too many emails. Maximum allowed is ${maxEmails}.`,
+          maxEmails,
+          validCount: validEmails.length,
+        });
+      }
+
+      const [globalEmailLogDel, singlePendingDel, sendGridPendingDel] =
+        await Promise.all([
+          EmailLog.deleteMany({ email: { $in: validEmails } }),
+          SinglePending.deleteMany({ email: { $in: validEmails } }),
+          SendGridPending.deleteMany({ email: { $in: validEmails } }),
+        ]);
+
+      const { perUserResults, totalUserEmailLogDeleted } =
+        await deleteEmailsFromAllUserDbs(validEmails);
+
+      const failedUsers = perUserResults.filter((x) => !x.ok).length;
+
+      return res.json({
+        ok: true,
+        message:
+          failedUsers > 0
+            ? "Bulk deletion completed with partial errors in some user DBs."
+            : "Bulk deletion completed successfully across global and all user DBs.",
+        requestedCount: Array.isArray(req.body?.emails)
+          ? req.body.emails.length
+          : 0,
+        validCount: validEmails.length,
+        invalidEmails,
+        duplicateCount,
+        targetEmails: validEmails,
+        deleted: {
+          global: {
+            EmailLog: Number(globalEmailLogDel?.deletedCount || 0),
+            SinglePending: Number(singlePendingDel?.deletedCount || 0),
+            SendGridPending: Number(sendGridPendingDel?.deletedCount || 0),
+          },
+          allUsers: {
+            userCount: perUserResults.length,
+            failedUsers,
+            EmailLogTotal: totalUserEmailLogDeleted,
+          },
+        },
+        perUserResults,
+      });
+    } catch (err) {
+      console.error("❌ /api/admin/db-delete/emails error:", err);
       return res.status(500).json({
         ok: false,
         error: err.message || "Server error",

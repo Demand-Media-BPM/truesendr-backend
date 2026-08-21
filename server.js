@@ -17,14 +17,15 @@ const mongoose = require("mongoose");
 const EmailLog = require("./models/EmailLog");
 const RegionStat = require("./models/RegionStats");
 const DomainReputation = require("./models/DomainReputation");
-const ProviderReputation = require("./models/ProviderReputation"); // 👈 NEW
+const ProviderReputation = require("./models/ProviderReputation");
 const User = require("./models/User");
 const BulkStat = require("./models/BulkStat");
-const SinglePending = require("./models/SinglePending");
-const SendGridPending = require("./models/SendGridPending"); // 👈 NEW: for webhook-based validation
-
+const SinglePending = require("./models/SinglePending"); 
+const SendGridPending = require("./models/SendGridPending");
+ 
 // SMTP validators now live under utils
 const { validateSMTP, validateSMTPStable } = require("./utils/smtpValidator");
+
 
 // Routers
 const authRoutes = require("./routes/auth");
