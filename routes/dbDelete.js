@@ -230,7 +230,7 @@ module.exports = function dbDeleteRouter(deps) {
         });
       }
 
-      const maxEmails = Number(process.env.DB_DELETE_MAX_EMAILS || 1000);
+      const maxEmails = 10000;
       if (validEmails.length > maxEmails) {
         return res.status(400).json({
           ok: false,
