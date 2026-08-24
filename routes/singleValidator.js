@@ -200,7 +200,7 @@ module.exports = function singleValidatorRouter(deps) {
         confidence: 0.9,
         score: 85,
         reason: "Recent Training Sample",
-        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+        message: "You can safely send emails to this address because, Email address was accepted.",
       };
     }
     if (l === "invalid") {
@@ -211,7 +211,7 @@ module.exports = function singleValidatorRouter(deps) {
         confidence: 0.9,
         score: 5,
         reason: "Recent Training Sample",
-        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+        message: "You should not send emails to this address because, Email address was rejected; it does not exist.",
       };
     }
     if (l === "risky") {
@@ -222,7 +222,7 @@ module.exports = function singleValidatorRouter(deps) {
         confidence: 0.85,
         score: 40,
         reason: "Recent Training Sample",
-        message: "This email was found in recent training data (within 15 days). Returned directly without live verification.",
+        message: "This address looks risky to send to because, Email address appears to be deliverable, but deliverability cannot be guaranteed.",
       };
     }
 
@@ -233,7 +233,7 @@ module.exports = function singleValidatorRouter(deps) {
       confidence: 0.7,
       score: 50,
       reason: "Recent Training Sample",
-      message: "This email was found in recent training data (within 15 days) but mapped to unknown.",
+      message: "This email was found in recent training data but mapped to unknown.",
     };
   }
 

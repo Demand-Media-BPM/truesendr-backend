@@ -217,7 +217,8 @@ module.exports = function sendgridWebhookRouter(deps) {
     const hasGmailFingerprint =
       r.includes('gmail has detected') ||
       r.includes('gsmtp') ||
-      r.includes('google.com/mail/answer/188131');
+      r.includes('google.com/mail/answer/188131')||
+      r.includes('likely unsolicited mail');
 
     const hasLowReputationSignal =
       r.includes('very low reputation of the sending ip address') ||
