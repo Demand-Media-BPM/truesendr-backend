@@ -648,6 +648,10 @@ const MANUAL_HIGH_RISK_DOMAINS = [
   'tscbank.com',
   'publicisgroupe.com',
   'eaton.com',
+  'safrangroup.com',
+  'skywest.com',
+  'fresnounified.org',
+
   
 
 ];
