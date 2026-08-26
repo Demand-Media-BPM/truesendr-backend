@@ -651,7 +651,9 @@ const MANUAL_HIGH_RISK_DOMAINS = [
   'safrangroup.com',
   'skywest.com',
   'fresnounified.org',
-
+  'premierhealth.com',
+  'syncreon.com',
+  'ahn.org',
   
 
 ];
