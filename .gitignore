@@ -25,3 +25,8 @@
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# office log
+EdlpInjector.log
+ExplorerDll.log
+PrinterMonitor.log

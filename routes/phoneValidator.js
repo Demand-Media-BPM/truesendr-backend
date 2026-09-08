@@ -1226,6 +1226,168 @@ const twilioClient = twilio(accountSid, authToken);
    Credit helper
    Deduct exactly 1 credit only on successful validation (cache or twilio).
 ───────────────────────────────────────────── */
+function normalizeRawLookupInput(phone, dialCode) {
+  const rawPhone = String(phone || "").trim();
+  const rawDialCode = String(dialCode || "").trim();
+
+  if (!rawPhone) {
+    return {
+      ok: false,
+      status: 400,
+      error: "missing_phone",
+      message: "Phone number is required",
+    };
+  }
+
+  if (/^\+/.test(rawPhone)) {
+    const digits = rawPhone.replace(/[^\d]/g, "");
+    if (!digits) {
+      return {
+        ok: false,
+        status: 400,
+        error: "invalid_phone",
+        message: "Enter a valid phone number",
+      };
+    }
+
+    return {
+      ok: true,
+      inputPhone: rawPhone,
+      inputDialCode: rawDialCode || null,
+      e164Input: `+${digits}`,
+      dialDigits: null,
+      localDigits: digits,
+    };
+  }
+
+  const localDigits = rawPhone.replace(/[^\d]/g, "");
+  const dialDigits = rawDialCode.replace(/[^\d]/g, "");
+
+  if (!dialDigits) {
+    return {
+      ok: false,
+      status: 400,
+      error: "missing_dial",
+      message: "Country code is required when phone is not in +E.164 format",
+    };
+  }
+
+  if (!localDigits) {
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_phone",
+      message: "Enter a valid phone number",
+    };
+  }
+
+  const normalizedLocal = localDigits.startsWith(dialDigits)
+    ? localDigits.slice(dialDigits.length)
+    : localDigits;
+
+  if (!normalizedLocal) {
+    return {
+      ok: false,
+      status: 400,
+      error: "invalid_phone",
+      message: "Enter a valid local phone number",
+    };
+  }
+
+  return {
+    ok: true,
+    inputPhone: rawPhone,
+    inputDialCode: rawDialCode,
+    e164Input: `+${dialDigits}${normalizedLocal}`,
+    dialDigits,
+    localDigits: normalizedLocal,
+  };
+}
+
+function buildRawLookupFetchOptions(fields) {
+  const DEFAULT_FIELDS = "caller_name,line_type_intelligence";
+  const fieldsSource = Array.isArray(fields)
+    ? fields
+    : String(fields || process.env.TWILIO_LOOKUP_FIELDS || DEFAULT_FIELDS).split(",");
+
+  const ALLOWED_FIELDS = new Set([
+    "validation",
+    "caller_name",
+    "sim_swap",
+    "call_forwarding",
+    "line_status",
+    "line_type_intelligence",
+    "identity_match",
+    "reassigned_number",
+    "sms_pumping_risk",
+    "phone_number_quality_score",
+    "pre_fill",
+  ]);
+
+  const safeFields = fieldsSource
+    .map((field) => String(field || "").trim())
+    .filter((field) => ALLOWED_FIELDS.has(field));
+
+  return safeFields.length ? { fields: safeFields.join(",") } : {};
+}
+
+function toPlainObject(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+router.post("/debug/raw-lookup", async (req, res) => {
+  try {
+    const { phone, dialCode, fields } = req.body || {};
+    const input = normalizeRawLookupInput(phone, dialCode);
+
+    if (!input.ok) {
+      return res.status(input.status).json({
+        ok: false,
+        error: input.error,
+        message: input.message,
+      });
+    }
+
+    const fetchOptions = buildRawLookupFetchOptions(fields);
+    const twilioData = await twilioClient.lookups.v2
+      .phoneNumbers(input.e164Input)
+      .fetch(fetchOptions);
+
+    return res.json({
+      ok: true,
+      input: {
+        phone: input.inputPhone,
+        dialCode: input.inputDialCode,
+        e164: input.e164Input,
+        dialDigits: input.dialDigits,
+        localDigits: input.localDigits,
+        fields: fetchOptions.fields || null,
+      },
+      twilio: {
+        raw: toPlainObject(twilioData),
+      },
+      storedInDatabase: false,
+      creditsDeducted: false,
+      fromCache: false,
+    });
+  } catch (err) {
+    console.error("[/api/phone/debug/raw-lookup] Twilio error:", err);
+    return res.status(err?.status || 500).json({
+      ok: false,
+      error: "twilio_failed",
+      message: err?.message || "Twilio lookup failed",
+      twilioError: {
+        status: err?.status || null,
+        code: err?.code || null,
+        moreInfo: err?.moreInfo || null,
+        details: err?.details || null,
+      },
+      storedInDatabase: false,
+      creditsDeducted: false,
+    });
+  }
+});
+
 async function deductOneCreditOrFail(userId) {
   const updatedUser = await User.findOneAndUpdate(
     { _id: userId, credits: { $gt: 0 } },

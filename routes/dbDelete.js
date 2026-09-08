@@ -47,14 +47,14 @@ module.exports = function dbDeleteRouter(deps) {
     for (const item of raw) {
       const email = norm(item);
       if (!email) continue;
-
+    
       if (!EMAIL_REGEX.test(email)) {
         invalidEmails.push(email);
         continue;
       }
 
       if (!seen.has(email)) {
-        seen.add(email);
+        seen.add(email); 
         validEmails.push(email);
       }
     }
