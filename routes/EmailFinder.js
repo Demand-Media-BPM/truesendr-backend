@@ -1333,17 +1333,18 @@ module.exports = function EmailFinderRouter() {
 
   /* ───────────────────────────── PARALLEL START ─────────────────────────────
    POST /api/finder/start
-   Body: { fullName, domain }
+   Body: { firstName, middleName, lastName, domain } OR legacy { fullName, domain }
    Returns immediately: { ok:true, jobId }
 ─────────────────────────────────────────────────────────────────────────── */
   router.post("/start", requireAuth, async (req, res) => {
     try {
-      const { fullName, domain } = req.body || {};
+      const { fullName, firstName, middleName, lastName, domain } =
+        req.body || {};
 
-      if (!fullName || !domain) {
+      if ((!fullName && !firstName) || !domain) {
         return res
           .status(400)
-          .json({ error: "fullName and domain are required" });
+          .json({ error: "firstName and domain are required" });
       }
 
       const domainLC = normalizeDomain(domain);
@@ -1353,10 +1354,30 @@ module.exports = function EmailFinderRouter() {
           .json({ error: "Please provide a valid domain." });
       }
 
-      const nameParts = splitFullName(fullName);
+      const directFirst = normalizeASCII(firstName);
+      const directLast = normalizeASCII(lastName);
+      const nameParts = directFirst
+        ? {
+            first: directFirst,
+            last: directLast,
+            F: directFirst[0] || "",
+            L: directLast ? directLast[0] : "",
+          }
+        : splitFullName(fullName);
       if (!nameParts.first) {
         return res.status(400).json({ error: "Could not parse first name." });
       }
+
+      const cleanDisplayName = (value) =>
+        String(value || "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const displayName = directFirst
+        ? [firstName, middleName, lastName]
+            .map(cleanDisplayName)
+            .filter(Boolean)
+            .join(" ")
+        : cleanDisplayName(fullName);
 
       const tenant = req.tenant;
       const userId = req.user.id;
@@ -1399,7 +1420,7 @@ module.exports = function EmailFinderRouter() {
           const userDoc = createVirtualFinderJob({
             state: "done",
             status: "Valid",
-            fullName: fullName.trim(),
+            fullName: displayName,
             domain: domainLC,
             email: globalHit.email,
             confidence: globalHit.confidence || "Med",
@@ -1467,7 +1488,7 @@ module.exports = function EmailFinderRouter() {
         const userDoc = createVirtualFinderJob({
           state: "done",
           status: "Valid",
-          fullName: fullName.trim(),
+          fullName: displayName,
           domain: domainLC,
           email: userHit.email,
           confidence: userHit.confidence || "Med",
@@ -1484,7 +1505,7 @@ module.exports = function EmailFinderRouter() {
         domain: domainLC,
         first,
         last,
-        nameInput: fullName.trim(),
+        nameInput: displayName,
         state: "running",
         status: "Unknown",
         confidence: "Low",
@@ -1589,7 +1610,7 @@ module.exports = function EmailFinderRouter() {
                   domain: domainLC,
                   first,
                   last,
-                  nameInput: fullName.trim(),
+                  nameInput: displayName,
                   state: "done",
                   status: "Valid",
                   confidence,
