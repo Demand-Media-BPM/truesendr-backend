@@ -1137,16 +1137,16 @@ module.exports = function singleValidatorRouter(deps) {
         console.warn("SendGridLog create failed:", e.message);
       }
       
-      // ── WAIT UP TO 15 SECONDS FOR SENDGRID WEBHOOK RESULT ─────────────────
+      // ── WAIT UP TO 60 SECONDS FOR SENDGRID WEBHOOK RESULT ─────────────────
       // Poll every 500ms. For Mimecast/Exchange domains, the sequence is:
       //   processed → delivered (kept alive) → bounce (final, deletes pending)
       // We wait long enough to capture the bounce that follows delivered.
       // If the bounce arrives in time → return Risky/Invalid.
       // If only delivered arrives → return Valid (from EmailLog).
       // If nothing arrives → return Risky as safe fallback.
-      // Increased from 15s to 30s to avoid race conditions where the webhook
-      // arrives just after the timeout, causing a Risky→Valid result flip.
-      const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 30000);
+      // Increased from 30s to 60s to give slow gateways (Proofpoint/Mimecast)
+      // more time to deliver bounces before falling back to Risky.
+      const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 60000);
       const POLL_INTERVAL_MS = +(process.env.SENDGRID_POLL_INTERVAL_MS || 500);
       const pollStart = Date.now();
 
@@ -1540,11 +1540,11 @@ module.exports = function singleValidatorRouter(deps) {
           logger("sendgrid_fallback_log_err", `SendGridLog create failed: ${e.message}`, "warn");
         }
 
-        // ── Poll up to 30s for webhook result ────────────────────────────────
-        // Increased from 5s → 30s so single validator waits as long as the
-        // Proofpoint/Mimecast direct path. This captures bounces that arrive
-        // a few seconds after the initial "delivered" event.
-        const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 30000);
+        // ── Poll up to 60s for webhook result ────────────────────────────────
+        // Increased from 30s → 60s so single validator waits long enough for
+        // slow gateways (Proofpoint/Mimecast). This captures bounces that
+        // arrive a few seconds after the initial "delivered" event.
+        const WEBHOOK_WAIT_MS = +(process.env.SENDGRID_WEBHOOK_WAIT_MS || 60000);
         const POLL_INTERVAL_MS = +(process.env.SENDGRID_POLL_INTERVAL_MS || 500);
         const pollStart = Date.now();
 

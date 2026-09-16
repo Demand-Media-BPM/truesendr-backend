@@ -568,7 +568,6 @@ const MANUAL_HIGH_RISK_DOMAINS = [
   'fema.gov',
   'hawaiicounty.gov',
   'doi.gov',
-  'dol.gov',
   'fairfaxcounty.gov',
   'hdtglobal.com',
   'austintexas.gov',

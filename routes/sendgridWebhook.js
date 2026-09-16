@@ -535,6 +535,7 @@ module.exports = function sendgridWebhookRouter(deps) {
                   webhookAttempt: attempt,
                   finalCategory: finalCategory,
                   finalStatus: finalStatus,
+                  finalSubStatus: finalSubStatus,
                 }
               }
             );
@@ -915,6 +916,7 @@ module.exports = function sendgridWebhookRouter(deps) {
               webhookAttempt: attempt,
               finalCategory: isFinalEvent ? finalCategory : undefined,
               finalStatus: isFinalEvent ? finalStatus : undefined,
+              finalSubStatus: isFinalEvent ? finalSubStatus : undefined,
             }
           }
         );

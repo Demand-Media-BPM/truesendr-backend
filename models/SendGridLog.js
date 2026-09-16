@@ -54,8 +54,7 @@ const sendGridLogSchema = new mongoose.Schema({
   },
   messageId: {
     type: String,
-    default: null,
-    index: true
+    default: null
   },
   statusCode: {
     type: Number,
@@ -112,7 +111,49 @@ const sendGridLogSchema = new mongoose.Schema({
     enum: ['hard', 'soft', 'block', null],
     default: null
   },
+  // Raw webhook event fields (written by sendgridWebhook.js)
+  webhookReason: {
+    type: String,
+    default: null
+  },
+  webhookType: {
+    type: String,
+    default: null
+  },
+  webhookResponse: {
+    type: String,
+    default: null
+  },
+  webhookStatus: {
+    type: mongoose.Schema.Types.Mixed,
+    default: null
+  },
+  webhookAttempt: {
+    type: String,
+    default: null
+  },
+  // Final webhook verdict (written by sendgridWebhook.js on delivered/bounce/etc.)
+  // Used by the dedupe layer in sendgridVerifier.js to reuse known results.
+  finalStatus: {
+    type: String,
+    default: null,
+    index: true
+  }, // 'Valid' | 'Invalid' | 'Risky'
+  finalCategory: {
+    type: String,
+    enum: ['valid', 'invalid', 'risky', null],
+    default: null,
+    index: true
+  },
+  finalSubStatus: {
+    type: String,
+    default: null
+  },
   // Metadata
+  elapsed_client_ms: {
+    type: Number,
+    default: null
+  },
   elapsed_ms: {
     type: Number,
     default: null
@@ -133,7 +174,6 @@ const sendGridLogSchema = new mongoose.Schema({
   },
   bulkId: {
     type: String,
-    index: true,
     default: null
   },
   // Flags
@@ -173,6 +213,30 @@ sendGridLogSchema.statics.getRecentVerification = async function(email, maxAgeMs
   const cutoff = new Date(Date.now() - maxAgeMs);
   return await this.findOne({
     email: email.toLowerCase(),
+    createdAt: { $gte: cutoff }
+  }).sort({ createdAt: -1 });
+};
+
+// Static method: Get most recent webhook-FINALIZED verification for an email.
+// Used by the SendGrid dedupe layer to reuse a known verdict instead of
+// sending a duplicate verification email.
+sendGridLogSchema.statics.getRecentFinalVerification = async function(email, maxAgeMs = 24 * 60 * 60 * 1000) {
+  const cutoff = new Date(Date.now() - maxAgeMs);
+  return await this.findOne({
+    email: String(email || '').toLowerCase(),
+    finalStatus: { $ne: null },
+    finalCategory: { $in: ['valid', 'invalid', 'risky'] },
+    createdAt: { $gte: cutoff }
+  }).sort({ createdAt: -1 });
+};
+
+// Static method: Get most recent send that was ACCEPTED by SendGrid but has
+// no final webhook verdict yet (i.e. still in flight).
+sendGridLogSchema.statics.getRecentInFlightVerification = async function(email, maxAgeMs = 15 * 60 * 1000) {
+  const cutoff = new Date(Date.now() - maxAgeMs);
+  return await this.findOne({
+    email: String(email || '').toLowerCase(),
+    messageId: { $ne: null },
     createdAt: { $gte: cutoff }
   }).sort({ createdAt: -1 });
 };
