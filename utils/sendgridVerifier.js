@@ -6,6 +6,7 @@
 
 const sgMail = require('@sendgrid/mail');
 const dns = require('dns').promises;
+const SendGridLog = require('../models/SendGridLog');
 
 // Initialize SendGrid with API key from environment
 const SENDGRID_API_KEY = process.env.SENDGRID_API_KEY || '';
@@ -34,9 +35,24 @@ const SENDGRID_SENDER_POOL = Array.from(new Set([
 const SENDGRID_ENABLED = process.env.SENDGRID_ENABLED === 'true';
 const SENDGRID_TIMEOUT_MS = +(process.env.SENDGRID_TIMEOUT_MS || 10000);
 
+// ── DEDUPE: avoid re-sending verification emails to the same address ────────
+// Before sending a new email, check SendGridLog for a recent attempt:
+//   1) A webhook-FINALIZED result within TTL       -> reuse the known status
+//   2) An accepted-but-unconfirmed send (in flight) -> do not send a duplicate
+// Fail-open: if the dedupe lookup errors, the normal send proceeds.
+const SENDGRID_DEDUPE_ENABLED = process.env.SENDGRID_DEDUPE_ENABLED !== 'false';
+const SENDGRID_DEDUPE_TTL_MS = +(process.env.SENDGRID_DEDUPE_TTL_HOURS || 24) * 60 * 60 * 1000;
+const SENDGRID_DEDUPE_INFLIGHT_MS = +(process.env.SENDGRID_DEDUPE_INFLIGHT_MINUTES || 15) * 60 * 1000;
+
 // In-memory sender rotation state per recipient domain.
 // Ensures repeated sends to the same domain rotate sender account.
 const domainSenderRotation = new Map();
+
+// In-memory registry of in-flight SendGrid sends (per process), keyed by
+// lowercased recipient email. If two workers ask to verify the same address
+// at the same time (e.g. bulk concurrency), the second one awaits the first
+// one's promise instead of sending a duplicate email.
+const inFlightSends = new Map(); // lowercased email -> Promise<result>
 
 function toDisplayNameFromEmail(senderEmail) {
   const localPart = String(senderEmail || '').split('@')[0] || '';
@@ -100,13 +116,218 @@ async function isMimecastDomain(domain) {
   }
 }
 
+function formatAgeMs(ms) {
+  const mins = Math.round(ms / 60000);
+  if (mins < 1) return 'less than a minute';
+  if (mins < 60) return `${mins} minute${mins === 1 ? '' : 's'}`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'}`;
+}
+
+function categoryToStatus(category) {
+  if (category === 'valid') return 'deliverable';
+  if (category === 'invalid') return 'undeliverable';
+  if (category === 'risky') return 'risky';
+  return 'unknown';
+}
+
 /**
- * Send verification email via SendGrid
+ * Build a verification result from a webhook-finalized SendGridLog entry.
+ * No new email is sent — the known verdict is reused.
+ * NOTE: intentionally carries NO messageId, so downstream webhook bookkeeping
+ * (SendGridPending / BulkStat.sendgridMessageIds) never links to a message
+ * that this request did not actually send.
+ */
+function buildCachedResultFromLog(log) {
+  const category = ['valid', 'invalid', 'risky'].includes(log.finalCategory)
+    ? log.finalCategory
+    : 'unknown';
+  const ageMs = Math.max(0, Date.now() - new Date(log.createdAt).getTime());
+  return {
+    success: true,
+    status: categoryToStatus(category),
+    sub_status: log.finalSubStatus || 'sendgrid_dedupe_cached',
+    reason:
+      `Duplicate send prevented — SendGrid already sent to this address ` +
+      `${formatAgeMs(ageMs)} ago with verdict "${log.finalStatus || category}"` +
+      `${log.webhookReason ? ` (${log.webhookReason})` : ''}. Reusing previous result; no new email sent.`,
+    provider: log.provider || 'SendGrid',
+    method: 'skipped',
+    dedupe: 'cached',
+    dedupeLogId: log._id ? String(log._id) : null,
+    dedupeAgeMs: ageMs,
+    confidence: typeof log.confidence === 'number' ? log.confidence : 0.8,
+    category,
+    statusCode: log.statusCode || null,
+    elapsed_ms: 0,
+    awaitingWebhook: false
+  };
+}
+
+/**
+ * Build an "already in flight" result from a recent SendGridLog entry that was
+ * accepted by SendGrid but has no final webhook verdict yet.
+ */
+function buildInFlightResultFromLog(log, options = {}) {
+  const isBulkMode = options.bulkMode === true || options.trainingTag === 'bulk';
+  const ageMs = Math.max(0, Date.now() - new Date(log.createdAt).getTime());
+
+  if (isBulkMode) {
+    // Bulk mode: return a neutral result WITHOUT messageId. The original
+    // message is already tracked in BulkStat.sendgridMessageIds — re-registering
+    // it would corrupt the webhook settle counter.
+    return {
+      success: true,
+      status: 'unknown',
+      sub_status: 'sendgrid_dedupe_in_progress',
+      reason: 'Duplicate send prevented — a SendGrid verification email for this address is already in flight; the webhook will confirm delivery.',
+      provider: 'SendGrid',
+      method: 'skipped',
+      dedupe: 'in_progress',
+      dedupeLogId: log._id ? String(log._id) : null,
+      dedupeAgeMs: ageMs,
+      confidence: 0.3,
+      category: 'unknown',
+      statusCode: null,
+      elapsed_ms: 0,
+      awaitingWebhook: false
+    };
+  }
+
+  // Single mode: hand back the original messageId so the existing
+  // SendGridPending + webhook polling flow tracks the SAME message.
+  return {
+    success: true,
+    status: 'pending',
+    sub_status: 'sendgrid_dedupe_in_progress',
+    reason: 'Duplicate send prevented — verification for this address is already awaiting SendGrid webhook confirmation.',
+    provider: 'SendGrid',
+    method: 'web_api',
+    dedupe: 'in_progress',
+    dedupeLogId: log._id ? String(log._id) : null,
+    dedupeAgeMs: ageMs,
+    messageId: log.messageId || null,
+    statusCode: log.statusCode || null,
+    confidence: null,
+    category: 'pending',
+    elapsed_ms: 0,
+    awaitingWebhook: true
+  };
+}
+
+/**
+ * Check whether SendGrid already sent a verification email to this address
+ * recently, and if so return a ready-to-use result that short-circuits the
+ * send. Returns null when it is safe (and desired) to send a new email.
+ */
+async function getSendGridDedupeResult(email, options = {}, logger = () => {}) {
+  try {
+    // 1) Webhook-finalized result within TTL → reuse the known status.
+    const finalLog = await SendGridLog.getRecentFinalVerification(email, SENDGRID_DEDUPE_TTL_MS);
+    if (finalLog) {
+      const result = buildCachedResultFromLog(finalLog);
+      logger(
+        'sendgrid_dedupe',
+        `Duplicate prevented for ${email}: reusing finalized SendGrid result "${result.category}" from ${formatAgeMs(result.dedupeAgeMs)} ago (no email sent)`,
+        'info'
+      );
+      return result;
+    }
+
+    // 2) Accepted-but-unconfirmed send within the in-flight window → no resend.
+    const inflightLog = await SendGridLog.getRecentInFlightVerification(email, SENDGRID_DEDUPE_INFLIGHT_MS);
+    if (inflightLog) {
+      const result = buildInFlightResultFromLog(inflightLog, options);
+      logger(
+        'sendgrid_dedupe',
+        `Duplicate prevented for ${email}: previous SendGrid email still awaiting webhook (${formatAgeMs(result.dedupeAgeMs)} ago). No new email sent`,
+        'info'
+      );
+      return result;
+    }
+
+    return null;
+  } catch (err) {
+    // Fail-open: never block sending because the dedupe lookup failed.
+    logger('sendgrid_dedupe_error', `Dedupe check failed: ${err.message} → proceeding with normal send`, 'warn');
+    return null;
+  }
+}
+
+/**
+ * Send verification email via SendGrid (with dedupe).
+ * Before dispatching, checks whether SendGrid already sent an email to this
+ * address recently (finalized webhook verdict, or one still awaiting its
+ * webhook) and reuses that result instead of sending a duplicate. Concurrent
+ * requests for the same address share a single in-flight send.
+ * @param {string} email - Email address to verify
+ * @param {object} options - Additional options (skipDedupe: true forces a fresh send)
+ * @returns {Promise<object>} - Verification result
+ */
+async function sendVerificationEmail(email, options = {}) {
+  const logger = typeof options.logger === 'function' ? options.logger : () => {};
+
+  if (!SENDGRID_ENABLED) {
+    logger('sendgrid', 'SendGrid is disabled in environment');
+    return {
+      success: false,
+      status: 'unknown',
+      sub_status: 'sendgrid_disabled',
+      reason: 'SendGrid verification is not enabled',
+      provider: 'SendGrid',
+      method: 'skipped'
+    };
+  }
+
+  if (!SENDGRID_API_KEY) {
+    logger('sendgrid', 'SendGrid API key not configured');
+    return {
+      success: false,
+      status: 'unknown',
+      sub_status: 'sendgrid_not_configured',
+      reason: 'SendGrid API key is missing',
+      provider: 'SendGrid',
+      method: 'skipped'
+    };
+  }
+
+  // ── DEDUPE: skip sending if SendGrid already has a recent result ──────────
+  if (SENDGRID_DEDUPE_ENABLED && options.skipDedupe !== true) {
+    const dedupeResult = await getSendGridDedupeResult(email, options, logger);
+    if (dedupeResult) return dedupeResult;
+  }
+
+  // ── IN-FLIGHT SHARING: same process, concurrent duplicate sends ───────────
+  const flightKey = String(email || '').toLowerCase();
+  const existingFlight = inFlightSends.get(flightKey);
+  if (existingFlight) {
+    logger(
+      'sendgrid_dedupe',
+      `Send already in flight for ${email} — sharing its result (no duplicate email sent)`
+    );
+    const shared = await existingFlight;
+    return { ...shared, dedupe: shared.dedupe || 'shared_inflight' };
+  }
+
+  const flight = dispatchVerificationEmail(email, options);
+  inFlightSends.set(flightKey, flight);
+  try {
+    return await flight;
+  } finally {
+    if (inFlightSends.get(flightKey) === flight) inFlightSends.delete(flightKey);
+  }
+}
+
+/**
+ * Core send routine (no dedupe) — invoked by sendVerificationEmail after the
+ * dedupe checks. Do not call directly from routes.
  * @param {string} email - Email address to verify
  * @param {object} options - Additional options
  * @returns {Promise<object>} - Verification result
  */
-async function sendVerificationEmail(email, options = {}) {
+async function dispatchVerificationEmail(email, options = {}) {
   const logger = typeof options.logger === 'function' ? options.logger : () => {};
   const isBulkMode = options.bulkMode === true || options.trainingTag === 'bulk';
   
@@ -490,5 +711,10 @@ module.exports = {
   sendVerificationEmail,
   isProofpointDomain,
   isMimecastDomain,
-  toTrueSendrFormat
+  toTrueSendrFormat,
+  // Dedupe helpers (exported for testing / reuse)
+  getSendGridDedupeResult,
+  buildCachedResultFromLog,
+  buildInFlightResultFromLog,
+  categoryToStatus
 };

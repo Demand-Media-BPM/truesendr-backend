@@ -36,6 +36,7 @@ const {
 } = require("../utils/domainClassifier");
 
 const SENDGRID_VALID_SETTLE_MS = +(process.env.SENDGRID_VALID_SETTLE_MS || 5000);
+const SENDGRID_BULK_WEBHOOK_WAIT_MS = +(process.env.SENDGRID_BULK_WEBHOOK_WAIT_MS || 60000);
 const TRAINING_SAMPLE_BYPASS_MS = 15 * 24 * 60 * 60 * 1000; // 15 days
 
 module.exports = function bulkValidatorRouter(deps) {
@@ -1107,7 +1108,7 @@ module.exports = function bulkValidatorRouter(deps) {
     sessionId,
     UserBulkStat,
   ) {
-    const MAX_WAIT_TIME = 20000; // 20 seconds
+    const MAX_WAIT_TIME = SENDGRID_BULK_WEBHOOK_WAIT_MS; // 60 seconds (configurable via SENDGRID_BULK_WEBHOOK_WAIT_MS)
     const CHECK_INTERVAL = 1000; // Check every 1 second
     const startTime = Date.now();
 
@@ -3451,7 +3452,7 @@ const history = await getHistoryCached(E);
                 sendgridPendingCount: sendgridMessageIds.length,
                 sendgridMessageIds: sendgridMessageIds,
                 sendgridEmails: sendGridEmails,
-                webhookTimeoutAt: new Date(Date.now() + 20000), // 20 second timeout
+                webhookTimeoutAt: new Date(Date.now() + SENDGRID_BULK_WEBHOOK_WAIT_MS), // matches webhook wait window (60s)
               },
             },
           );
