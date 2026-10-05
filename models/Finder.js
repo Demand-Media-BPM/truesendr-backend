@@ -15,7 +15,7 @@ const finderSchema = new mongoose.Schema(
 
     // Normalized split name used for cache lookups
     first: { type: String, required: true, trim: true },
-    last: { type: String, required: true, trim: true },
+    last: { type: String, trim: true, default: "" },
 
     // Domain & chosen result (always stored lowercase)
     domain: {
