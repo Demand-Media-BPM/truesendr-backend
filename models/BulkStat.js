@@ -80,6 +80,7 @@ const BulkStatSchema = new mongoose.Schema(
     invalidFormat: { type: Number, default: 0 },
     duplicates: { type: Number, default: 0 },
     uniqueValid: { type: Number, default: 0 },
+    uniqueDomains: { type: Number, default: 0 },
 
     errorsFound: { type: Number, default: 0 },
     cleanupSaves: { type: Number, default: 0 },

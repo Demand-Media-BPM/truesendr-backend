@@ -158,6 +158,7 @@ module.exports = function bulkValidatorRouter(deps) {
   // ───────────────────────────────────────────────────────────
   function analyzeRows(rows, emailCol) {
     const seenValid = new Set();
+    const seenDomains = new Set();
 
     let totalRowsWithEmailCell = 0; // rows where email cell is non-empty (raw)
     let emptyOrJunk = 0;
@@ -188,10 +189,12 @@ module.exports = function bulkValidatorRouter(deps) {
         duplicates++;
       } else {
         seenValid.add(e);
+        seenDomains.add(e.slice(e.lastIndexOf("@") + 1));
       }
     }
 
     const uniqueValid = seenValid.size;
+    const uniqueDomains = seenDomains.size;
 
     const errorsFound = invalidFormat + duplicates + emptyOrJunk;
     const cleanupSaves = duplicates + emptyOrJunk; // invalidFormat cannot be auto-fixed
@@ -202,6 +205,7 @@ module.exports = function bulkValidatorRouter(deps) {
       invalidFormat,
       duplicates,
       uniqueValid,
+      uniqueDomains,
       errorsFound,
       cleanupSaves,
     };
@@ -567,6 +571,7 @@ module.exports = function bulkValidatorRouter(deps) {
           invalidFormat: stats.invalidFormat,
           duplicates: stats.duplicates,
           uniqueValid: stats.uniqueValid,
+          uniqueDomains: stats.uniqueDomains,
 
           errorsFound: stats.errorsFound,
           cleanupSaves: stats.cleanupSaves,
