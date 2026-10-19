@@ -18,7 +18,19 @@ const DEFAULT_SENDGRID_SENDERS = [
   'rebecca@mailvariant.com',
   'william@mailnumerator.com',
   'oliver@maildenominator.com',
-  'mia@mailsystematic.com'
+  'mia@mailsystematic.com',
+  'henry@naturemails.com',
+  'john@nautremails.com',
+  'leo@emailfier.com',
+  'edward@emailsfier.com',
+  'finn@mailjungles.com',
+  'milo@emailjungles.com',
+  'harry@emailfires.com',
+  'george@getemailfire.com',
+  'noah@emailfiretech.com',
+  'charles@mailfirepro.com',
+  'charlotte@mailvariance.com',
+  'james@mailjampack.com'
 ];
 const SENDGRID_VERIFIED_SENDER = process.env.SENDGRID_VERIFIED_SENDER || 'david.g@mailjournals.com';
 const SENDGRID_VERIFIED_SENDERS = (process.env.SENDGRID_VERIFIED_SENDERS || '')
