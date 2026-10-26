@@ -30,7 +30,7 @@ const Domain = require("../models/Domain");
 const dns = require("dns").promises;
 
 // 🆕 Bank/Healthcare domain classifier (Yash logic)
-const { classifyDomain, getDomainCategory, hasBankWordInDomain, isTwDomain, isManualHighRiskDomain } = require("../utils/domainClassifier");
+const { classifyDomain, getDomainCategory, hasBankWordInDomain, isTwDomain, isManualHighRiskDomain, isOutlookProviderText } = require("../utils/domainClassifier");
 const { remember, DEFAULT_TTLS } = require("../utils/validationCache");
 const {
   evaluateEarlyRisk,
@@ -460,7 +460,11 @@ module.exports = function singleValidatorRouter(deps) {
     //    (Domain is good and mailbox exists, but banking domains
     //     are high-risk for cold email sending.)
     // ─────────────────────────────────────────────────────────
-    if (payload.category === "valid" && hasBankWordInDomain(payload.domain)) {
+    // Exception: Outlook-hosted domain with a definitive SMTP result (not SendGrid) keeps its status.
+    const keepSmtpStatusOutlookFinal =
+      isOutlookProviderText(payload.domainProvider) &&
+      !String(via || "").startsWith("sendgrid");
+    if (payload.category === "valid" && hasBankWordInDomain(payload.domain) && !keepSmtpStatusOutlookFinal) {
       console.log(`[single][bank_override] ${E} → domain "${payload.domain}" contains "bank", overriding Valid → Risky`);
       payload.status = "Risky";
       payload.category = "risky";
@@ -735,7 +739,22 @@ module.exports = function singleValidatorRouter(deps) {
     // ccTLD domains should NOT be marked risky here anymore.
     // They should flow into SendGrid-direct decision:
     //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
-    if (isBankOrHealthcare) {
+    // NEW RULE: bank/healthcare/high-risk-industry domain hosted on Outlook →
+    // skip the early Risky exit and the direct SendGrid path. SMTP decides:
+    // valid/invalid is final (no SendGrid, no Risky override); only risky/unknown
+    // SMTP may use the existing Outlook SendGrid fallback.
+    const isBankHealthcareOutlookSmtpFirst =
+      isBankOrHealthcare && isOutlookProvider && !isProofpoint && !isMimecast;
+
+    if (isBankHealthcareOutlookSmtpFirst) {
+      mkLogger(sessionId, E, username)(
+        'bank_healthcare_outlook',
+        `Domain ${domain} is bank/healthcare on Outlook → SMTP-first (no early Risky, no direct SendGrid)`,
+        'info',
+      );
+    }
+
+    if (isBankOrHealthcare && !isBankHealthcareOutlookSmtpFirst) {
       const earlyLogger = mkLogger(sessionId, E, username);
       const subStatus = 'bank_healthcare_domain';
       const message = 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
@@ -2678,7 +2697,9 @@ module.exports = function singleValidatorRouter(deps) {
       // ─────────────────────────────────────────────────────────
       // 🏦 Bank domain override (prelim stage)
       // ─────────────────────────────────────────────────────────
-      if (prelimPayload.category === "valid" && hasBankWordInDomain(prelimPayload.domain)) {
+      // Exception: Outlook-hosted domain with a definitive SMTP result (no SendGrid fallback) keeps its status.
+      const keepSmtpStatusOutlookPrelim = !fb && isOutlookProviderText(prelimPayload.domainProvider);
+      if (prelimPayload.category === "valid" && hasBankWordInDomain(prelimPayload.domain) && !keepSmtpStatusOutlookPrelim) {
         console.log(`[single][bank_override][prelim] ${E} → domain "${prelimPayload.domain}" contains "bank", overriding Valid → Risky`);
         prelimPayload.status = "Risky";
         prelimPayload.category = "risky";
@@ -2812,7 +2833,9 @@ module.exports = function singleValidatorRouter(deps) {
           // ─────────────────────────────────────────────────────────
           // 🏦 Bank domain override (stable background stage)
           // ─────────────────────────────────────────────────────────
-          if (finalPayload.category === "valid" && hasBankWordInDomain(finalPayload.domain)) {
+          // Exception: Outlook-hosted domain with a definitive SMTP result (no SendGrid fallback) keeps its status.
+          const keepSmtpStatusOutlookStable = !fb2 && isOutlookProviderText(finalPayload.domainProvider);
+          if (finalPayload.category === "valid" && hasBankWordInDomain(finalPayload.domain) && !keepSmtpStatusOutlookStable) {
             console.log(`[single][bank_override][stable] ${E} → domain "${finalPayload.domain}" contains "bank", overriding Valid → Risky`);
             finalPayload.status = "Risky";
             finalPayload.category = "risky";

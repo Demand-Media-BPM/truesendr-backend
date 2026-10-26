@@ -764,6 +764,16 @@ function hasBankWordInDomain(domain) {
 }
 
 /**
+ * Check if a provider label (e.g. "Outlook / Microsoft 365") is Outlook/Microsoft.
+ * Used for the rule: high-risk industry domains (bank/healthcare/etc.) hosted on
+ * Outlook trust a definitive SMTP valid/invalid result — no SendGrid verification
+ * and no forced Risky override.
+ */
+function isOutlookProviderText(providerText) {
+  return /outlook|microsoft/i.test(String(providerText || ''));
+}
+
+/**
  * Check if domain ends with .org, .edu, .gov, or .mx (case-insensitive).
  * These are organizational, educational, government, and Mexican TLD domains
  * that are high-risk for cold email sending and should be marked Risky after validation.
@@ -936,6 +946,7 @@ module.exports = {
   isKnownHealthcareDomain,
   hasBankKeywords,
   hasBankWordInDomain,
+  isOutlookProviderText,
   isOrgEduGovDomain,
   isTwDomain,
   isCcTLDDomain,
