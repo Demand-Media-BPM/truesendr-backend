@@ -754,7 +754,13 @@ module.exports = function singleValidatorRouter(deps) {
       );
     }
 
-    if (isBankOrHealthcare && !isBankHealthcareOutlookSmtpFirst) {
+    // .edu/.gov must not take this early return (parity with bulk) so they flow into
+    // the SendGrid-direct decision below (with the .edu SMTP mailbox_not_found pre-check).
+    const isEduOrGovDomainForEarlyExit =
+      String(domain || "").toLowerCase().endsWith(".edu") ||
+      String(domain || "").toLowerCase().endsWith(".gov");
+
+    if (isBankOrHealthcare && !isBankHealthcareOutlookSmtpFirst && !isEduOrGovDomainForEarlyExit) {
       const earlyLogger = mkLogger(sessionId, E, username);
       const subStatus = 'bank_healthcare_domain';
       const message = 'This address belongs to a banking or healthcare domain. Sending cold emails to these domains is risky.';
