@@ -115,9 +115,16 @@ function shouldUseSendGridDirect({
   const shouldUseEduGovOrgDirect =
     isEduGovOrgDomain && !isOutlookProvider && !isGoogleWorkspaceProvider;
 
+  // Bank/healthcare (or any high-risk industry) hosted on Outlook:
+  // run SMTP first. A definitive SMTP valid/invalid is final (no SendGrid);
+  // only risky/unknown SMTP may use the existing Outlook SendGrid fallback.
+  // Proofpoint/Mimecast gateways keep their existing handling.
+  const isBankHealthcareOutlookSmtpFirst =
+    isBankOrHealthcare && isOutlookProvider && !isProofpoint && !isMimecast;
+
   return (
     shouldUseEduGovOrgDirect ||
-    isBankOrHealthcare ||
+    (isBankOrHealthcare && !isBankHealthcareOutlookSmtpFirst) ||
     ((isProofpoint || isMimecast) && isTargetSendgridSuffix)
   );
 }

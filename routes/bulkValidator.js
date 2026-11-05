@@ -30,6 +30,7 @@ const {
   classifyDomain,
   getDomainCategory,
   hasBankWordInDomain,
+  isOutlookProviderText,
   isTwDomain,
   isManualHighRiskDomain,
   // isHighRiskDomain, // (optional) not required, Yash also doesn't actually use it in worker
@@ -2052,8 +2053,23 @@ module.exports = function bulkValidatorRouter(deps) {
         //   (Proofpoint/Mimecast && target suffix list including .ca/.br)
         // Also, .edu/.gov must not take this early return so webhook-final
         // SendGrid outcome can be used consistently (single + bulk parity).
+        // NEW RULE: bank/healthcare/high-risk-industry domain hosted on Outlook →
+        // no early Risky exit and no direct SendGrid. SMTP decides: valid/invalid
+        // is final (no SendGrid, no Risky override); only risky/unknown SMTP may
+        // use the existing Outlook SendGrid fallback.
+        const isBankHealthcareOutlookSmtpFirst =
+          isBankOrHealthcare &&
+          isOutlookProviderText(preDetectedProvider) &&
+          !isProofpoint &&
+          !isMimecast;
+
+        if (isBankHealthcareOutlookSmtpFirst) {
+          console.log(`[BULK][${E}] Bank/Healthcare on Outlook → SMTP-first (no early Risky, no direct SendGrid)`);
+        }
+
         if (
           isBankOrHealthcare &&
+          !isBankHealthcareOutlookSmtpFirst &&
           !String(domain || "").toLowerCase().endsWith(".edu") &&
           !String(domain || "").toLowerCase().endsWith(".gov")
         ) {
@@ -2218,7 +2234,7 @@ module.exports = function bulkValidatorRouter(deps) {
           const isGoogleWorkspaceProviderDirect = /google|gmail|google workspace|workspace/.test(normalizedProvider);
           const shouldSendgridDirect =
             (isEduGovOrgDomain && !isGoogleWorkspaceProviderDirect) ||
-            isBankOrHealthcare ||
+            (isBankOrHealthcare && !isBankHealthcareOutlookSmtpFirst) ||
             ((isProofpoint || isMimecast) && isTargetSendgridSuffix);
 
         // ───────────────────────────────────────────────────────
@@ -3329,7 +3345,13 @@ const history = await getHistoryCached(E);
         //    (Domain is good and mailbox exists, but banking domains
         //     are high-risk for cold email sending.)
         // ─────────────────────────────────────────────────────────
-        if (final && (final.category === "valid" || categoryFromStatus(final.status || "") === "valid") && hasBankWordInDomain(domain)) {
+        // Exception: Outlook-hosted domain whose Valid came from SMTP (or a cached
+        // SMTP result) keeps its status. SendGrid-derived results still get overridden.
+        const keepSmtpStatusOutlook =
+          !!final &&
+          isOutlookProviderText(final.domainProvider) &&
+          (usedCache || smtpPrimaryCat === "valid" || smtpStableCat === "valid");
+        if (final && (final.category === "valid" || categoryFromStatus(final.status || "") === "valid") && hasBankWordInDomain(domain) && !keepSmtpStatusOutlook) {
           console.log(`[BULK][bank_override] ${E} → domain "${domain}" contains "bank", overriding Valid → Risky`);
           final.status = "Risky";
           final.category = "risky";
