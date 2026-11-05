@@ -87,16 +87,16 @@ const PROVIDERS = {
     spamFolder: "Spam",
   },
 
-  hotmail: {
-    label: "Hotmail",
-    emailEnv: "DELIV_HOTMAIL_EMAIL",
-    passEnv: null,
-    imap: { host: "outlook.office365.com", port: 993, secure: true },
-    smtp: { host: "smtp-mail.outlook.com", port: 587, secure: false },
-    inboxFolder: "Inbox",
-    spamFolder: "Junk",
-    spamFolderAlternates: [],
-  },
+  // hotmail: {
+  //   label: "Hotmail",
+  //   emailEnv: "DELIV_HOTMAIL_EMAIL",
+  //   passEnv: null,
+  //   imap: { host: "outlook.office365.com", port: 993, secure: true },
+  //   smtp: { host: "smtp-mail.outlook.com", port: 587, secure: false },
+  //   inboxFolder: "Inbox",
+  //   spamFolder: "Junk",
+  //   spamFolderAlternates: [],
+  // },
 
   microsoft_business: {
     label: "Microsoft Business",
