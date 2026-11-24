@@ -1281,26 +1281,13 @@ function normalizeRawLookupInput(phone, dialCode) {
     };
   }
 
-  const normalizedLocal = localDigits.startsWith(dialDigits)
-    ? localDigits.slice(dialDigits.length)
-    : localDigits;
-
-  if (!normalizedLocal) {
-    return {
-      ok: false,
-      status: 400,
-      error: "invalid_phone",
-      message: "Enter a valid local phone number",
-    };
-  }
-
   return {
     ok: true,
     inputPhone: rawPhone,
     inputDialCode: rawDialCode,
-    e164Input: `+${dialDigits}${normalizedLocal}`,
+    e164Input: `+${dialDigits}${localDigits}`,
     dialDigits,
-    localDigits: normalizedLocal,
+    localDigits,
   };
 }
 
@@ -1433,13 +1420,8 @@ router.post("/validate", requireAuth, async (req, res) => {
 
     const rawInputNumber = String(phone).trim(); // local number user typed
 
-    let localDigits = rawInputNumber.replace(/[^\d]/g, "");
+    const localDigits = rawInputNumber.replace(/[^\d]/g, "");
     const dialDigits = String(dialCode).trim().replace(/[^\d]/g, "");
-
-    // ✅ If user pasted number starting with country code, strip it once
-    if (dialDigits && localDigits.startsWith(dialDigits)) {
-      localDigits = localDigits.slice(dialDigits.length);
-    }
 
     if (!dialDigits) {
       return res.status(400).json({
@@ -1491,7 +1473,7 @@ router.post("/validate", requireAuth, async (req, res) => {
     // ─────────────────────────────────────────
     const globalHit = await GlobalPhone.findOne({ lookupKey }).lean();
 
-    if (globalHit) {
+    if (globalHit?.valid === true) {
       // charge (even for cache)
       const charged = await deductOneCreditOrFail(userId);
       if (!charged.ok) {
@@ -1589,7 +1571,7 @@ router.post("/validate", requireAuth, async (req, res) => {
     // ─────────────────────────────────────────
     const userHit = await PhoneCheck.findOne({ userId, lookupKey }).lean();
 
-    if (userHit) {
+    if (userHit?.valid === true) {
       // charge (even for cache)
       const charged = await deductOneCreditOrFail(userId);
       if (!charged.ok) {
@@ -1768,10 +1750,14 @@ router.post("/validate", requireAuth, async (req, res) => {
       valid: twilioData.valid === undefined ? true : Boolean(twilioData.valid),
       country: twilioData.countryCode || null, // ISO like "US", "CA"
       e164: twilioData.phoneNumber || e164Input,
-      carrier: lti.carrier_name || twilioData.carrier?.name || null,
+      carrier:
+        lti.carrierName ||
+        lti.carrier_name ||
+        twilioData.carrier?.name ||
+        null,
       lineType: lti.type || twilioData.carrier?.type || null,
-      callerName: caller.caller_name || null,
-      ownerType: caller.caller_type || null,
+      callerName: caller.callerName || caller.caller_name || null,
+      ownerType: caller.callerType || caller.caller_type || null,
     };
 
     // ✅ IMPORTANT: set cc from Twilio ISO country
